@@ -24,6 +24,7 @@ class FakeBackend:
     def stop(self, process):
         self.events.append("stop")
         if not self.fail_stop: self.processes = []
+    def fence_pending_starts(self): self.events.append("fence")
     def start(self, goal):
         assert not self.processes, "second backend"
         self.events.append("start")

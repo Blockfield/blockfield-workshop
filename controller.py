@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 import fcntl
 import json
 import os
+import stat
 from pathlib import Path
 import tempfile
 from typing import Protocol
@@ -61,6 +62,12 @@ class Backend(Protocol):
         """Finish tools, save world+config and stop new writes; raise on uncertainty."""
     def stop(self, process: Process) -> None:
         """Graceful stop; success is rechecked by observe before any new start."""
+    def fence_pending_starts(self) -> None:
+        """Cancel/settle ALL previously accepted starts before explicit recovery.
+
+        Returning must guarantee no delayed old request can later start a backend.
+        Raise if that cannot be established. An empty observe() alone is not fencing.
+        """
     def start(self, goal: Goal) -> None:
         """Start the single allowed backend with isolated data; no parallel staging."""
 
@@ -85,17 +92,53 @@ class Controller:
             os.close(fd)
 
     def _read(self) -> dict:
-        if not self.file.exists():
-            return {"schema": 1, "phase": "UNINITIALIZED", "gate": "closed", "operation": None, "desired": None, "revision": 0}
-        if self.file.is_symlink() or self.file.stat().st_size > 16384:
+        # Check links before existence: a dangling link is corruption, not fresh state.
+        if self.file.is_symlink():
             raise ValueError("invalid state file")
-        state = json.loads(self.file.read_text())
-        if not isinstance(state, dict) or state.get("schema") != 1:
+        try:
+            fd = os.open(self.file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return {"schema": 1, "phase": "UNINITIALIZED", "gate": "closed", "operation": None, "desired": None, "revision": 0}
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 16384:
+                raise ValueError("invalid state file")
+            data = handle.read(16385)
+        if len(data) > 16384:
+            raise ValueError("invalid state file")
+
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate state key")
+                result[key] = value
+            return result
+
+        state = json.loads(data, object_pairs_hook=unique)
+        if not isinstance(state, dict) or type(state.get("schema")) is not int or state["schema"] != 1:
             raise ValueError("unsupported state schema")
         if type(state.get("revision")) is not int or state["revision"] < 0:
             raise ValueError("invalid state revision")
-        if state.get("desired") is not None:
-            Goal(**state["desired"])
+        gates = {"UNINITIALIZED": "closed", "REQUESTED": "closed", "DRAINING": "draining",
+                 "SAVING": "closed", "STARTING": "closed", "ERROR": "closed",
+                 "game": "public", "workshop": "builders", "test": "testers"}
+        phase = state.get("phase")
+        if not isinstance(phase, str) or phase not in gates or state.get("gate") not in ("closed", gates[phase]):
+            raise ValueError("invalid state phase/gate")
+        if phase == "UNINITIALIZED":
+            if state["revision"] != 0 or state.get("desired") is not None or state.get("operation") is not None:
+                raise ValueError("invalid uninitialized state")
+            return state
+        if state["revision"] < 1 or not isinstance(state.get("desired"), dict) or not isinstance(state.get("operation"), str):
+            raise ValueError("invalid operation state")
+        try:
+            UUID(state["operation"])
+            goal = Goal(**state["desired"])
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ValueError("invalid operation intent") from error
+        if phase in {"game", "workshop", "test"} and phase != goal.profile:
+            raise ValueError("stable phase does not match desired profile")
         return state
 
     def _write(self, state: dict) -> None:
@@ -138,7 +181,10 @@ class Controller:
     def step(self, *, recover: bool = False) -> dict:
         """One reconciliation under a process lock. Retry STARTING/DRAINING, don't start a worker.
 
-        ERROR requires explicit recovery. A repeated step never counts as forced interruption.
+        ERROR requires explicit recovery. STARTING with no visible process waits closed:
+        absence cannot distinguish a failed request from an accepted, delayed start.
+        Explicit recovery fences pending starts before considering another start.
+        A repeated step never counts as forced interruption.
         """
         with self._locked():
             state = self._read()
@@ -146,11 +192,14 @@ class Controller:
                 raise RuntimeError("no requested operation")
             if state.get("phase") == "ERROR" and not recover:
                 return state
+            previous_phase = state["phase"]
             goal = Goal(**state["desired"])
             state.update(gate="closed", error=None)
             self._write(state)
             try:
                 self.backend.preflight(goal)
+                if recover and previous_phase in {"STARTING", "ERROR"}:
+                    self.backend.fence_pending_starts()
                 processes = self.backend.observe()
                 if len(processes) > 1:
                     raise RuntimeError("multiple full backends observed")
@@ -160,6 +209,12 @@ class Controller:
                     state["gate"] = ({"game": "public", "workshop": "builders", "test": "testers"}[goal.profile]
                                      if current.ready else "closed")
                     self._write(state)
+                    return state
+                if previous_phase == "STARTING" and not recover:
+                    if current is not None:
+                        raise RuntimeError("unexpected backend while start is unresolved")
+                    # Intent was durable before start(). Never reissue it automatically,
+                    # including after a controller crash or delayed process visibility.
                     return state
                 if current is not None:
                     if current.goal.profile == "game":

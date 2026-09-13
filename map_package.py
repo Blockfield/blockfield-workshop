@@ -68,6 +68,9 @@ def validate(path: Path, expected_sha256: str, *, max_archive: int = 512 * 1024 
             all_paths = set()
             for entry in entries:
                 name = entry.filename
+                # ZipInfo truncates filename at NUL; validate the original spelling too.
+                if entry.orig_filename != name or "\x00" in entry.orig_filename:
+                    raise ValueError("noncanonical original archive path")
                 parts = PurePosixPath(name).parts
                 if not name or "\\" in name or ":" in name or name.startswith("/") or "\x00" in name:
                     raise ValueError("unsafe path")
