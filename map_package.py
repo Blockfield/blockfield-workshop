@@ -18,7 +18,8 @@ import zipfile
 
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
-_REGION = re.compile(r"world/(region|entities|poi)/r\.-?\d+\.-?\d+\.mca\Z")
+# One spelling per coordinate: \d would admit Unicode digits and 0/-0/00 aliases.
+_REGION = re.compile(r"world/(region|entities|poi)/r\.(0|-?[1-9][0-9]*)\.(0|-?[1-9][0-9]*)\.mca\Z")
 
 
 def _json(raw: bytes):

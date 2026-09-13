@@ -51,6 +51,17 @@ class PackageTests(unittest.TestCase):
             with self.subTest(name=name):
                 expected = self.pack(extra=name)
                 with self.assertRaises(ValueError): validate(self.path, expected)
+    def test_region_coordinate_aliases_rejected(self):
+        for name in ["world/region/r.٠.0.mca", "world/region/r.-0.1.mca", "world/region/r.01.1.mca"]:
+            with self.subTest(name=name):
+                files = {"map.json": b'{"id":"arena"}', name: b"alias"}
+                manifest = {"schemaVersion": 1, "mapId": "arena", "version": "v2", "baseVersion": "v1",
+                            "files": {n: digest(d) for n, d in files.items()}}
+                with zipfile.ZipFile(self.path, "w") as z:
+                    z.writestr("manifest.json", json.dumps(manifest))
+                    for n, d in files.items(): z.writestr(n, d)
+                with self.assertRaisesRegex(ValueError, "unapproved world file"):
+                    validate(self.path, digest(self.path.read_bytes()))
     def test_unknown_sidecars_rejected_not_lost(self):
         expected = self.pack(extra="world/data/mod-state.dat")
         with self.assertRaises(ValueError): validate(self.path, expected)
