@@ -111,7 +111,7 @@ python3 workshopctl.py request game    # save, stop workshop, start game, open a
 python3 workshopctl.py request game --recover   # only from ERROR; read `error` in status first
 ```
 
-Drasl profile ids: `curl https://skins.nether.pp.ua/account/users/profiles/minecraft/<Name>`. `members` applies online:
+Drasl profile ids: `curl https://skins.blockfield.pro/account/users/profiles/minecraft/<Name>`. `members` applies online:
 removed accounts are sent to the lobby on the proxy's next tick (3 s). Exit codes: 0 ok, 1 invalid request, 2 ERROR, 75 busy.
 
 ## Process journal acceptance test (owner maintenance window)
