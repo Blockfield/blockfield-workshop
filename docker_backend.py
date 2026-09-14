@@ -186,6 +186,10 @@ class DockerBackend:
             if selection and selection["profile"] == profile:
                 goal = self._goal(profile, selection["release"], selection.get("session"))
                 expected = {key: selection.get(key) for key in ("profile", "generation", "session", "release")}
+                if profile == "game" and ready and ready.get("release"):
+                    # Game images are deployed as :latest by release tags, outside the controller: follow the build.
+                    goal = self._goal(profile, ready["release"], selection.get("session"))
+                    expected["release"] = ready["release"]
             elif selection is None and ready and ready.get("profile") == profile and ready.get("generation") is None:
                 # Adoption of a game started before the controller existed.
                 goal = self._goal(profile, ready.get("release"), ready.get("session"))

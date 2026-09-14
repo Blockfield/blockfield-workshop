@@ -6,7 +6,7 @@ not an optimistic HTTP response. Proxy/web consumers must fail closed on absent 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import replace, asdict, dataclass
 import fcntl
 import json
 import os
@@ -293,6 +293,12 @@ class Controller:
                 if len(processes) > 1:
                     raise RuntimeError("multiple full backends observed")
                 current = processes[0] if processes else None
+                if (current is not None and goal.profile == current.goal.profile == "game"
+                        and current.goal.release != goal.release and replace(current.goal, release=goal.release) == goal):
+                    # A release tag redeployed the game image; follow it instead of draining and restarting.
+                    goal = current.goal
+                    state["desired"] = asdict(goal)
+                    self._write(state)
                 if current is not None and current.goal == goal:
                     if current.ready:
                         commit(goal.profile, OPEN_GATES[goal.profile])

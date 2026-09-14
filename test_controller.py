@@ -45,6 +45,16 @@ class ControllerTests(unittest.TestCase):
         self.controller.step()
         self.backend.processes = [Process(self.goal, True)]
         return self.controller.step()
+    def test_game_release_deploy_is_followed_without_restart(self):
+        self.controller.request(self.op, Goal("game", "v1"), 0)
+        self.assertEqual(self.controller.step()["gate"], "public")
+        self.backend.processes = [Process(Goal("game", "v2"), True)]
+        state = self.controller.step()
+        self.assertEqual((state["phase"], state["gate"], state["error"], state["desired"]["release"]), ("game", "public", None, "v2"))
+        self.assertEqual(self.backend.events, [])
+        restarted = Controller(Path(self.temp.name), self.backend)
+        self.assertEqual(restarted.step()["desired"]["release"], "v2")
+
     def test_drain_waits_entire_campaign_without_timeout(self):
         self.request()
         for _ in range(20): self.assertEqual(self.controller.step()["phase"], "DRAINING")

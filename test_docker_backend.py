@@ -180,6 +180,15 @@ class DockerBackendTests(unittest.TestCase):
         self.ready("workshop", generation=selection["generation"], session=session, release="v1")
         self.assertEqual(self.backend.observe(), [Process(goal, True)])
 
+    def test_game_follows_release_deployed_outside_controller(self):
+        self.backend.start(Goal("game", "v1"))
+        selection = json.loads((self.lock / "profile.json").read_text())
+        self.running("game")
+        self.ready("game", generation=selection["generation"], session=None, release="v2")
+        self.assertEqual(self.backend.observe(), [Process(Goal("game", "v2"), True)])
+        self.ready("game", generation=str(uuid4()), session=None, release="v2")
+        self.assertEqual(self.backend.observe(), [Process(Goal("game", "v2"), False)])
+
     def test_drain_status_parsing(self):
         self.running("game")
         status = "bf maintenance status"
