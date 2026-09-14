@@ -182,8 +182,7 @@ class DockerBackendTests(unittest.TestCase):
 
     def test_game_follows_release_deployed_outside_controller(self):
         self.backend.start(Goal("game", "v1"))
-        selection = json.loads((self.lock / "profile.json").read_text())
-        self.running("game")
+        selection = json.loads((self.lock / "profile.json").read_text())  # fake scale=1 already started java
         self.ready("game", generation=selection["generation"], session=None, release="v2")
         self.assertEqual(self.backend.observe(), [Process(Goal("game", "v2"), True)])
         self.ready("game", generation=str(uuid4()), session=None, release="v2")
