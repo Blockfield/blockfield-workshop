@@ -1,0 +1,17 @@
+# Пример: /etc/systemd/system/blockfield-workshop.service (tools/workshop/README.md).
+[Unit]
+Description=Blockfield workshop controller reconciliation step
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/blockfield/workshop.env
+WorkingDirectory=/opt/blockfield-workshop
+ExecStart=/usr/bin/python3 /opt/blockfield-workshop/workshopctl.py step
+# Шаг держит controller.lock; остановка backend может ждать до stop_timeout (300 с).
+TimeoutStartSec=15min
+# Код 2 — ERROR записан и вход закрыт: это не сбой юнита, восстановление — workshopctl request game --recover.
+SuccessExitStatus=2 75
+NoNewPrivileges=yes
+PrivateTmp=yes

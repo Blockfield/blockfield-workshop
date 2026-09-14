@@ -1,0 +1,10 @@
+[Unit]
+Description=Blockfield workshop controller every 15 s
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

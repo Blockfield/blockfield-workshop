@@ -1,4 +1,4 @@
-"""Durable single-backend transition core. No production/Docker adapter is installed.
+"""Durable single-backend transition core. The Docker adapter lives in docker_backend.py.
 
 A trusted adapter must fence all other starters and expose actual process readiness,
 not an optimistic HTTP response. Proxy/web consumers must fail closed on absent state.
@@ -10,9 +10,11 @@ from dataclasses import asdict, dataclass
 import fcntl
 import json
 import os
+import re
 import stat
 from pathlib import Path
 import tempfile
+import time
 from typing import Protocol
 from uuid import UUID
 
@@ -72,13 +74,58 @@ class Backend(Protocol):
         """Start the single allowed backend with isolated data; no parallel staging."""
 
 
+DEFAULT_MESSAGE = "На сервере проводятся технические работы. Обычный вход временно недоступен."
+OPEN_GATES = {"game": "public", "workshop": "builders", "test": "testers"}
+ROLES = {"builder", "lead", "admin"}
+NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
+
+
+def member(value) -> dict:
+    """Validated ACL entry; the proxy matches both the Drasl profile id and the current name."""
+    if not isinstance(value, dict) or set(value) - {"draslId", "name", "role"}:
+        raise ValueError("invalid member")
+    drasl = value.get("draslId")
+    if not isinstance(drasl, str):
+        raise ValueError("invalid draslId")
+    drasl = drasl.replace("-", "").lower()
+    if len(drasl) != 32 or any(c not in "0123456789abcdef" for c in drasl):
+        raise ValueError("invalid draslId")
+    name, role = value.get("name"), value.get("role", "builder")
+    if not isinstance(name, str) or not NAME.fullmatch(name) or role not in ROLES:
+        raise ValueError("invalid member name/role")
+    return {"draslId": drasl, "name": name, "role": role}
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + "-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 class Controller:
-    def __init__(self, directory: Path, backend: Backend):
+    def __init__(self, directory: Path, backend: Backend, *, gate_file: Path | None = None,
+                 public_file: Path | None = None, message: str = DEFAULT_MESSAGE):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.directory.is_symlink():
             raise ValueError("state directory must not be a symlink")
         self.file = self.directory / "state.json"
+        self.members_file = self.directory / "members.json"
+        self.gate_file = Path(gate_file) if gate_file else self.directory / "gate.json"
+        self.public_file = Path(public_file) if public_file else self.directory / "public.json"
+        self.message = message.strip()[:500] or DEFAULT_MESSAGE
         self.backend = backend
 
     @contextmanager
@@ -142,24 +189,58 @@ class Controller:
         return state
 
     def _write(self, state: dict) -> None:
-        data = json.dumps(state, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()
-        fd, temporary = tempfile.mkstemp(prefix=".state-", dir=self.directory)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.file)
-            directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
+        atomic_write(self.file, json.dumps(state, ensure_ascii=False, sort_keys=True, allow_nan=False).encode())
+        self._export(state)
 
-    def request(self, operation: str, goal: Goal, expected_revision: int) -> dict:
-        """Persist intent only. No side effect on a running backend until step is called."""
+    def members(self) -> list[dict]:
+        """Missing or invalid ACL admits nobody."""
+        try:
+            return [member(entry) for entry in json.loads(self.members_file.read_bytes()[:65536])]
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def set_members(self, entries: list) -> list[dict]:
+        members = [member(entry) for entry in entries]
+        if len({m["draslId"] for m in members}) != len(members):
+            raise ValueError("duplicate member")
+        with self._locked():
+            atomic_write(self.members_file, json.dumps(members, sort_keys=True).encode())
+            self._export(self._read())
+        return members
+
+    def status(self) -> dict:
+        return self._read()
+
+    def _export(self, state: dict) -> None:
+        """Proxy gate (private ACL) and public site status. Rewritten only when content changes."""
+        gate = state["gate"] if state["gate"] in {"public", "draining", "builders"} else "closed"
+        profile = (state.get("desired") or {}).get("profile", "game")
+        backend = "workshop" if gate == "builders" or (gate == "closed" and profile == "workshop") else "game"
+        gate_doc = {"schema": 1, "revision": state["revision"], "gate": gate, "backend": backend,
+                    "message": "" if gate == "public" else self.message,
+                    "allowed": self.members() if gate == "builders" else []}
+        self._replace_if_changed(self.gate_file, gate_doc, keep=())
+        mode = {"public": "game", "draining": "draining", "builders": "workshop"}.get(gate, "maintenance")
+        public = {"mode": mode, "message": "" if mode == "game" else self.message, "since": int(time.time() * 1000)}
+        self._replace_if_changed(self.public_file, public, keep=("since",))
+
+    @staticmethod
+    def _replace_if_changed(path: Path, document: dict, keep: tuple) -> None:
+        try:
+            previous = json.loads(path.read_bytes()[:65536])
+            if isinstance(previous, dict) and {k: v for k, v in previous.items() if k not in keep} == \
+                    {k: v for k, v in document.items() if k not in keep}:
+                return
+        except (OSError, ValueError):
+            pass
+        atomic_write(path, json.dumps(document, ensure_ascii=False, sort_keys=True).encode(), 0o644)
+
+    def request(self, operation: str, goal: Goal, expected_revision: int, *, recover: bool = False) -> dict:
+        """Persist intent only. No side effect on a running backend until step is called.
+
+        recover=True accepts an ERROR state, but only toward the game profile; the phase stays
+        ERROR so only an explicit step(recover=True) can act on it.
+        """
         UUID(operation)
         with self._locked():
             state = self._read()
@@ -169,12 +250,13 @@ class Controller:
                 return state
             if type(expected_revision) is not int or expected_revision != state["revision"]:
                 raise ValueError("stale state revision")
-            if state.get("phase") not in {"UNINITIALIZED", "game", "workshop", "test"}:
+            recovering = recover and state.get("phase") == "ERROR" and goal.profile == "game"
+            if state.get("phase") not in {"UNINITIALIZED", "game", "workshop", "test"} and not recovering:
                 raise RuntimeError("operation in progress or requires recovery")
             self.backend.preflight(goal)
             revision = state["revision"] + 1
-            state = {"schema": 1, "revision": revision, "phase": "REQUESTED", "gate": "closed", "operation": operation,
-                     "desired": asdict(goal), "error": None}
+            state = {"schema": 1, "revision": revision, "phase": "ERROR" if recovering else "REQUESTED", "gate": "closed",
+                     "operation": operation, "desired": asdict(goal), "error": state.get("error") if recovering else None}
             self._write(state)
             return state
 
@@ -184,53 +266,59 @@ class Controller:
         ERROR requires explicit recovery. STARTING with no visible process waits closed:
         absence cannot distinguish a failed request from an accepted, delayed start.
         Explicit recovery fences pending starts before considering another start.
-        A repeated step never counts as forced interruption.
+        A repeated step never counts as forced interruption. State is written only when
+        phase/gate/error change, so a stable or draining gate never flaps through closed.
         """
         with self._locked():
             state = self._read()
             if state.get("desired") is None:
                 raise RuntimeError("no requested operation")
             if state.get("phase") == "ERROR" and not recover:
+                self._export(state)
                 return state
             previous_phase = state["phase"]
             goal = Goal(**state["desired"])
-            state.update(gate="closed", error=None)
-            self._write(state)
+
+            def commit(phase: str, gate: str, error: str | None = None) -> None:
+                if (state["phase"], state["gate"], state.get("error")) != (phase, gate, error):
+                    state.update(phase=phase, gate=gate, error=error)
+                    self._write(state)
+
             try:
                 self.backend.preflight(goal)
                 if recover and previous_phase in {"STARTING", "ERROR"}:
+                    commit(previous_phase, "closed", state.get("error"))
                     self.backend.fence_pending_starts()
                 processes = self.backend.observe()
                 if len(processes) > 1:
                     raise RuntimeError("multiple full backends observed")
                 current = processes[0] if processes else None
                 if current is not None and current.goal == goal:
-                    state["phase"] = goal.profile if current.ready else "STARTING"
-                    state["gate"] = ({"game": "public", "workshop": "builders", "test": "testers"}[goal.profile]
-                                     if current.ready else "closed")
-                    self._write(state)
+                    if current.ready:
+                        commit(goal.profile, OPEN_GATES[goal.profile])
+                    else:
+                        commit("STARTING", "closed")
+                    self._export(state)
                     return state
                 if previous_phase == "STARTING" and not recover:
                     if current is not None:
                         raise RuntimeError("unexpected backend while start is unresolved")
                     # Intent was durable before start(). Never reissue it automatically,
                     # including after a controller crash or delayed process visibility.
+                    self._export(state)
                     return state
                 if current is not None:
                     if current.goal.profile == "game":
-                        state.update(phase="DRAINING", gate="draining")
-                        self._write(state)
+                        commit("DRAINING", "draining")
                         self.backend.request_drain()
                         if not self.backend.drained():
                             return state
-                    state.update(phase="SAVING", gate="closed")
-                    self._write(state)
+                    commit("SAVING", "closed")
                     self.backend.save_and_freeze(current)
                     self.backend.stop(current)
                     if self.backend.observe():
                         raise RuntimeError("old backend not confirmed stopped")
-                state.update(phase="STARTING", gate="closed")
-                self._write(state)
+                commit("STARTING", "closed")
                 self.backend.start(goal)
                 return state
             except Exception as error:
