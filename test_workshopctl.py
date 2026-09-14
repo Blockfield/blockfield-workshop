@@ -76,6 +76,16 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertTrue(json.loads((self.root / "admin" / "results" / f"{request_id}.json").read_text())["ok"])
         self.assertEqual(json.loads((self.root / "admin" / "status.json").read_text())["phase"], "STARTING")
 
+    def test_inbox_failure_does_not_block_reconcile(self):
+        self.ctl("request", "game", "--release", "v1")
+        original = workshopctl.Controller.process_inbox
+        def broken(controller):
+            raise RecursionError("boom")
+        workshopctl.Controller.process_inbox = broken
+        self.addCleanup(setattr, workshopctl.Controller, "process_inbox", original)
+        code, state = self.ctl("step")
+        self.assertEqual((code, state["gate"]), (0, "public"))
+
     def test_bad_member_and_busy_lock(self):
         self.assertEqual(self.ctl("members", "nope")[0], 1)
         self.ctl("status")

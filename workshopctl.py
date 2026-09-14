@@ -65,7 +65,10 @@ def main(argv=None, backend_factory=None) -> int:
         elif args.command == "members":
             result = {"members": controller.set_members([parse_member(m) for m in args.member])}
         elif args.command == "step":
-            controller.process_inbox()
+            try:
+                controller.process_inbox()
+            except Exception as error:  # the site inbox must never block reconciliation
+                print(f"workshopctl: inbox pass failed: {error!r}", file=sys.stderr)
             state = controller.status()
             result = state if state["phase"] == "UNINITIALIZED" else controller.step()
         else:

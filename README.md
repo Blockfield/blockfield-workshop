@@ -76,7 +76,7 @@ unknown kind. A busy `controller.lock` leaves the request for the next step. Eac
   workshop gets a fresh session UUID; `recover` only toward game and runs the recovery step immediately.
 - `members` `{members:[{draslId,name,role}]}`: full ACL replacement (the site is the source of truth; `workshopctl members`
   is the owner fallback); a list without an `admin` is refused.
-- `message` `{message}`: at most 200 characters, no control characters, stored in `controller/message.json` and exported to
+- `message` `{message}`: at most 200 characters, no control characters (Cc) or `§` (same rule as the site), stored in `controller/message.json` and exported to
   gate/public/status; an empty message returns to `BF_MAINTENANCE_MESSAGE`.
 
 ## Owner setup (not done by this PR)

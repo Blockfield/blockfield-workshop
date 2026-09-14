@@ -212,6 +212,73 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(oct(self.admin.stat().st_mode & 0o777), "0o755")
         self.assertEqual(oct((self.admin / "status.json").stat().st_mode & 0o777), "0o644")
 
+    def test_deeply_nested_json_gets_error_result(self):
+        request_id = str(uuid4())
+        (self.inbox / f"{request_id}.json").write_text("[" * 60000)
+        self.assertEqual(self.process(), 1)
+        self.assertEqual(self.result(request_id)["error"], "invalid json")
+        self.assertEqual(os.listdir(self.inbox), [])
+
+    def test_failed_recovery_reports_error(self):
+        self.put("mode", profile="workshop", expectedRevision=1)
+        self.process()
+        self.backend.is_drained = True
+        self.backend.fail_start = True
+        self.controller.step()
+        request_id = self.put("mode", profile="game", expectedRevision=self.controller.status()["revision"], recover=True)
+        self.process()
+        result = self.result(request_id)
+        self.assertEqual((result["ok"], result["error"], result["revision"]), (False, "recovery failed: OSError", None))
+
+    def test_accepted_request_is_not_expired_after_busy_recovery_step(self):
+        self.put("mode", profile="workshop", expectedRevision=1)
+        self.process()
+        self.backend.is_drained = True
+        self.backend.fail_start = True
+        self.controller.step()
+        self.backend.fail_start = False
+        request_id = self.put("mode", profile="game", expectedRevision=self.controller.status()["revision"], recover=True)
+        step = self.controller.step
+        def busy(**kwargs):
+            raise BlockingIOError()
+        self.controller.step = busy
+        self.assertEqual(self.process(), 0)
+        self.assertEqual(self.controller.status()["operation"], request_id)
+        self.controller.step = step
+        self.process(now_ms=int(time.time() * 1000) + 11 * 60 * 1000)
+        self.assertTrue(self.result(request_id)["ok"])
+        self.assertEqual(self.controller.status()["phase"], "STARTING")
+
+    def test_prune_tolerates_vanished_result(self):
+        (self.admin / "results" / f"{uuid4()}.json").symlink_to(self.dir / "missing")
+        request_id = self.put("message", message="ok")
+        self.process()
+        self.assertTrue(self.result(request_id)["ok"])
+
+    def test_only_batch_is_read_and_leftover_directory_is_skipped(self):
+        stuck = str(uuid4())
+        (self.inbox / f"{stuck}.json").mkdir()
+        (self.inbox / f"{stuck}.json" / "child").write_text("x")
+        (self.admin / "results" / f"{stuck}.json").write_text("{}")
+        for i in range(25):
+            self.put("message", message=f"m{i}")
+        reads = []
+        load = self.controller._load_request
+        self.controller._load_request = lambda name: reads.append(name) or load(name)
+        self.assertEqual(self.process(), 20)
+        self.assertEqual(len(reads), 20)
+        self.assertNotIn(f"{stuck}.json", reads)
+        self.assertEqual(self.process(), 5)
+
+    def test_message_accepts_format_characters_like_the_site(self):
+        text = "Стройка 👩‍💻 идёт­"
+        request_id = self.put("message", message=text)
+        section = self.put("message", message="§cred")
+        self.process()
+        self.assertTrue(self.result(request_id)["ok"])
+        self.assertFalse(self.result(section)["ok"])
+        self.assertEqual(self.controller.message, text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -106,8 +106,9 @@ def member(value) -> dict:
 def valid_message(value) -> str:
     if not isinstance(value, str) or len(value) > 200:
         raise ValueError("message must be text of at most 200 characters")
-    if any(unicodedata.category(c) in {"Cc", "Cf", "Zl", "Zp"} for c in value):
-        raise ValueError("message must not contain control characters")
+    # Same rule as the site: control characters and Minecraft formatting codes only.
+    if "§" in value or any(unicodedata.category(c) == "Cc" for c in value):
+        raise ValueError("message must not contain control characters or §")
     return value.strip()
 
 
@@ -393,21 +394,28 @@ class Controller:
         try:
             # Separate lock: a concurrent manual step must not apply the same file twice.
             with self._locked("inbox.lock"):
-                names = sorted(n for n in os.listdir(self.inbox_dir) if INBOX_NAME.fullmatch(n))
-                pending = []
-                for name in names:
+                candidates = []
+                for name in os.listdir(self.inbox_dir):
+                    if not INBOX_NAME.fullmatch(name):
+                        continue
                     if (results / name).exists():
                         _remove(self.inbox_dir / name)
                         continue
+                    try:
+                        candidates.append((os.lstat(self.inbox_dir / name).st_mtime_ns, name))
+                    except FileNotFoundError:
+                        pass
+                # The site renames complete files, so mtime approximates createdAt without reading every file.
+                pending = []
+                for _, name in sorted(candidates)[:INBOX_BATCH]:
                     document, error = self._load_request(name)
                     created = document.get("createdAt") if document else None
                     pending.append((created if type(created) is int else 0, name, document, error))
                 pending.sort(key=lambda item: item[:2])
                 done = 0
-                for _, name, document, error in pending[:INBOX_BATCH]:
+                for _, name, document, error in pending:
                     request_id = name[:-len(".json")]
-                    actor = "?"
-                    revision = None
+                    actor, revision = "?", None
                     try:
                         if error:
                             raise ValueError(error)
@@ -417,13 +425,15 @@ class Controller:
                             raise ValueError("invalid actor")
                         if document.get("id") != request_id:
                             raise ValueError("id does not match file name")
-                        if type(document.get("createdAt")) is not int or now_ms - document["createdAt"] > INBOX_TTL_MS:
+                        # An operation already accepted (e.g. recovery step was busy) is finished, not expired.
+                        if (type(document.get("createdAt")) is not int or now_ms - document["createdAt"] > INBOX_TTL_MS) \
+                                and self.status().get("operation") != request_id:
                             raise ValueError("request expired")
                         revision = self._apply(request_id, document)
                     except BlockingIOError:
                         break
                     except Exception as failure:
-                        error = str(failure) or type(failure).__name__
+                        error, revision = str(failure) or type(failure).__name__, None
                     else:
                         error = None
                     result = {"id": request_id, "ok": error is None, "error": error, "revision": revision, "doneAt": now_ms}
@@ -433,12 +443,21 @@ class Controller:
                     kind = document.get("kind") if document else None
                     print(f"inbox {request_id} kind={kind!r} actor={actor} " + ("ok" if error is None else f"error: {error}"),
                           file=sys.stderr, flush=True)
+                self._prune_results(results)
         except (BlockingIOError, FileNotFoundError):
             return 0
-        kept = sorted(results.glob("*.json"), key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
-        for old in kept[RESULTS_KEPT:]:
-            old.unlink(missing_ok=True)
         return done
+
+    @staticmethod
+    def _prune_results(results: Path) -> None:
+        kept = []
+        for path in results.glob("*.json"):
+            try:
+                kept.append((path.stat().st_mtime_ns, path.name, path))
+            except FileNotFoundError:
+                pass
+        for _, _, old in sorted(kept, reverse=True)[RESULTS_KEPT:]:
+            old.unlink(missing_ok=True)
 
     def _load_request(self, name: str) -> tuple[dict | None, str | None]:
         try:
@@ -454,7 +473,7 @@ class Controller:
             return None, "request too large"
         try:
             document = json.loads(data)
-        except ValueError:
+        except Exception:  # includes RecursionError from deeply nested input
             return None, "invalid json"
         if not isinstance(document, dict) or type(document.get("schema")) is not int or document["schema"] != 1:
             return None, "unsupported schema"
@@ -480,13 +499,19 @@ class Controller:
             raise ValueError("invalid mode request")
         if recover and profile != "game":
             raise ValueError("recover is only allowed toward game")
-        release = (self.status().get("desired") or {}).get("release")
-        if not release:
-            raise ValueError("controller is not initialised")
-        goal = Goal("workshop", release, str(uuid4())) if profile == "workshop" else Goal("game", release)
+        state = self.status()
+        if state.get("operation") == request_id:
+            goal = Goal(**state["desired"])
+        else:
+            release = (state.get("desired") or {}).get("release")
+            if not release:
+                raise ValueError("controller is not initialised")
+            goal = Goal("workshop", release, str(uuid4())) if profile == "workshop" else Goal("game", release)
         state = self.request(request_id, goal, expected, recover=recover)
         if recover:
             state = self.step(recover=True)
+            if state["phase"] == "ERROR":
+                raise RuntimeError(f"recovery failed: {state.get('error')}")
         return state["revision"]
 
 
