@@ -49,6 +49,7 @@ elif argv[1:3] == ["service", "scale"]:
         state["java"][pid] = service["container"]
         (proc / pid).mkdir(parents=True, exist_ok=True)
         (proc / pid / "cgroup").write_text("0::/system.slice/docker-" + service["container"] + ".scope\n")
+        (proc / pid / "comm").write_text("java\n")
 elif argv[1] == "exec":
     print(state.get("rcon", {}).get(" ".join(argv[4:]), ""))
 state_path.write_text(json.dumps(state))
@@ -87,11 +88,12 @@ class DockerBackendTests(unittest.TestCase):
     def load(self):
         self.state = json.loads(self.state_file.read_text())
 
-    def java(self, pid, cid):
+    def java(self, pid, cid, comm="java"):
         self.load()
         self.state["java"][str(pid)] = cid
         (self.proc / str(pid)).mkdir(exist_ok=True)
         (self.proc / str(pid) / "cgroup").write_text(f"0::/system.slice/docker-{cid}.scope\n" if cid else "0::/user.slice\n")
+        (self.proc / str(pid) / "comm").write_text(comm + "\n")
         self.save()
 
     def running(self, profile, pid=100):
@@ -128,6 +130,15 @@ class DockerBackendTests(unittest.TestCase):
         self.assertEqual(self.backend.observe(), [Process(Goal("game", "unknown"), False)])
         self.ready("game", generation=None, session=None, release="v2.27.0")
         self.assertEqual(self.backend.observe(), [Process(Goal("game", "v2.27.0"), True)])
+
+    def test_mc_server_runner_wrapper_is_not_a_second_java(self):
+        # Real itzg container on homeserver: pgrep -f matches mc-server-runner and its java child, same cgroup.
+        self.running("game", pid=100)
+        self.java(99, GAME_CID, comm="mc-server-runne")
+        self.assertEqual(self.backend.java_pids(), [100])
+        inventory = self.backend.inventory()
+        self.assertEqual((inventory["game"]["java"], inventory["unknown"]), (1, 0))
+        self.backend.observe()
 
     def test_unknown_java_fails_closed(self):
         self.running("game")

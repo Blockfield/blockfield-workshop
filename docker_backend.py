@@ -94,7 +94,15 @@ class DockerBackend:
         return sum(1 for line in out.splitlines() if line.strip())
 
     def java_pids(self) -> list[int]:
-        return [int(pid) for pid in self.run(["pgrep", "-f", JAVA_PATTERN], ok_codes=(0, 1)).split()]
+        # pgrep -f also matches itzg's mc-server-runner, whose arguments carry the whole java command line.
+        pids = []
+        for pid in self.run(["pgrep", "-f", JAVA_PATTERN], ok_codes=(0, 1)).split():
+            try:
+                if (self.proc / pid / "comm").read_text().strip() == "java":
+                    pids.append(int(pid))
+            except OSError:
+                continue  # exited between pgrep and /proc read
+        return pids
 
     def container_of(self, pid: int) -> str | None:
         try:
