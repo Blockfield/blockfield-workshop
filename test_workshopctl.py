@@ -3,6 +3,7 @@ import fcntl
 import io
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from uuid import uuid4
@@ -25,7 +26,8 @@ class WorkshopctlTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = workshopctl.main(["--state-dir", str(self.root / "controller"), "--gate-file", str(self.root / "gate" / "gate.json"),
-                                     "--public-file", str(self.root / "public" / "public.json"), *argv], lambda: self.backend)
+                                     "--public-file", str(self.root / "public" / "public.json"),
+                                     "--admin-dir", str(self.root / "admin"), "--inbox-dir", str(self.root / "inbox"), *argv], lambda: self.backend)
         return code, json.loads(out.getvalue()) if out.getvalue() else err.getvalue()
 
     def test_switch_round_trip(self):
@@ -60,6 +62,19 @@ class WorkshopctlTests(unittest.TestCase):
         code, state = self.ctl("request", "game", "--recover")
         self.assertEqual((code, state["phase"]), (0, "STARTING"))
         self.assertIn("fence", self.backend.events)
+
+    def test_step_applies_inbox_before_reconcile(self):
+        self.ctl("request", "game", "--release", "v1")
+        self.ctl("step")
+        request_id = str(uuid4())
+        (self.root / "inbox").mkdir()
+        (self.root / "inbox" / f"{request_id}.json").write_text(json.dumps(
+            {"schema": 1, "id": request_id, "kind": "mode", "actor": {"draslId": DRASL, "name": "Nether"},
+             "createdAt": int(time.time() * 1000), "profile": "workshop", "expectedRevision": 1}))
+        code, state = self.ctl("step")
+        self.assertEqual((code, state["phase"], state["operation"]), (0, "STARTING", request_id))
+        self.assertTrue(json.loads((self.root / "admin" / "results" / f"{request_id}.json").read_text())["ok"])
+        self.assertEqual(json.loads((self.root / "admin" / "status.json").read_text())["phase"], "STARTING")
 
     def test_bad_member_and_busy_lock(self):
         self.assertEqual(self.ctl("members", "nope")[0], 1)

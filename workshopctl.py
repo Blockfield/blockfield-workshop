@@ -4,7 +4,7 @@
 workshopctl request workshop --session <uuid> [--release vX.Y.Z]
 workshopctl request game [--release vX.Y.Z] [--recover]
 workshopctl members [draslId:name[:role] ...]
-workshopctl step | status
+workshopctl step | status      # step applies the site admin inbox first
 """
 from __future__ import annotations
 
@@ -33,6 +33,8 @@ def main(argv=None, backend_factory=None) -> int:
     parser.add_argument("--state-dir", default=env.get("BF_STATE_DIR", "/srv/minecraft/workshop/controller"))
     parser.add_argument("--gate-file", default=env.get("BF_GATE_FILE", "/srv/minecraft/workshop/gate/gate.json"))
     parser.add_argument("--public-file", default=env.get("BF_PUBLIC_FILE", "/srv/minecraft/workshop/public/public.json"))
+    parser.add_argument("--admin-dir", default=env.get("BF_ADMIN_DIR", "/srv/minecraft/workshop/admin"))
+    parser.add_argument("--inbox-dir", default=env.get("BF_INBOX_DIR", "/srv/minecraft/workshop/inbox"))
     commands = parser.add_subparsers(dest="command", required=True)
     request = commands.add_parser("request").add_subparsers(dest="profile", required=True)
     workshop = request.add_parser("workshop")
@@ -55,13 +57,15 @@ def main(argv=None, backend_factory=None) -> int:
         for path in (Path(args.gate_file), Path(args.public_file)):
             path.parent.mkdir(parents=True, exist_ok=True)
         controller = Controller(state_dir, backend_factory(), gate_file=Path(args.gate_file),
-                                public_file=Path(args.public_file), message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE))
+                                public_file=Path(args.public_file), message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE),
+                                admin_dir=Path(args.admin_dir), inbox_dir=Path(args.inbox_dir))
         os.chmod(state_dir, 0o700)
         if args.command == "status":
             result = {"state": controller.status(), "members": controller.members()}
         elif args.command == "members":
             result = {"members": controller.set_members([parse_member(m) for m in args.member])}
         elif args.command == "step":
+            controller.process_inbox()
             state = controller.status()
             result = state if state["phase"] == "UNINITIALIZED" else controller.step()
         else:

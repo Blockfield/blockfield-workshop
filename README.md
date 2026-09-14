@@ -34,7 +34,9 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 | `<data>/.blockfield-ready.json` | mod on SERVER_STARTED (deleted by container start, SERVER_STARTING/STOPPING and controller before start) | controller | `{profile, generation, session, release}` |
 | `/srv/minecraft/workshop/gate/gate.json` | controller after every state write | proxy (`BLOCKFIELD_GATE_FILE`) | `{schema:1, revision, gate: public/draining/closed/builders, backend: game/workshop, message, allowed:[{draslId,name,role}]}` |
 | `/srv/minecraft/workshop/public/public.json` | controller | site (`BLOCKFIELD_GATE_FILE`) | `{mode: game/draining/workshop/maintenance, message, since}` |
-| `/srv/minecraft/workshop/controller/` (0700) | controller | — | `state.json`, `members.json`, `controller.lock` |
+| `/srv/minecraft/workshop/controller/` (0700) | controller | — | `state.json`, `members.json`, `message.json`, `controller.lock`, `inbox.lock` |
+| `/srv/minecraft/workshop/admin/` (0755, files 0644, `BF_ADMIN_DIR`) | controller | site admin (read-only mount) | `members.json` (current ACL), `status.json` `{schema:1, revision, phase, gate, error, desired, message, updatedAt}`, `results/<requestId>.json` `{id, ok, error, revision, doneAt}` (newest 200 kept) |
+| `/srv/minecraft/workshop/inbox/` (root:1000 0770, `BF_INBOX_DIR`) | site admin (uid 1000, `.<id>.tmp` + rename) | controller | `<id>.json` `{schema:1, id, kind: mode/members/message, actor:{draslId,name}, createdAt, ...}` |
 
 `release` is `build` from the image's `/opt/blockfield-build.json` (the modpack tag, e.g. `v2.27.0`). Readiness counts only
 when all four fields equal `profile.json` and exactly one java of that app runs. Before the first controller start
@@ -62,6 +64,21 @@ and a single-file bind mount would keep showing the old inode.
 with `bf maintenance drain`, `bf maintenance status`, `save-all flush`, and `pgrep -f <java pattern>`; java is mapped
 to its container through `/proc/<pid>/cgroup`.
 
+## Site admin inbox
+
+`workshopctl step` (the timer) first applies up to 20 inbox requests, oldest `createdAt` first, then reconciles.
+Every request gets exactly one `admin/results/<id>.json` and its inbox file is removed; an existing result only removes
+the inbox file (idempotent). Rejected with a result: names not `^[0-9a-f-]{36}\.json$` are ignored, symlinks/non-regular
+files, > 65536 bytes, invalid JSON, `schema != 1`, `id` != file name, invalid actor, `createdAt` older than 10 min,
+unknown kind. A busy `controller.lock` leaves the request for the next step. Each request is logged with the actor name.
+
+- `mode` `{profile: game|workshop, expectedRevision, recover?}`: same as `workshopctl request` with the current release;
+  workshop gets a fresh session UUID; `recover` only toward game and runs the recovery step immediately.
+- `members` `{members:[{draslId,name,role}]}`: full ACL replacement (the site is the source of truth; `workshopctl members`
+  is the owner fallback); a list without an `admin` is refused.
+- `message` `{message}`: at most 200 characters, no control characters, stored in `controller/message.json` and exported to
+  gate/public/status; an empty message returns to `BF_MAINTENANCE_MESSAGE`.
+
 ## Owner setup (not done by this PR)
 
 Dependencies: server image with blockfield-mod#30 (readiness + workshop profile, stacked on #28 DRAINING), proxy image
@@ -71,6 +88,8 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    ```sh
    install -d -m 0755 /srv/minecraft/backend-lock /srv/minecraft/workshop /srv/minecraft/workshop/gate /srv/minecraft/workshop/public
    install -d -m 0700 /srv/minecraft/workshop/controller
+   install -d -m 0755 /srv/minecraft/workshop/admin /srv/minecraft/workshop/admin/results
+   install -d -m 0770 -o root -g 1000 /srv/minecraft/workshop/inbox   # site container uid/gid 1000 writes requests
    install -d -o 1000 -g 1000 /srv/minecraft/workshop/data
    install -d /opt/blockfield-workshop /etc/blockfield
    install -m 0644 tools/workshop/{controller,docker_backend,workshopctl,journal}.py /opt/blockfield-workshop/
@@ -89,7 +108,8 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    as the game app, own `RCON_PASSWORD`, same `FABRIC_PROXY_SECRET`; **no** `BLOCKFIELD_STATS_INGEST_*` variables.
    Put the resulting service name into `/etc/blockfield/workshop.env` and into `proxy/velocity.toml` (`workshop = ...`).
 4. Proxy app: env `BLOCKFIELD_GATE_FILE=/workshop-gate/gate.json`, mount `/srv/minecraft/workshop/gate` -> `/workshop-gate` read-only.
-   Site app: env `BLOCKFIELD_GATE_FILE=/workshop-public/public.json`, mount `/srv/minecraft/workshop/public` read-only.
+   Site app: env `BLOCKFIELD_GATE_FILE=/workshop-public/public.json`, mount `/srv/minecraft/workshop/public` read-only;
+   for the admin also mount `/srv/minecraft/workshop/admin` read-only and `/srv/minecraft/workshop/inbox` read-write.
 5. Initialise before deploying the proxy/site with the env (with the env set and no file both fail closed):
    ```sh
    cd /opt/blockfield-workshop && set -a && . /etc/blockfield/workshop.env && set +a

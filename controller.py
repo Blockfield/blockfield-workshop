@@ -12,11 +12,13 @@ import json
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 import tempfile
 import time
 from typing import Protocol
-from uuid import UUID
+import unicodedata
+from uuid import UUID, uuid4
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,11 @@ DEFAULT_MESSAGE = "На сервере проводятся технически
 OPEN_GATES = {"game": "public", "workshop": "builders", "test": "testers"}
 ROLES = {"builder", "lead", "admin"}
 NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
+INBOX_NAME = re.compile(r"[0-9a-f-]{36}\.json")
+INBOX_MAX_BYTES = 65536
+INBOX_BATCH = 20
+INBOX_TTL_MS = 10 * 60 * 1000
+RESULTS_KEPT = 200
 
 
 def member(value) -> dict:
@@ -94,6 +101,14 @@ def member(value) -> dict:
     if not isinstance(name, str) or not NAME.fullmatch(name) or role not in ROLES:
         raise ValueError("invalid member name/role")
     return {"draslId": drasl, "name": name, "role": role}
+
+
+def valid_message(value) -> str:
+    if not isinstance(value, str) or len(value) > 200:
+        raise ValueError("message must be text of at most 200 characters")
+    if any(unicodedata.category(c) in {"Cc", "Cf", "Zl", "Zp"} for c in value):
+        raise ValueError("message must not contain control characters")
+    return value.strip()
 
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -116,7 +131,8 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
 
 class Controller:
     def __init__(self, directory: Path, backend: Backend, *, gate_file: Path | None = None,
-                 public_file: Path | None = None, message: str = DEFAULT_MESSAGE):
+                 public_file: Path | None = None, message: str = DEFAULT_MESSAGE,
+                 admin_dir: Path | None = None, inbox_dir: Path | None = None):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.directory.is_symlink():
@@ -125,13 +141,20 @@ class Controller:
         self.members_file = self.directory / "members.json"
         self.gate_file = Path(gate_file) if gate_file else self.directory / "gate.json"
         self.public_file = Path(public_file) if public_file else self.directory / "public.json"
-        self.message = message.strip()[:500] or DEFAULT_MESSAGE
+        self.message_file = self.directory / "message.json"
+        self.default_message = message.strip()[:500] or DEFAULT_MESSAGE
+        self.admin_dir = Path(admin_dir) if admin_dir else None
+        self.inbox_dir = Path(inbox_dir) if inbox_dir else None
+        if self.admin_dir:
+            (self.admin_dir / "results").mkdir(parents=True, exist_ok=True)
+            for path in (self.admin_dir, self.admin_dir / "results"):
+                os.chmod(path, 0o755)
         self.backend = backend
 
     @contextmanager
-    def _locked(self):
+    def _locked(self, name: str = "controller.lock"):
         flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
-        fd = os.open(self.directory / "controller.lock", flags, 0o600)
+        fd = os.open(self.directory / name, flags, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             yield
@@ -208,6 +231,26 @@ class Controller:
             self._export(self._read())
         return members
 
+    @property
+    def message(self) -> str:
+        """Admin override from message.json, else the configured default."""
+        try:
+            value = json.loads(self.message_file.read_bytes()[:4096])["message"]
+            return valid_message(value) or self.default_message
+        except (OSError, ValueError, TypeError, KeyError):
+            return self.default_message
+
+    def set_message(self, value) -> str:
+        """Empty text removes the override."""
+        value = valid_message(value)
+        with self._locked():
+            if value:
+                atomic_write(self.message_file, json.dumps({"message": value}, ensure_ascii=False).encode())
+            else:
+                self.message_file.unlink(missing_ok=True)
+            self._export(self._read())
+        return self.message
+
     def status(self) -> dict:
         return self._read()
 
@@ -223,13 +266,19 @@ class Controller:
         mode = {"public": "game", "draining": "draining", "builders": "workshop"}.get(gate, "maintenance")
         public = {"mode": mode, "message": "" if mode == "game" else self.message, "since": int(time.time() * 1000)}
         self._replace_if_changed(self.public_file, public, keep=("since",))
+        if self.admin_dir:
+            self._replace_if_changed(self.admin_dir / "members.json", self.members(), keep=())
+            status = {"schema": 1, "revision": state["revision"], "phase": state["phase"], "gate": state["gate"],
+                      "error": state.get("error"), "desired": state.get("desired"), "message": self.message,
+                      "updatedAt": int(time.time() * 1000)}
+            self._replace_if_changed(self.admin_dir / "status.json", status, keep=("updatedAt",))
 
     @staticmethod
-    def _replace_if_changed(path: Path, document: dict, keep: tuple) -> None:
+    def _replace_if_changed(path: Path, document, keep: tuple) -> None:
+        def strip(value):
+            return {k: v for k, v in value.items() if k not in keep} if isinstance(value, dict) else value
         try:
-            previous = json.loads(path.read_bytes()[:65536])
-            if isinstance(previous, dict) and {k: v for k, v in previous.items() if k not in keep} == \
-                    {k: v for k, v in document.items() if k not in keep}:
+            if strip(json.loads(path.read_bytes()[:65536])) == strip(document):
                 return
         except (OSError, ValueError):
             pass
@@ -331,3 +380,123 @@ class Controller:
                 state.update(phase="ERROR", gate="closed", error=type(error).__name__)
                 self._write(state)
                 return state
+
+    def process_inbox(self, now_ms: int | None = None) -> int:
+        """Apply admin requests from the site, oldest first; each one gets exactly one result file.
+
+        Returns the number of results written. Busy controller lock leaves the request for the next pass.
+        """
+        if not self.inbox_dir or not self.admin_dir:
+            return 0
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        results = self.admin_dir / "results"
+        try:
+            # Separate lock: a concurrent manual step must not apply the same file twice.
+            with self._locked("inbox.lock"):
+                names = sorted(n for n in os.listdir(self.inbox_dir) if INBOX_NAME.fullmatch(n))
+                pending = []
+                for name in names:
+                    if (results / name).exists():
+                        _remove(self.inbox_dir / name)
+                        continue
+                    document, error = self._load_request(name)
+                    created = document.get("createdAt") if document else None
+                    pending.append((created if type(created) is int else 0, name, document, error))
+                pending.sort(key=lambda item: item[:2])
+                done = 0
+                for _, name, document, error in pending[:INBOX_BATCH]:
+                    request_id = name[:-len(".json")]
+                    actor = "?"
+                    revision = None
+                    try:
+                        if error:
+                            raise ValueError(error)
+                        actor = member({**document.get("actor"), "role": "builder"})["name"] \
+                            if isinstance(document.get("actor"), dict) else None
+                        if actor is None:
+                            raise ValueError("invalid actor")
+                        if document.get("id") != request_id:
+                            raise ValueError("id does not match file name")
+                        if type(document.get("createdAt")) is not int or now_ms - document["createdAt"] > INBOX_TTL_MS:
+                            raise ValueError("request expired")
+                        revision = self._apply(request_id, document)
+                    except BlockingIOError:
+                        break
+                    except Exception as failure:
+                        error = str(failure) or type(failure).__name__
+                    else:
+                        error = None
+                    result = {"id": request_id, "ok": error is None, "error": error, "revision": revision, "doneAt": now_ms}
+                    atomic_write(results / name, json.dumps(result, ensure_ascii=False, sort_keys=True).encode(), 0o644)
+                    _remove(self.inbox_dir / name)
+                    done += 1
+                    kind = document.get("kind") if document else None
+                    print(f"inbox {request_id} kind={kind!r} actor={actor} " + ("ok" if error is None else f"error: {error}"),
+                          file=sys.stderr, flush=True)
+        except (BlockingIOError, FileNotFoundError):
+            return 0
+        kept = sorted(results.glob("*.json"), key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+        for old in kept[RESULTS_KEPT:]:
+            old.unlink(missing_ok=True)
+        return done
+
+    def _load_request(self, name: str) -> tuple[dict | None, str | None]:
+        try:
+            fd = os.open(self.inbox_dir / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None, "not a regular file"
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None, "not a regular file"
+        with os.fdopen(fd, "rb") as handle:
+            data = handle.read(INBOX_MAX_BYTES + 1)
+        if len(data) > INBOX_MAX_BYTES:
+            return None, "request too large"
+        try:
+            document = json.loads(data)
+        except ValueError:
+            return None, "invalid json"
+        if not isinstance(document, dict) or type(document.get("schema")) is not int or document["schema"] != 1:
+            return None, "unsupported schema"
+        return document, None
+
+    def _apply(self, request_id: str, document: dict) -> int | None:
+        kind = document.get("kind")
+        if kind == "members":
+            entries = document.get("members")
+            if not isinstance(entries, list):
+                raise ValueError("members must be a list")
+            if not any(member(entry)["role"] == "admin" for entry in entries):
+                raise ValueError("members must keep at least one admin")
+            self.set_members(entries)
+            return None
+        if kind == "message":
+            self.set_message(document.get("message"))
+            return None
+        if kind != "mode":
+            raise ValueError("unknown kind")
+        profile, expected, recover = document.get("profile"), document.get("expectedRevision"), document.get("recover", False)
+        if profile not in {"game", "workshop"} or type(expected) is not int or type(recover) is not bool:
+            raise ValueError("invalid mode request")
+        if recover and profile != "game":
+            raise ValueError("recover is only allowed toward game")
+        release = (self.status().get("desired") or {}).get("release")
+        if not release:
+            raise ValueError("controller is not initialised")
+        goal = Goal("workshop", release, str(uuid4())) if profile == "workshop" else Goal("game", release)
+        state = self.request(request_id, goal, expected, recover=recover)
+        if recover:
+            state = self.step(recover=True)
+        return state["revision"]
+
+
+def _remove(path: Path) -> None:
+    try:
+        path.unlink()
+    except IsADirectoryError:
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+    except FileNotFoundError:
+        pass
