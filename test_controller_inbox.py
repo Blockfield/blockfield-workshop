@@ -39,7 +39,11 @@ class InboxTests(unittest.TestCase):
         request_id = str(uuid4())
         document = {"schema": 1, "id": request_id, "kind": kind, "actor": {"draslId": DRASL, "name": "Nether"},
                     "createdAt": int(time.time() * 1000) if created is None else created, **fields}
-        (self.inbox / f"{request_id}.json").write_text(json.dumps(document))
+        path = self.inbox / f"{request_id}.json"
+        path.write_text(json.dumps(document))
+        # The controller picks its batch by mtime (the site renames files in order); coarse
+        # filesystem timestamps on CI runners tie otherwise and make the batch order random.
+        os.utime(path, ns=(document["createdAt"] * 1_000_000,) * 2)
         return request_id
 
     def result(self, request_id):
