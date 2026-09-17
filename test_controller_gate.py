@@ -108,6 +108,8 @@ class GateTests(unittest.TestCase):
         # lead/admin always have all maps: an explicit list is dropped, not rejected.
         self.assertEqual(member({**builder, "role": "lead"}), {"draslId": DRASL, "name": "Nether", "role": "lead"})
         self.assertNotIn("maps", member({"draslId": DRASL, "name": "Nether"}))
+        # Explicit [] is not the same as missing: the builder may enter the hub but edit no map.
+        self.assertEqual(member({**builder, "maps": []})["maps"], [])
         self.controller.set_members([builder])
         self.to_workshop()
         self.assertEqual(self.gate()["allowed"], [builder])
