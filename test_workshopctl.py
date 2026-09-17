@@ -50,6 +50,12 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual((gate["backend"], gate["allowed"][0]["name"]), ("workshop", "Nether"))
         self.assertEqual(json.loads((self.root / "public" / "public.json").read_text())["mode"], "workshop")
 
+    def test_members_cli_parses_maps(self):
+        code, result = self.ctl("members", f"{DRASL}:Nether:admin", f"{'a' * 32}:Builder:builder:konstaxa+fields")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["members"][1]["maps"], ["konstaxa", "fields"])
+        self.assertEqual(self.ctl("members", f"{DRASL}:Nether:admin", f"{'a' * 32}:Builder:builder:nope")[0], 1)
+
     def test_recover_runs_explicit_step(self):
         self.ctl("request", "game", "--release", "v1")
         self.ctl("step")

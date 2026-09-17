@@ -96,6 +96,22 @@ class GateTests(unittest.TestCase):
         self.controller._write(self.controller.status())
         self.assertEqual(self.gate()["allowed"], [])
 
+    def test_member_maps_validated_and_exported(self):
+        builder = {"draslId": DRASL, "name": "Nether", "role": "builder", "maps": ["konstaxa", "fields"]}
+        self.assertEqual(member(builder), builder)
+        with self.assertRaises(ValueError):
+            member({**builder, "maps": ["nope"]})
+        with self.assertRaises(ValueError):
+            member({**builder, "maps": ["fields", "fields"]})
+        with self.assertRaises(ValueError):
+            member({**builder, "maps": "fields"})
+        # lead/admin always have all maps: an explicit list is dropped, not rejected.
+        self.assertEqual(member({**builder, "role": "lead"}), {"draslId": DRASL, "name": "Nether", "role": "lead"})
+        self.assertNotIn("maps", member({"draslId": DRASL, "name": "Nether"}))
+        self.controller.set_members([builder])
+        self.to_workshop()
+        self.assertEqual(self.gate()["allowed"], [builder])
+
     def test_since_survives_unchanged_mode(self):
         self.controller.request(str(uuid4()), self.goal, 0)
         self.controller.step()

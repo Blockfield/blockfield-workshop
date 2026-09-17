@@ -32,7 +32,7 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 | --- | --- | --- | --- |
 | `/srv/minecraft/backend-lock/profile.json` | controller `start()` | `start-container.sh`, mod | `{schema:1, profile, generation, session, release}` |
 | `<data>/.blockfield-ready.json` | mod on SERVER_STARTED (deleted by container start, SERVER_STARTING/STOPPING and controller before start) | controller | `{profile, generation, session, release}` |
-| `/srv/minecraft/workshop/gate/gate.json` | controller after every state write | proxy (`BLOCKFIELD_GATE_FILE`) | `{schema:1, revision, gate: public/draining/closed/builders, backend: game/workshop, message, allowed:[{draslId,name,role}]}` |
+| `/srv/minecraft/workshop/gate/gate.json` | controller after every state write | proxy (`BLOCKFIELD_GATE_FILE`) | `{schema:1, revision, gate: public/draining/closed/builders, backend: game/workshop, message, allowed:[{draslId,name,role,maps?}]}` |
 | `/srv/minecraft/workshop/public/public.json` | controller | site (`BLOCKFIELD_GATE_FILE`) | `{mode: game/draining/workshop/maintenance, message, since}` |
 | `/srv/minecraft/workshop/controller/` (0700) | controller | — | `state.json`, `members.json`, `message.json`, `controller.lock`, `inbox.lock` |
 | `/srv/minecraft/workshop/admin/` (0755, files 0644, `BF_ADMIN_DIR`) | controller | site admin (read-only mount) | `members.json` (current ACL), `status.json` `{schema:1, revision, phase, gate, error, desired, message, updatedAt}`, `results/<requestId>.json` `{id, ok, error, revision, doneAt}` (newest 200 kept) |
@@ -74,8 +74,9 @@ unknown kind. A busy `controller.lock` leaves the request for the next step. Eac
 
 - `mode` `{profile: game|workshop, expectedRevision, recover?}`: same as `workshopctl request` with the current release;
   workshop gets a fresh session UUID; `recover` only toward game and runs the recovery step immediately.
-- `members` `{members:[{draslId,name,role}]}`: full ACL replacement (the site is the source of truth; `workshopctl members`
-  is the owner fallback); a list without an `admin` is refused.
+- `members` `{members:[{draslId,name,role,maps?}]}`: full ACL replacement (the site is the source of truth; `workshopctl members`
+  is the owner fallback); a list without an `admin` is refused. `maps` is an optional array of map ids (`baxmut, berdichev, dm_arena, fields, firing_range, konstaxa, kozyatyn, zaliznichne`, matching `server/lobby/blockfield/maps/*.json`
+  in blockfield-mod); missing means all maps, unknown ids are rejected, and `lead`/`admin` always have all maps regardless of `maps`.
 - `message` `{message}`: at most 200 characters, no control characters (Cc) or `§` (same rule as the site), stored in `controller/message.json` and exported to
   gate/public/status; an empty message returns to `BF_MAINTENANCE_MESSAGE`.
 
@@ -124,7 +125,8 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
 ## Operations
 
 ```sh
-python3 workshopctl.py members e10438e4797b49718cfecec6a8fa171b:Nether:admin <draslId>:<Name>[:builder|lead|admin]
+python3 workshopctl.py members e10438e4797b49718cfecec6a8fa171b:Nether:admin <draslId>:<Name>[:builder|lead|admin[:mapId+mapId]]
+python3 workshopctl.py members e10438e4797b49718cfecec6a8fa171b:Nether:admin <draslId>:Builder:builder:konstaxa+fields  # restrict to two maps
 python3 workshopctl.py request workshop --session "$(python3 -c 'import uuid;print(uuid.uuid4())')"
 python3 workshopctl.py status          # the timer does the steps; phase DRAINING can last a whole campaign
 python3 workshopctl.py request game    # save, stop workshop, start game, open after readiness

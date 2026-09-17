@@ -3,7 +3,7 @@
 
 workshopctl request workshop --session <uuid> [--release vX.Y.Z]
 workshopctl request game [--release vX.Y.Z] [--recover]
-workshopctl members [draslId:name[:role] ...]
+workshopctl members [draslId:name[:role[:mapId+mapId...]] ...]
 workshopctl step | status      # step applies the site admin inbox first
 """
 from __future__ import annotations
@@ -22,9 +22,12 @@ BUSY = 75
 
 def parse_member(text: str) -> dict:
     parts = text.split(":")
-    if len(parts) not in (2, 3):
-        raise ValueError(f"member must be draslId:name[:role], got {text!r}")
-    return {"draslId": parts[0], "name": parts[1], "role": parts[2] if len(parts) == 3 else "builder"}
+    if len(parts) not in (2, 3, 4):
+        raise ValueError(f"member must be draslId:name[:role[:mapId+mapId...]], got {text!r}")
+    result = {"draslId": parts[0], "name": parts[1], "role": parts[2] if len(parts) >= 3 else "builder"}
+    if len(parts) == 4:
+        result["maps"] = parts[3].split("+") if parts[3] else []
+    return result
 
 
 def main(argv=None, backend_factory=None) -> int:

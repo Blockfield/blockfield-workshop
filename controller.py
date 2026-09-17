@@ -79,6 +79,8 @@ class Backend(Protocol):
 DEFAULT_MESSAGE = "На сервере проводятся технические работы. Обычный вход временно недоступен."
 OPEN_GATES = {"game": "public", "workshop": "builders", "test": "testers"}
 ROLES = {"builder", "lead", "admin"}
+# server/lobby/blockfield/maps/*.json ids (blockfield-mod); the controller only validates, it does not read the mod's data.
+MAP_IDS = frozenset({"baxmut", "berdichev", "dm_arena", "fields", "firing_range", "konstaxa", "kozyatyn", "zaliznichne"})
 NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
 INBOX_NAME = re.compile(r"[0-9a-f-]{36}\.json")
 INBOX_MAX_BYTES = 65536
@@ -88,8 +90,13 @@ RESULTS_KEPT = 200
 
 
 def member(value) -> dict:
-    """Validated ACL entry; the proxy matches both the Drasl profile id and the current name."""
-    if not isinstance(value, dict) or set(value) - {"draslId", "name", "role"}:
+    """Validated ACL entry; the proxy matches both the Drasl profile id and the current name.
+
+    Optional "maps": which map ids a builder may edit; missing means all maps (backwards
+    compatible). lead/admin always have all maps, so an explicit list on those roles is dropped
+    rather than rejected -- callers that pass one through unchanged (e.g. a full site payload) stay valid.
+    """
+    if not isinstance(value, dict) or set(value) - {"draslId", "name", "role", "maps"}:
         raise ValueError("invalid member")
     drasl = value.get("draslId")
     if not isinstance(drasl, str):
@@ -100,7 +107,19 @@ def member(value) -> dict:
     name, role = value.get("name"), value.get("role", "builder")
     if not isinstance(name, str) or not NAME.fullmatch(name) or role not in ROLES:
         raise ValueError("invalid member name/role")
-    return {"draslId": drasl, "name": name, "role": role}
+    result = {"draslId": drasl, "name": name, "role": role}
+    if "maps" in value and value["maps"] is not None:
+        maps = value["maps"]
+        if not isinstance(maps, list) or any(not isinstance(m, str) for m in maps):
+            raise ValueError("invalid maps list")
+        if len(set(maps)) != len(maps):
+            raise ValueError("duplicate map id")
+        unknown = set(maps) - MAP_IDS
+        if unknown:
+            raise ValueError(f"unknown map id: {sorted(unknown)}")
+        if role == "builder":
+            result["maps"] = maps
+    return result
 
 
 def valid_message(value) -> str:
