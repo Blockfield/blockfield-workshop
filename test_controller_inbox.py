@@ -205,8 +205,9 @@ class InboxTests(unittest.TestCase):
 
     def test_status_export_content_and_stable_timestamp(self):
         status = json.loads((self.admin / "status.json").read_text())
-        self.assertEqual({k: v for k, v in status.items() if k != "updatedAt"},
+        self.assertEqual({k: v for k, v in status.items() if k not in ("updatedAt", "since")},
                          {"schema": 1, "revision": 1, "phase": "game", "gate": "public", "error": None,
+                          "errorMessage": None, "deadline": None,
                           "desired": {"profile": "game", "release": "v1", "session": None, "candidate": None},
                           "message": DEFAULT_MESSAGE})
         inode = (self.admin / "status.json").stat().st_ino

@@ -11,13 +11,18 @@ class FakeBackend:
         self.processes = [Process(Goal("game", "v1"), True)]
         self.events = []
         self.is_drained = False
+        self.drain_rooms = self.drain_ranked = self.drain_pending = 1
+        self.drain_healthy = True
         self.fail_save = False
         self.fail_stop = False
         self.fail_start = False
+        self.fence_fails = False
     def preflight(self, goal): pass
     def observe(self): return list(self.processes)
     def request_drain(self): self.events.append("drain")
-    def drained(self): return self.is_drained
+    def drain_progress(self):
+        return {"draining": True, "drained": self.is_drained, "rooms": self.drain_rooms,
+                "ranked": self.drain_ranked, "pending": self.drain_pending, "healthy": self.drain_healthy}
     def save_and_freeze(self, process):
         self.events.append("save")
         if self.fail_save: raise OSError("save failed")

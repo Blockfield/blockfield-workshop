@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 import tempfile
 import time
-from typing import Protocol
+from typing import Callable, Protocol
 import unicodedata
 from uuid import UUID, uuid4
 
@@ -60,8 +60,13 @@ class Backend(Protocol):
         """Return EVERY full backend, including unready/stopping processes."""
     def request_drain(self) -> None:
         """Reject new campaigns; keep all rounds and valid reconnects of active campaigns."""
-    def drained(self) -> bool:
-        """True only after all campaigns/battles ended and their results are durable locally."""
+    def drain_progress(self) -> dict | None:
+        """None when there is nothing to drain (matches the old drained()==True fast path).
+
+        Otherwise a dict with "drained" (bool) plus whatever `bf maintenance status` reports:
+        "rooms", "ranked", "pending" (int) and "healthy" (bool), used to size the drain deadline
+        and to short-circuit the "nothing left but stats unhealthy" case.
+        """
     def save_and_freeze(self, process: Process) -> None:
         """Finish tools, save world+config and stop new writes; raise on uncertainty."""
     def stop(self, process: Process) -> None:
@@ -152,7 +157,18 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
 class Controller:
     def __init__(self, directory: Path, backend: Backend, *, gate_file: Path | None = None,
                  public_file: Path | None = None, message: str = DEFAULT_MESSAGE,
-                 admin_dir: Path | None = None, inbox_dir: Path | None = None):
+                 admin_dir: Path | None = None, inbox_dir: Path | None = None,
+                 drain_timeout: float = 600.0, drain_timeout_ranked: float = 3600.0,
+                 drain_health_grace: float = 60.0, start_timeout: float = 300.0,
+                 now: Callable[[], float] | None = None):
+        """drain_timeout/drain_timeout_ranked: DRAINING deadline (seconds) with no/some ranked campaigns
+        left; drain_health_grace: extra short-circuit when rooms=ranked=pending=0 but stats are still
+        unhealthy (the 2026-09-18 incident) -- don't hold players hostage to that flag. start_timeout:
+        STARTING deadline. Any deadline exceeded rolls back to the previous stable profile automatically.
+        """
+        self.drain_timeout, self.drain_timeout_ranked = drain_timeout, drain_timeout_ranked
+        self.drain_health_grace, self.start_timeout = drain_health_grace, start_timeout
+        self._now = now or time.time
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.directory.is_symlink():
@@ -170,6 +186,9 @@ class Controller:
             for path in (self.admin_dir, self.admin_dir / "results"):
                 os.chmod(path, 0o755)
         self.backend = backend
+
+    def _now_ms(self) -> int:
+        return int(self._now() * 1000)
 
     @contextmanager
     def _locked(self, name: str = "controller.lock"):
@@ -229,6 +248,17 @@ class Controller:
             raise ValueError("invalid operation intent") from error
         if phase in {"game", "workshop", "test"} and phase != goal.profile:
             raise ValueError("stable phase does not match desired profile")
+        # Additive fields: absent on a state.json written before this fix, so default rather than reject.
+        state.setdefault("since", 0)
+        state.setdefault("errorMessage", None)
+        state.setdefault("rollback", None)
+        if type(state["since"]) is not int or not (state["errorMessage"] is None or isinstance(state["errorMessage"], str)):
+            raise ValueError("invalid state timing/error fields")
+        if state["rollback"] is not None:
+            try:
+                Goal(**state["rollback"])
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ValueError("invalid rollback goal") from error
         return state
 
     def _write(self, state: dict) -> None:
@@ -274,8 +304,12 @@ class Controller:
     def status(self) -> dict:
         return self._read()
 
-    def _export(self, state: dict) -> None:
-        """Proxy gate (private ACL) and public site status. Rewritten only when content changes."""
+    def _export(self, state: dict, *, deadline: int | None = None) -> None:
+        """Proxy gate (private ACL) and public site status. Rewritten only when content changes.
+
+        deadline is passed in by the caller for the ticks where it is live (DRAINING/STARTING wait
+        loops); it is derived from "since" rather than persisted, so it is never stale on disk.
+        """
         gate = state["gate"] if state["gate"] in {"public", "draining", "builders"} else "closed"
         profile = (state.get("desired") or {}).get("profile", "game")
         backend = "workshop" if gate == "builders" or (gate == "closed" and profile == "workshop") else "game"
@@ -289,7 +323,9 @@ class Controller:
         if self.admin_dir:
             self._replace_if_changed(self.admin_dir / "members.json", self.members(), keep=())
             status = {"schema": 1, "revision": state["revision"], "phase": state["phase"], "gate": state["gate"],
-                      "error": state.get("error"), "desired": state.get("desired"), "message": self.message,
+                      "error": state.get("error"), "errorMessage": state.get("errorMessage"),
+                      "since": state.get("since"), "deadline": deadline,
+                      "desired": state.get("desired"), "message": self.message,
                       "updatedAt": int(time.time() * 1000)}
             self._replace_if_changed(self.admin_dir / "status.json", status, keep=("updatedAt",))
 
@@ -324,8 +360,14 @@ class Controller:
                 raise RuntimeError("operation in progress or requires recovery")
             self.backend.preflight(goal)
             revision = state["revision"] + 1
+            # The stable phase we're leaving IS the running goal (phase==goal.profile is an invariant of
+            # _read()); remember it now so a later DRAINING/STARTING timeout can roll back to it without
+            # relying on backend.observe() still agreeing once things go wrong.
+            previous_stable = state.get("desired") if state.get("phase") in {"game", "workshop", "test"} else None
             state = {"schema": 1, "revision": revision, "phase": "ERROR" if recovering else "REQUESTED", "gate": "closed",
-                     "operation": operation, "desired": asdict(goal), "error": state.get("error") if recovering else None}
+                     "operation": operation, "desired": asdict(goal), "error": state.get("error") if recovering else None,
+                     "errorMessage": state.get("errorMessage") if recovering else None,
+                     "since": self._now_ms(), "rollback": None if recovering else previous_stable}
             self._write(state)
             return state
 
@@ -337,6 +379,9 @@ class Controller:
         Explicit recovery fences pending starts before considering another start.
         A repeated step never counts as forced interruption. State is written only when
         phase/gate/error change, so a stable or draining gate never flaps through closed.
+
+        DRAINING and STARTING each carry a deadline (see __init__); past it, step() rolls back to
+        the profile recorded in state["rollback"] instead of waiting or requiring root recovery.
         """
         with self._locked():
             state = self._read()
@@ -348,15 +393,19 @@ class Controller:
             previous_phase = state["phase"]
             goal = Goal(**state["desired"])
 
-            def commit(phase: str, gate: str, error: str | None = None) -> None:
-                if (state["phase"], state["gate"], state.get("error")) != (phase, gate, error):
-                    state.update(phase=phase, gate=gate, error=error)
+            def commit(phase: str, gate: str, error: str | None = None, error_message: str | None = None) -> None:
+                if (state["phase"], state["gate"], state.get("error"), state.get("errorMessage")) != (phase, gate, error, error_message):
+                    if state["phase"] != phase:
+                        state["since"] = self._now_ms()
+                        if phase in {"game", "workshop", "test"}:
+                            state["rollback"] = None
+                    state.update(phase=phase, gate=gate, error=error, errorMessage=error_message)
                     self._write(state)
 
             try:
                 self.backend.preflight(goal)
                 if recover and previous_phase in {"STARTING", "ERROR"}:
-                    commit(previous_phase, "closed", state.get("error"))
+                    commit(previous_phase, "closed", state.get("error"), state.get("errorMessage"))
                     self.backend.fence_pending_starts()
                 processes = self.backend.observe()
                 if len(processes) > 1:
@@ -371,22 +420,26 @@ class Controller:
                 if current is not None and current.goal == goal:
                     if current.ready:
                         commit(goal.profile, OPEN_GATES[goal.profile])
-                    else:
-                        commit("STARTING", "closed")
-                    self._export(state)
-                    return state
+                        self._export(state)
+                        return state
+                    commit("STARTING", "closed")
+                    return self._starting_wait(state, goal, unexpected=None)
                 if previous_phase == "STARTING" and not recover:
-                    if current is not None:
-                        raise RuntimeError("unexpected backend while start is unresolved")
-                    # Intent was durable before start(). Never reissue it automatically,
-                    # including after a controller crash or delayed process visibility.
-                    self._export(state)
-                    return state
+                    # Either nothing is visible yet (intent was durable before start(); never reissue it
+                    # automatically, including after a controller crash or delayed process visibility) or
+                    # current is an unexpected backend -- e.g. the 2026-09-18 incident, where an external
+                    # restart resurrected another backend mid-start. Either way: wait for the deadline,
+                    # fencing off anything unexpected instead of erroring out and requiring root recovery.
+                    return self._starting_wait(state, goal, unexpected=current)
                 if current is not None:
                     if current.goal.profile == "game":
                         commit("DRAINING", "draining")
                         self.backend.request_drain()
-                        if not self.backend.drained():
+                        progress = self.backend.drain_progress()
+                        if progress is not None and not progress.get("drained", False):
+                            verdict = self._drain_wait(state, progress)
+                            if verdict is not None:
+                                return self._rollback(state, goal, verdict)
                             return state
                     commit("SAVING", "closed")
                     self.backend.save_and_freeze(current)
@@ -397,9 +450,72 @@ class Controller:
                 self.backend.start(goal)
                 return state
             except Exception as error:
-                state.update(phase="ERROR", gate="closed", error=type(error).__name__)
+                state.update(phase="ERROR", gate="closed", error=type(error).__name__, errorMessage=str(error) or repr(error))
                 self._write(state)
                 return state
+
+    def _starting_wait(self, state: dict, goal: Goal, unexpected: Process | None) -> dict:
+        elapsed_ms = self._now_ms() - state["since"]
+        if elapsed_ms > self.start_timeout * 1000:
+            detail = "unexpected backend present" if unexpected is not None else "no ready backend appeared"
+            return self._rollback(state, goal, f"start of {goal.profile} timed out after {elapsed_ms // 1000}s ({detail})")
+        if unexpected is not None:
+            self.backend.fence_pending_starts()
+        self._export(state, deadline=state["since"] + int(self.start_timeout * 1000))
+        return state
+
+    def _drain_wait(self, state: dict, progress: dict) -> str | None:
+        """None to keep waiting (also exports the live deadline); else the rollback reason."""
+        now_ms, since = self._now_ms(), state["since"]
+        nothing_left = not progress.get("rooms") and not progress.get("ranked") and not progress.get("pending")
+        if nothing_left and progress.get("healthy") is False:
+            if now_ms - since > self.drain_health_grace * 1000:
+                return (f"drain: nothing left to drain but stats persistence stayed unhealthy for "
+                        f"{(now_ms - since) // 1000}s; rolling back rather than risk losing results ({progress})")
+            deadline = since + int(self.drain_health_grace * 1000)
+        else:
+            timeout = self.drain_timeout_ranked if progress.get("ranked") else self.drain_timeout
+            if now_ms - since > timeout * 1000:
+                return f"drain timed out after {(now_ms - since) // 1000}s: {progress}"
+            deadline = since + int(timeout * 1000)
+        self._export(state, deadline=deadline)
+        return None
+
+    def _rollback(self, state: dict, goal: Goal, reason: str) -> dict:
+        """Abandon the in-flight switch and reopen the gate of the previously stable profile.
+
+        DRAINING never touched the old backend, so reverting is just switching "desired" back.
+        STARTING already stopped it, so bring it back up before declaring the profile stable again;
+        if that itself fails there is no safe automatic move left, so it becomes an ERROR (root recovery).
+        """
+        stable = Goal(**state["rollback"])
+        if state["phase"] == "STARTING":
+            try:
+                self.backend.stop(Process(goal, False))
+                self.backend.start(stable)
+            except Exception as error:
+                state.update(phase="ERROR", gate="closed", error=type(error).__name__,
+                              errorMessage=f"{reason}; rollback to {stable.profile} also failed: {error}")
+                self._write(state)
+                return state
+            state.update(phase="STARTING", gate="closed", desired=asdict(stable), error=None,
+                          errorMessage=reason, since=self._now_ms(), rollback=None)
+        else:
+            state.update(phase=stable.profile, gate=OPEN_GATES[stable.profile], desired=asdict(stable),
+                          error=None, errorMessage=reason, since=self._now_ms(), rollback=None)
+        self._write(state)
+        return state
+
+    def cancel(self) -> dict:
+        """Unprivileged abort of a stuck switch (site -> inbox "cancel", no root): roll back now
+        instead of waiting for the deadline. Only valid while a switch is actually in flight."""
+        with self._locked():
+            state = self._read()
+            if state.get("phase") not in {"DRAINING", "STARTING"}:
+                raise ValueError("nothing to cancel: no switch is in progress")
+            if not state.get("rollback"):
+                raise ValueError("no previous stable profile recorded to roll back to")
+            return self._rollback(state, Goal(**state["desired"]), "cancelled by admin request")
 
     def process_inbox(self, now_ms: int | None = None) -> int:
         """Apply admin requests from the site, oldest first; each one gets exactly one result file.
@@ -511,6 +627,9 @@ class Controller:
         if kind == "message":
             self.set_message(document.get("message"))
             return None
+        if kind == "cancel":
+            # Unprivileged recovery: an admin cancels a stuck DRAINING/STARTING switch without root.
+            return self.cancel()["revision"]
         if kind != "mode":
             raise ValueError("unknown kind")
         profile, expected, recover = document.get("profile"), document.get("expectedRevision"), document.get("recover", False)

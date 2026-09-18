@@ -191,20 +191,23 @@ class DockerBackendTests(unittest.TestCase):
     def test_drain_status_parsing(self):
         self.running("game")
         status = "bf maintenance status"
-        for line, expected in (("draining=true rooms=0 ranked=0 pending=0 healthy=true drained=true", True),
-                               ("draining=true rooms=1 ranked=1 pending=0 healthy=true drained=false", False),
-                               ("draining=false rooms=0 ranked=0 pending=0 healthy=true drained=false", False)):
+        for line, expected in (("draining=true rooms=0 ranked=0 pending=0 healthy=true drained=true",
+                                 {"draining": True, "rooms": 0, "ranked": 0, "pending": 0, "healthy": True, "drained": True}),
+                               ("draining=true rooms=1 ranked=1 pending=0 healthy=true drained=false",
+                                {"draining": True, "rooms": 1, "ranked": 1, "pending": 0, "healthy": True, "drained": False}),
+                               ("draining=false rooms=0 ranked=0 pending=0 healthy=true drained=false",
+                                {"draining": False, "rooms": 0, "ranked": 0, "pending": 0, "healthy": True, "drained": False})):
             self.load(); self.state["rcon"][status] = line; self.save()
-            self.assertIs(self.backend.drained(), expected)
+            self.assertEqual(self.backend.drain_progress(), expected)
         self.load(); self.state["rcon"][status] = "Unknown or incomplete command"; self.save()
         with self.assertRaises(RuntimeError):
-            self.backend.drained()
+            self.backend.drain_progress()
         self.backend.request_drain()
         self.assertIn(["docker", "exec", GAME_CID, "rcon-cli", "bf", "maintenance", "drain"], self.calls())
 
     def test_nothing_to_drain_or_save_without_java(self):
         self.load(); self.state["services"]["bf-game"]["replicas"] = 1; self.save()
-        self.assertTrue(self.backend.drained())
+        self.assertIsNone(self.backend.drain_progress())
         self.backend.save_and_freeze(Process(Goal("game", "v1"), False))
         self.assertFalse([c for c in self.calls() if c[:2] == ["docker", "exec"]])
 

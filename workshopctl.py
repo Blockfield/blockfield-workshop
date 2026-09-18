@@ -4,7 +4,7 @@
 workshopctl request workshop --session <uuid> [--release vX.Y.Z]
 workshopctl request game [--release vX.Y.Z] [--recover]
 workshopctl members [draslId:name[:role[:mapId+mapId...]] ...]
-workshopctl step | status      # step applies the site admin inbox first
+workshopctl step | status | cancel      # step applies the site admin inbox first
 """
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ def main(argv=None, backend_factory=None) -> int:
     game.add_argument("--recover", action="store_true", help="leave ERROR toward game: fence, save, stop, start game")
     commands.add_parser("step")
     commands.add_parser("status")
+    commands.add_parser("cancel", help="unprivileged rollback of a stuck DRAINING/STARTING switch")
     members = commands.add_parser("members", help="replace the workshop ACL; no arguments clears it")
     members.add_argument("member", nargs="*")
     args = parser.parse_args(argv)
@@ -61,12 +62,18 @@ def main(argv=None, backend_factory=None) -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
         controller = Controller(state_dir, backend_factory(), gate_file=Path(args.gate_file),
                                 public_file=Path(args.public_file), message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE),
-                                admin_dir=Path(args.admin_dir), inbox_dir=Path(args.inbox_dir))
+                                admin_dir=Path(args.admin_dir), inbox_dir=Path(args.inbox_dir),
+                                drain_timeout=float(env.get("BF_DRAIN_TIMEOUT_S", 600)),
+                                drain_timeout_ranked=float(env.get("BF_DRAIN_TIMEOUT_RANKED_S", 3600)),
+                                drain_health_grace=float(env.get("BF_DRAIN_HEALTH_GRACE_S", 60)),
+                                start_timeout=float(env.get("BF_START_TIMEOUT_S", 300)))
         os.chmod(state_dir, 0o700)
         if args.command == "status":
             result = {"state": controller.status(), "members": controller.members()}
         elif args.command == "members":
             result = {"members": controller.set_members([parse_member(m) for m in args.member])}
+        elif args.command == "cancel":
+            result = controller.cancel()
         elif args.command == "step":
             try:
                 controller.process_inbox()

@@ -217,14 +217,17 @@ class DockerBackend:
     def request_drain(self) -> None:
         self._rcon("game", "bf", "maintenance", "drain")
 
-    def drained(self) -> bool:
+    def drain_progress(self) -> dict | None:
         out = self._rcon("game", "bf", "maintenance", "status")
         if out is None:
-            return True
-        match = re.search(r"\bdraining=(true|false)\b.*\bdrained=(true|false)\b", out)
+            return None
+        match = re.search(r"\bdraining=(true|false)\s+rooms=(\d+)\s+ranked=(\d+)\s+pending=(\d+)\s+"
+                           r"healthy=(true|false)\b.*\bdrained=(true|false)\b", out)
         if not match:
             raise RuntimeError("unexpected /bf maintenance status output")
-        return match.group(1) == "true" and match.group(2) == "true"
+        draining, rooms, ranked, pending, healthy, drained = match.groups()
+        return {"draining": draining == "true", "rooms": int(rooms), "ranked": int(ranked),
+                "pending": int(pending), "healthy": healthy == "true", "drained": drained == "true"}
 
     def save_and_freeze(self, process: Process) -> None:
         self._rcon(process.goal.profile, "save-all", "flush")

@@ -35,7 +35,7 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 | `/srv/minecraft/workshop/gate/gate.json` | controller after every state write | proxy (`BLOCKFIELD_GATE_FILE`) | `{schema:1, revision, gate: public/draining/closed/builders, backend: game/workshop, message, allowed:[{draslId,name,role,maps?}]}` |
 | `/srv/minecraft/workshop/public/public.json` | controller | site (`BLOCKFIELD_GATE_FILE`) | `{mode: game/draining/workshop/maintenance, message, since}` |
 | `/srv/minecraft/workshop/controller/` (0700) | controller | — | `state.json`, `members.json`, `message.json`, `controller.lock`, `inbox.lock` |
-| `/srv/minecraft/workshop/admin/` (0755, files 0644, `BF_ADMIN_DIR`) | controller | site admin (read-only mount) | `members.json` (current ACL), `status.json` `{schema:1, revision, phase, gate, error, desired, message, updatedAt}`, `results/<requestId>.json` `{id, ok, error, revision, doneAt}` (newest 200 kept) |
+| `/srv/minecraft/workshop/admin/` (0755, files 0644, `BF_ADMIN_DIR`) | controller | site admin (read-only mount) | `members.json` (current ACL), `status.json` `{schema:1, revision, phase, gate, error, errorMessage, since, deadline, desired, message, updatedAt}`, `results/<requestId>.json` `{id, ok, error, revision, doneAt}` (newest 200 kept) |
 | `/srv/minecraft/workshop/inbox/` (root:1000 0770, `BF_INBOX_DIR`) | site admin (uid 1000, `.<id>.tmp` + rename) | controller | `<id>.json` `{schema:1, id, kind: mode/members/message, actor:{draslId,name}, createdAt, ...}` |
 
 `release` is `build` from the image's `/opt/blockfield-build.json` (the modpack tag, e.g. `v2.27.0`). Readiness counts only
@@ -50,12 +50,27 @@ and a single-file bind mount would keep showing the old inode.
 `request()` durably stores intent with CAS revisions; `step()` reconciles once under a non-blocking lock.
 - Stable phases and DRAINING are written only when phase/gate/error change: no gate flapping, exports keep their mtime.
 - `game -> workshop`: gate `draining` (existing game members may still connect), `/bf maintenance drain`, wait for
-  `drained=true` without timeout (whole Ranked campaign), `save-all flush`, scale game to 0 and wait until no task and
-  no java, write `profile.json`, delete readiness, scale workshop to 1, open `builders` only on matching readiness.
+  `drained=true`, `save-all flush`, scale game to 0 and wait until no task and no java, write `profile.json`, delete
+  readiness, scale workshop to 1, open `builders` only on matching readiness.
 - `workshop -> game`: `save-all flush`, stop, start game, `public` only on matching game readiness.
-- Any error -> `ERROR`, gate `closed`. The timer never leaves ERROR. `workshopctl request game --recover` fences the
+- **DRAINING and STARTING have a deadline** (2026-09-18 incident: DRAINING sat for ~2h on a stuck stats-health flag,
+  then a mid-operation external restart turned an unresolved STARTING into ERROR with no message). Past the deadline,
+  `step()` rolls back to the profile recorded when the switch was requested (`state["rollback"]`) instead of waiting
+  or requiring root: DRAINING never touched the old backend, so rollback just restores "desired"; STARTING already
+  stopped it, so rollback stops the half-started profile and starts the old one again. `errorMessage`/`since`/`deadline`
+  in `status.json` explain why. `BF_DRAIN_TIMEOUT_S` (default 600s, or `BF_DRAIN_TIMEOUT_RANKED_S`/3600s while a
+  Ranked campaign is still reported), `BF_DRAIN_HEALTH_GRACE_S` (default 60s: rooms=ranked=pending=0 but stats
+  unhealthy rolls back fast rather than waiting on a flag that may never clear) and `BF_START_TIMEOUT_S`
+  (default 300s) tune this; sizing "the longest match" beyond the ranked default is a manual env override, not
+  auto-detected from match length.
+- A backend of the *wrong* profile appearing while STARTING is unresolved (an external restart, as above) is fenced
+  and retried instead of raising; unrecoverable failures still surface as `ERROR` with `error`+`errorMessage`.
+  Any error -> `ERROR`, gate `closed`. The timer never leaves ERROR. `workshopctl request game --recover` fences the
   unselected app (scale 0, wait), then saves/stops whatever runs and starts game.
-- STARTING without a visible process waits closed and never re-issues start (see REVIEW-2026-09-13.md).
+- `workshopctl cancel` (or inbox kind `cancel`, no root) rolls back a stuck DRAINING/STARTING switch immediately
+  instead of waiting for its deadline -- the unprivileged counterpart to `--recover`, which stays root-only and
+  ERROR-only.
+- STARTING without a visible process waits closed (up to its deadline) and never re-issues start (see REVIEW-2026-09-13.md).
 - Missing/invalid `members.json` admits nobody. Any java outside the two apps (pattern `fabric-server-mc.*-launcher.*.jar`)
   is an error: do not run other Fabric servers on this host while the controller is enabled.
 
@@ -131,6 +146,7 @@ python3 workshopctl.py request workshop --session "$(python3 -c 'import uuid;pri
 python3 workshopctl.py status          # the timer does the steps; phase DRAINING can last a whole campaign
 python3 workshopctl.py request game    # save, stop workshop, start game, open after readiness
 python3 workshopctl.py request game --recover   # only from ERROR; read `error` in status first
+python3 workshopctl.py cancel                    # abort a stuck DRAINING/STARTING switch now, no root needed
 ```
 
 Drasl profile ids: `curl https://skins.blockfield.pro/account/users/profiles/minecraft/<Name>`. `members` applies online:
