@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import stat
 import sys
 from pathlib import Path
@@ -97,6 +98,30 @@ INBOX_MAX_BYTES = 65536
 INBOX_BATCH = 20
 INBOX_TTL_MS = 10 * 60 * 1000
 RESULTS_KEPT = 200
+
+
+WORKSHOP_KEY_GID = 1000  # the site and the workshop server both run as uid/gid 1000 and mount admin/ read-only
+
+
+def ensure_workshop_key(path: Path) -> None:
+    """Shared secret for the workshop tablet -> site write (blockfield-web /api/workshop/access).
+
+    Created once (never rotated here), 0640 root:1000 so only the two containers can read it.
+    """
+    if path.exists() or path.is_symlink():
+        return
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+    try:
+        os.write(fd, (secrets.token_hex(32) + "\n").encode())
+        try:
+            os.fchown(fd, -1, WORKSHOP_KEY_GID)
+        except PermissionError:
+            pass  # tests and non-root runs: the file stays with the caller's group
+        os.fchmod(fd, 0o640)
+    finally:
+        os.close(fd)
+    os.replace(temporary, path)
 
 
 def member(value) -> dict:
@@ -190,6 +215,7 @@ class Controller:
             (self.admin_dir / "results").mkdir(parents=True, exist_ok=True)
             for path in (self.admin_dir, self.admin_dir / "results"):
                 os.chmod(path, 0o755)
+            ensure_workshop_key(self.admin_dir / "workshop.key")
         self.backend = backend
 
     def _now_ms(self) -> int:

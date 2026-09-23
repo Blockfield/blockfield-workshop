@@ -31,6 +31,15 @@ class InboxTests(unittest.TestCase):
         self.controller.step()
         self.log = io.StringIO()
 
+    def test_workshop_key_created_once_and_private(self):
+        key = self.admin / "workshop.key"
+        text = key.read_text()
+        self.assertRegex(text.strip(), r"^[0-9a-f]{64}$")
+        self.assertEqual(key.stat().st_mode & 0o777, 0o640)
+        Controller(self.dir / "state", self.backend, gate_file=self.dir / "gate.json",
+                   public_file=self.dir / "public.json", admin_dir=self.admin, inbox_dir=self.inbox)
+        self.assertEqual(key.read_text(), text, "never rotated by a restart")
+
     def process(self, **kwargs):
         with contextlib.redirect_stderr(self.log):
             return self.controller.process_inbox(**kwargs)
