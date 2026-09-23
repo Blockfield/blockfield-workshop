@@ -13,9 +13,13 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from uuid import uuid4
 
 from controller import DEFAULT_MESSAGE, Controller, Goal
+
+# Transitional phases worth re-checking right away; stable phases and ERROR wait for the next tick.
+FOLLOWED_PHASES = {"REQUESTED", "DRAINING", "SAVING", "STARTING"}
 
 BUSY = 75
 
@@ -95,6 +99,12 @@ def main(argv=None, backend_factory=None) -> int:
                 print(f"workshopctl: inbox pass failed: {error!r}", file=sys.stderr)
             state = controller.status()
             result = state if state["phase"] == "UNINITIALIZED" else controller.step()
+            # A switch in flight is followed every few seconds inside this run instead of once per 15 s timer tick:
+            # the next phase (drained, stopped, ready) is acted on almost at once. Bounded, so the timer stays the clock.
+            deadline = time.monotonic() + float(env.get("BF_STEP_FOLLOW_S", 12))
+            while result.get("phase") in FOLLOWED_PHASES and time.monotonic() < deadline:
+                time.sleep(float(env.get("BF_STEP_POLL_S", 2)))
+                result = controller.step()
         else:
             state = controller.status()
             release = args.release or (state.get("desired") or {}).get("release")

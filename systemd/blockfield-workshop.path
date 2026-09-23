@@ -1,0 +1,11 @@
+# Пример: /etc/systemd/system/blockfield-workshop.path (tools/workshop/README.md).
+# Запрос с сайта (файл в inbox) запускает шаг сразу, а не на следующем тике таймера (до 15 с).
+[Unit]
+Description=Blockfield workshop controller on a new site request
+
+[Path]
+PathChanged=/srv/minecraft/workshop/inbox
+Unit=blockfield-workshop.service
+
+[Install]
+WantedBy=paths.target

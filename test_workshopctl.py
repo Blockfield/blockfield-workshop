@@ -2,6 +2,7 @@ import contextlib
 import fcntl
 import io
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -21,6 +22,9 @@ class WorkshopctlTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.backend = FakeBackend()
         self.backend.is_drained = True
+        # The fake backend never becomes ready by itself: following a switch would only burn the real-time budget.
+        os.environ["BF_STEP_FOLLOW_S"] = "0"
+        self.addCleanup(os.environ.pop, "BF_STEP_FOLLOW_S", None)
 
     def ctl(self, *argv):
         out, err = io.StringIO(), io.StringIO()

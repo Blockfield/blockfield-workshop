@@ -20,7 +20,9 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
   `/backend-lock/profile.json` selects its `BLOCKFIELD_PROFILE`. Java inherits the lock fd. A Swarm restart,
   start-first rollback, redeploy or host boot can therefore start at most one JVM, and never the unselected profile.
   Without the mount, `game` starts as before with a loud warning (current prod until reconfigured) and `workshop` refuses.
-- Host controller (`controller.py` + `docker_backend.py`) runs from a systemd timer every 15 s (`workshopctl step`);
+- Host controller (`controller.py` + `docker_backend.py`) runs from a systemd timer every 15 s (`workshopctl step`), and at once
+  when the site drops a request into the inbox (`blockfield-workshop.path`); a step during a switch re-checks every 2 s for up
+  to 12 s (`BF_STEP_POLL_S`, `BF_STEP_FOLLOW_S`), so drained/stopped/ready is acted on without waiting for the next tick;
   the owner issues requests with `workshopctl`. The web admin comes later.
 - The proxy reads `gate.json`, shows the maintenance message (join, lobby, server list MOTD) and admits only allowed
   accounts. The site/launcher read `public.json`.
@@ -134,7 +136,7 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    install -d /opt/blockfield-workshop /etc/blockfield
    install -m 0644 tools/workshop/{controller,docker_backend,workshopctl,journal,candidates,map_package}.py /opt/blockfield-workshop/
    install -m 0600 tools/workshop/systemd/workshop.env.example /etc/blockfield/workshop.env   # edit service names
-   install -m 0644 tools/workshop/systemd/blockfield-workshop.{service,timer} /etc/systemd/system/
+   install -m 0644 tools/workshop/systemd/blockfield-workshop.{service,timer,path} /etc/systemd/system/
    systemctl daemon-reload            # do NOT enable the timer yet
    ```
 2. Dokploy `blockfield-server` (game): add bind mount `/srv/minecraft/backend-lock` -> `/backend-lock`; env
