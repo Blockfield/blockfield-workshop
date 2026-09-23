@@ -162,7 +162,7 @@ class Controller:
                  public_file: Path | None = None, message: str = DEFAULT_MESSAGE,
                  admin_dir: Path | None = None, inbox_dir: Path | None = None,
                  drain_timeout: float = 600.0, drain_timeout_ranked: float = 3600.0,
-                 drain_health_grace: float = 60.0, start_timeout: float = 300.0,
+                 drain_health_grace: float = 60.0, start_timeout: float = 600.0,
                  now: Callable[[], float] | None = None):
         """drain_timeout/drain_timeout_ranked: DRAINING deadline (seconds) with no/some ranked campaigns
         left; drain_health_grace: extra short-circuit when rooms=ranked=pending=0 but stats are still

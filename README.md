@@ -61,7 +61,8 @@ and a single-file bind mount would keep showing the old inode.
   in `status.json` explain why. `BF_DRAIN_TIMEOUT_S` (default 600s, or `BF_DRAIN_TIMEOUT_RANKED_S`/3600s while a
   Ranked campaign is still reported), `BF_DRAIN_HEALTH_GRACE_S` (default 60s: rooms=ranked=pending=0 but stats
   unhealthy rolls back fast rather than waiting on a flag that may never clear) and `BF_START_TIMEOUT_S`
-  (default 300s) tune this; sizing "the longest match" beyond the ranked default is a manual env override, not
+  (default 600s: a cold pack start takes ~2.5 min on homeserver, and a missed deadline costs a second full
+  restart of the game) tune this; sizing "the longest match" beyond the ranked default is a manual env override, not
   auto-detected from match length.
 - A backend of the *wrong* profile appearing while STARTING is unresolved (an external restart, as above) is fenced
   and retried instead of raising; unrecoverable failures still surface as `ERROR` with `error`+`errorMessage`.
@@ -122,6 +123,8 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    `/srv/minecraft/backend-lock` -> `/backend-lock`. Env: `BLOCKFIELD_PROFILE=workshop`,
    `BLOCKFIELD_SESSION_PURPOSE=workshop`, `BLOCKFIELD_STATS_EXPORT_ENABLED=false`, `EULA`, `TYPE`/`VERSION`/memory
    as the game app, own `RCON_PASSWORD`, same `FABRIC_PROXY_SECRET`; **no** `BLOCKFIELD_STATS_INGEST_*` variables.
+   Health check as the game app (`mc-health`, interval 30s, **start period 600s**, 6 retries): the itzg image default
+   (start period 120s, 2 retries) kills the workshop as unhealthy mid-startup (2026-09-23 prod smoke test).
    Put the resulting service name into `/etc/blockfield/workshop.env` and into `proxy/velocity.toml` (`workshop = ...`).
 4. Proxy app: env `BLOCKFIELD_GATE_FILE=/workshop-gate/gate.json`, mount `/srv/minecraft/workshop/gate` -> `/workshop-gate` read-only.
    Site app: env `BLOCKFIELD_GATE_FILE=/workshop-public/public.json`, mount `/srv/minecraft/workshop/public` read-only;

@@ -66,7 +66,7 @@ def main(argv=None, backend_factory=None) -> int:
                                 drain_timeout=float(env.get("BF_DRAIN_TIMEOUT_S", 600)),
                                 drain_timeout_ranked=float(env.get("BF_DRAIN_TIMEOUT_RANKED_S", 3600)),
                                 drain_health_grace=float(env.get("BF_DRAIN_HEALTH_GRACE_S", 60)),
-                                start_timeout=float(env.get("BF_START_TIMEOUT_S", 300)))
+                                start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)))
         os.chmod(state_dir, 0o700)
         if args.command == "status":
             result = {"state": controller.status(), "members": controller.members()}
