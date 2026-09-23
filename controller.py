@@ -89,6 +89,8 @@ MAP_IDS = frozenset({
     "ancient", "anubis", "baxmut", "berdichev", "dm_arena", "dust2", "fields", "firing_range", "inferno",
     "konstaxa", "kozyatyn", "mirage", "nuke", "overpass", "snipers_towers", "train", "vertigo", "zaliznichne",
 })
+# Access scopes a builder's "maps" may name: every map plus the workshop hub itself (blockfield-mod WorkshopMembers.HUB).
+SCOPE_IDS = MAP_IDS | {"hub"}
 NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
 INBOX_NAME = re.compile(r"[0-9a-f-]{36}\.json")
 INBOX_MAX_BYTES = 65536
@@ -122,7 +124,7 @@ def member(value) -> dict:
             raise ValueError("invalid maps list")
         if len(set(maps)) != len(maps):
             raise ValueError("duplicate map id")
-        unknown = set(maps) - MAP_IDS
+        unknown = set(maps) - SCOPE_IDS
         if unknown:
             raise ValueError(f"unknown map id: {sorted(unknown)}")
         if role == "builder":

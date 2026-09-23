@@ -92,7 +92,7 @@ unknown kind. A busy `controller.lock` leaves the request for the next step. Eac
   workshop gets a fresh session UUID; `recover` only toward game and runs the recovery step immediately.
 - `members` `{members:[{draslId,name,role,maps?}]}`: full ACL replacement (the site is the source of truth; `workshopctl members`
   is the owner fallback); a list without an `admin` is refused. `maps` is an optional array of map ids (`controller.MAP_IDS`, kept equal to `server/lobby/blockfield/maps/*.json` by
-  `test_map_ids_match_lobby_maps`); missing means all maps, unknown ids are rejected, and `lead`/`admin` always have all maps regardless of `maps`.
+  `test_map_ids_match_lobby_maps`); plus `hub` for building in the workshop hub; missing means all maps and the hub, unknown ids are rejected, and `lead`/`admin` always have all maps regardless of `maps`.
 - `message` `{message}`: at most 200 characters, no control characters (Cc) or `§` (same rule as the site), stored in `controller/message.json` and exported to
   gate/public/status; an empty message returns to `BF_MAINTENANCE_MESSAGE`.
 
