@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from uuid import uuid4
-from controller import Controller, DEFAULT_MESSAGE, Goal, Process, member
+from controller import MAP_IDS, Controller, DEFAULT_MESSAGE, Goal, Process, member
 from test_controller import FakeBackend
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
@@ -113,6 +113,10 @@ class GateTests(unittest.TestCase):
         self.controller.set_members([builder])
         self.to_workshop()
         self.assertEqual(self.gate()["allowed"], [builder])
+
+    def test_map_ids_match_lobby_maps(self):
+        maps = Path(__file__).resolve().parents[2] / "server/lobby/blockfield/maps"
+        self.assertEqual(MAP_IDS, {f.stem for f in maps.glob("*.json")})
 
     def test_since_survives_unchanged_mode(self):
         self.controller.request(str(uuid4()), self.goal, 0)

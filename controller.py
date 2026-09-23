@@ -85,7 +85,10 @@ DEFAULT_MESSAGE = "На сервере проводятся технически
 OPEN_GATES = {"game": "public", "workshop": "builders", "test": "testers"}
 ROLES = {"builder", "lead", "admin"}
 # server/lobby/blockfield/maps/*.json ids (blockfield-mod); the controller only validates, it does not read the mod's data.
-MAP_IDS = frozenset({"baxmut", "berdichev", "dm_arena", "fields", "firing_range", "konstaxa", "kozyatyn", "zaliznichne"})
+MAP_IDS = frozenset({
+    "ancient", "anubis", "baxmut", "berdichev", "dm_arena", "dust2", "fields", "firing_range", "inferno",
+    "konstaxa", "kozyatyn", "mirage", "nuke", "overpass", "snipers_towers", "train", "vertigo", "zaliznichne",
+})
 NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
 INBOX_NAME = re.compile(r"[0-9a-f-]{36}\.json")
 INBOX_MAX_BYTES = 65536
