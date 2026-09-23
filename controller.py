@@ -190,12 +190,14 @@ class Controller:
                  admin_dir: Path | None = None, inbox_dir: Path | None = None,
                  drain_timeout: float = 600.0, drain_timeout_ranked: float = 3600.0,
                  drain_health_grace: float = 60.0, start_timeout: float = 600.0,
-                 now: Callable[[], float] | None = None):
+                 now: Callable[[], float] | None = None, maps=None):
         """drain_timeout/drain_timeout_ranked: DRAINING deadline (seconds) with no/some ranked campaigns
         left; drain_health_grace: extra short-circuit when rooms=ranked=pending=0 but stats are still
         unhealthy (the 2026-09-18 incident) -- don't hold players hostage to that flag. start_timeout:
         STARTING deadline. Any deadline exceeded rolls back to the previous stable profile automatically.
         """
+        # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
+        self.maps = maps
         self.drain_timeout, self.drain_timeout_ranked = drain_timeout, drain_timeout_ranked
         self.drain_health_grace, self.start_timeout = drain_health_grace, start_timeout
         self._now = now or time.time
@@ -614,6 +616,12 @@ class Controller:
             return 0
         return done
 
+    def export_maps(self) -> None:
+        """admin/candidates.json for the site: candidate list with status, backups per map."""
+        if self.maps is None or not self.admin_dir:
+            return
+        self._replace_if_changed(self.admin_dir / "candidates.json", self.maps.export(), keep=())
+
     @staticmethod
     def _prune_results(results: Path) -> None:
         kept = []
@@ -661,6 +669,20 @@ class Controller:
         if kind == "cancel":
             # Unprivileged recovery: an admin cancels a stuck DRAINING/STARTING switch without root.
             return self.cancel()["revision"]
+        if kind in {"candidate", "publish", "reject", "rollback"}:
+            if self.maps is None:
+                raise ValueError("map publishing is not configured")
+            actor = {"draslId": document["actor"]["draslId"], "name": document["actor"]["name"]}
+            if kind == "candidate":
+                self.maps.create(document.get("mapId"), actor, document.get("note", ""))
+            elif kind == "publish":
+                self.maps.publish(document.get("candidateId"), actor)
+            elif kind == "reject":
+                self.maps.reject(document.get("candidateId"), actor)
+            else:
+                self.maps.rollback(document.get("mapId"), actor)
+            self.export_maps()
+            return None
         if kind != "mode":
             raise ValueError("unknown kind")
         profile, expected, recover = document.get("profile"), document.get("expectedRevision"), document.get("recover", False)

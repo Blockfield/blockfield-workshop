@@ -96,6 +96,29 @@ unknown kind. A busy `controller.lock` leaves the request for the next step. Eac
 - `message` `{message}`: at most 200 characters, no control characters (Cc) or `§` (same rule as the site), stored in `controller/message.json` and exported to
   gate/public/status; an empty message returns to `BF_MAINTENANCE_MESSAGE`.
 
+## Map candidates (candidates.py)
+
+Builders send a map for review from the tablet (site `POST /api/workshop/submit`), admins from the site; admins accept
+or reject on the site. Inbox kinds (same envelope and validation as above):
+
+- `candidate` `{mapId, note?}`: snapshot `<BF_WORKSHOP_DATA>/world/dimensions/blockfield_workshop/<mapId>/{region,entities,poi}`
+  plus the markup JSON (`world/blockfield_workshop/maps/*.json` with that id, else the image's `blockfield/maps`) into
+  `<BF_CANDIDATES_DIR>/<id>.zip` (map_package layout v1, validated) + `<id>.json`. While the workshop runs its saving is
+  held: `save-off`, `save-all flush`, copy, `save-on` (RCON, allowlisted). Empty placeholder region files are skipped.
+- `publish` `{candidateId}`: pending only, and never over a newer published version of the same map. The template
+  `BF_TEMPLATES_DIR/<mapId>` is swapped for the candidate's world (staged next to it, then renamed; owner 1000) and the JSON
+  goes to `BF_PUBLISHED_MAPS_DIR/<mapId>.json`, which the game prefers over the image's JSON (blockfield-mod
+  `MapConfigManager` overlay, re-read every 5 s: new matches take it, running ones finish). The previous template/JSON
+  go to `BF_MAP_BACKUPS_DIR/<mapId>-<ms>/` (3 kept per map).
+- `reject` `{candidateId}`; `rollback` `{mapId}`: restore the newest backup (what was live becomes a backup itself).
+- `admin/candidates.json` `{schema:1, candidates:[{id, mapId, status: pending|published|rejected|superseded|rolled_back,
+  author, createdAt, sha256, size, regions, decidedBy?, decidedAt?}], backups:{mapId: count}}`. 30 decided candidates kept.
+
+Defaults: `BF_CANDIDATES_DIR=/srv/minecraft/workshop/candidates`, `BF_MAP_BACKUPS_DIR=/srv/minecraft/workshop/map-backups`,
+`BF_TEMPLATES_DIR=/srv/minecraft/templates/maps`, `BF_PUBLISHED_MAPS_DIR=/srv/minecraft/lobby/blockfield-published/maps`.
+ponytail: a published map's JSON lives only on the host (not in this repo); copy it back into `server/lobby/blockfield/maps`
+by hand when the repo should match prod again.
+
 ## Owner setup (not done by this PR)
 
 Dependencies: server image with blockfield-mod#30 (readiness + workshop profile, stacked on #28 DRAINING), proxy image
@@ -109,7 +132,7 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    install -d -m 0770 -o root -g 1000 /srv/minecraft/workshop/inbox   # site container uid/gid 1000 writes requests
    install -d -o 1000 -g 1000 /srv/minecraft/workshop/data
    install -d /opt/blockfield-workshop /etc/blockfield
-   install -m 0644 tools/workshop/{controller,docker_backend,workshopctl,journal}.py /opt/blockfield-workshop/
+   install -m 0644 tools/workshop/{controller,docker_backend,workshopctl,journal,candidates,map_package}.py /opt/blockfield-workshop/
    install -m 0600 tools/workshop/systemd/workshop.env.example /etc/blockfield/workshop.env   # edit service names
    install -m 0644 tools/workshop/systemd/blockfield-workshop.{service,timer} /etc/systemd/system/
    systemctl daemon-reload            # do NOT enable the timer yet

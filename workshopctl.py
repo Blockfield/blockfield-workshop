@@ -30,6 +30,17 @@ def parse_member(text: str) -> dict:
     return result
 
 
+def _map_store(env, backend):
+    """Map candidates (candidates.py) with the host paths; saving is held through the backend when it can."""
+    from candidates import MapStore
+    return MapStore(Path(env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")),
+                    Path(env.get("BF_TEMPLATES_DIR", "/srv/minecraft/templates/maps")),
+                    Path(env.get("BF_PUBLISHED_MAPS_DIR", "/srv/minecraft/lobby/blockfield-published/maps")),
+                    Path(env.get("BF_CANDIDATES_DIR", "/srv/minecraft/workshop/candidates")),
+                    Path(env.get("BF_MAP_BACKUPS_DIR", "/srv/minecraft/workshop/map-backups")),
+                    hold_saves=getattr(backend, "workshop_saves_held", None))
+
+
 def main(argv=None, backend_factory=None) -> int:
     env = os.environ
     parser = argparse.ArgumentParser(prog="workshopctl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -60,13 +71,15 @@ def main(argv=None, backend_factory=None) -> int:
         state_dir = Path(args.state_dir)
         for path in (Path(args.gate_file), Path(args.public_file)):
             path.parent.mkdir(parents=True, exist_ok=True)
-        controller = Controller(state_dir, backend_factory(), gate_file=Path(args.gate_file),
+        backend = backend_factory()
+        controller = Controller(state_dir, backend, gate_file=Path(args.gate_file),
                                 public_file=Path(args.public_file), message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE),
                                 admin_dir=Path(args.admin_dir), inbox_dir=Path(args.inbox_dir),
                                 drain_timeout=float(env.get("BF_DRAIN_TIMEOUT_S", 600)),
                                 drain_timeout_ranked=float(env.get("BF_DRAIN_TIMEOUT_RANKED_S", 3600)),
                                 drain_health_grace=float(env.get("BF_DRAIN_HEALTH_GRACE_S", 60)),
-                                start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)))
+                                start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
+                                maps=_map_store(env, backend))
         os.chmod(state_dir, 0o700)
         if args.command == "status":
             result = {"state": controller.status(), "members": controller.members()}
@@ -77,6 +90,7 @@ def main(argv=None, backend_factory=None) -> int:
         elif args.command == "step":
             try:
                 controller.process_inbox()
+                controller.export_maps()
             except Exception as error:  # the site inbox must never block reconciliation
                 print(f"workshopctl: inbox pass failed: {error!r}", file=sys.stderr)
             state = controller.status()

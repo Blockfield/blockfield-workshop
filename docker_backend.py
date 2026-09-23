@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import re
@@ -20,7 +21,8 @@ from controller import Goal, Process, atomic_write
 
 # itzg runs `java ... -jar ./fabric-server-mc.1.21.1-loader.X-launcher.Y.jar`.
 JAVA_PATTERN = r"fabric-server-mc\..*-launcher\..*\.jar"
-RCON_COMMANDS = {("bf", "maintenance", "drain"), ("bf", "maintenance", "status"), ("save-all", "flush")}
+RCON_COMMANDS = {("bf", "maintenance", "drain"), ("bf", "maintenance", "status"), ("save-all", "flush"),
+                 ("save-off",), ("save-on",)}
 READY_FILE = ".blockfield-ready.json"
 UNKNOWN_SESSION = "00000000-0000-0000-0000-000000000000"
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
@@ -213,6 +215,18 @@ class DockerBackend:
         if container is None:
             raise RuntimeError(f"{profile} java without a container")
         return self.run(["docker", "exec", container, "rcon-cli", *command])
+
+    @contextmanager
+    def workshop_saves_held(self):
+        """A consistent copy of the workshop's region files (map candidates): no autosave writes meanwhile."""
+        if self._rcon("workshop", "save-off") is None:
+            yield  # not running: the files are already at rest
+            return
+        try:
+            self._rcon("workshop", "save-all", "flush")
+            yield
+        finally:
+            self._rcon("workshop", "save-on")
 
     def request_drain(self) -> None:
         self._rcon("game", "bf", "maintenance", "drain")
