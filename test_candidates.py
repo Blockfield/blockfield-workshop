@@ -52,6 +52,45 @@ class CandidateTests(unittest.TestCase):
         self.store = MapStore(self.data, self.templates, self.published, self.root / "candidates",
                               self.root / "backups", repo_maps=self.repo, hold_saves=hold, now=lambda: self.clock[0])
 
+    def test_running_snapshot_stops_before_copy_and_waits_for_readiness(self):
+        backend = FakeBackend()
+        goal = Goal("workshop", "v1", str(uuid4()))
+        from controller import Process
+        backend.processes = [Process(goal, True)]
+        control = Controller(self.root / "controller", backend, maps=self.store)
+        control.request(str(uuid4()), goal, 0)
+        control.step()
+        create = self.store.create
+
+        def snapshot(*args):
+            self.assertEqual(backend.processes, [])
+            self.assertEqual(control.status()["gate"], "closed")
+            return create(*args)
+
+        with mock.patch.object(self.store, "create", side_effect=snapshot):
+            control._snapshot("konstaxa", ACTOR, "")
+        self.assertEqual(backend.events, ["save", "stop", "start"])
+        self.assertEqual(control.status()["phase"], "STARTING")
+        self.assertEqual(control.step()["gate"], "closed")
+        backend.processes = [Process(goal, True)]
+        self.assertEqual(control.step()["gate"], "builders")
+
+        for failure in ("save", "stop", "copy", "start"):
+            backend.fail_save = failure == "save"
+            backend.fail_stop = failure == "stop"
+            backend.fail_start = failure == "start"
+            with mock.patch.object(self.store, "create", side_effect=OSError("disk full") if failure == "copy" else snapshot):
+                with self.assertRaises((OSError, RuntimeError)):
+                    control._snapshot("konstaxa", ACTOR, "")
+            self.assertEqual(control.status()["phase"], "ERROR")
+            self.assertEqual(control.step()["gate"], "closed")
+            self.assertLessEqual(len(backend.processes), 1)
+            # Restore a ready workshop fixture for the next independent fault.
+            backend.processes = [Process(goal, True)]
+            state = control.status()
+            state.update(phase="workshop", gate="builders", error=None, errorMessage=None)
+            control._write(state)
+
     def test_snapshot_holds_saves_and_prefers_the_markup_copy(self):
         overlay = self.data / "world" / "blockfield_workshop" / "maps"
         overlay.mkdir(parents=True)

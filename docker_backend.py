@@ -231,15 +231,10 @@ class DockerBackend:
 
     @contextmanager
     def workshop_saves_held(self):
-        """A consistent copy of the workshop's region files (map candidates): no autosave writes meanwhile."""
-        if self._rcon("workshop", "save-off") is None:
-            yield  # not running: the files are already at rest
-            return
-        try:
-            self._rcon("workshop", "save-all", "flush")
-            yield
-        finally:
-            self._rcon("workshop", "save-on")
+        """The controller must stop the workshop before copying world and markup together."""
+        if self.inventory()["workshop"]["java"]:
+            raise RuntimeError("stop the workshop before taking a consistent snapshot")
+        yield
 
     def request_drain(self) -> None:
         self._rcon("game", "bf", "maintenance", "drain")
@@ -257,7 +252,9 @@ class DockerBackend:
                 "pending": int(pending), "healthy": healthy == "true", "drained": drained == "true"}
 
     def save_and_freeze(self, process: Process) -> None:
-        self._rcon(process.goal.profile, "save-all", "flush")
+        result = self._rcon(process.goal.profile, "save-all", "flush")
+        if result is not None and "Saved the game" not in result:
+            raise RuntimeError(f"save-all did not confirm success: {result}")
 
     def _scale(self, profile: str, replicas: int) -> None:
         self.run(["docker", "service", "scale", "--detach", f"{self.apps[self.app_of(profile)].service}={replicas}"])

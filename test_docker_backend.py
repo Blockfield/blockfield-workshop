@@ -71,7 +71,7 @@ class DockerBackendTests(unittest.TestCase):
         self.state_file, self.log = root / "state.json", root / "calls.log"
         self.state = {"services": {"bf-game": {"replicas": 0, "container": GAME_CID},
                                    "bf-workshop": {"replicas": 0, "container": WORKSHOP_CID}},
-                      "java": {}, "rcon": {}}
+                      "java": {}, "rcon": {"save-all flush": "Saved the game"}}
         self.save()
         env = {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "BF_FAKE": str(self.state_file),
                "BF_FAKE_LOG": str(self.log), "BF_FAKE_PROC": str(self.proc)}
@@ -219,6 +219,20 @@ class DockerBackendTests(unittest.TestCase):
         self.load(); self.state["stop_leaves_java"] = True; self.save()
         with self.assertRaises(TimeoutError):
             self.backend.stop(Process(Goal("game", "v1"), True))
+
+    def test_save_requires_success_and_snapshot_requires_no_workshop_java(self):
+        self.running("workshop")
+        with self.assertRaises(RuntimeError):
+            with self.backend.workshop_saves_held():
+                self.fail("live snapshot")
+        for response in ("", "Saving failed", "Saved the game"):
+            self.load(); self.state["rcon"]["save-all flush"] = response; self.save()
+            process = Process(Goal("workshop", "v1", str(uuid4())), True)
+            if response == "Saved the game":
+                self.backend.save_and_freeze(process)
+            else:
+                with self.assertRaises(RuntimeError):
+                    self.backend.save_and_freeze(process)
 
     def test_fence_scales_unselected_app(self):
         (self.lock / "profile.json").write_text(json.dumps(

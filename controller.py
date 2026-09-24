@@ -684,6 +684,37 @@ class Controller:
             return None, "unsupported schema"
         return document, None
 
+    def _snapshot(self, map_id: str, actor: dict, note: str) -> dict:
+        with self._locked():
+            state = self._read()
+            if state["phase"] not in {"game", "workshop"}:
+                raise ValueError("snapshot requires a stable game or workshop")
+            processes = self.backend.observe()
+            if len(processes) != 1 or not processes[0].ready or asdict(processes[0].goal) != state["desired"]:
+                raise RuntimeError("snapshot backend does not match controller state")
+            current = processes[0]
+            if current.goal.profile == "game":
+                return self.maps.create(map_id, actor, note)
+            # Durable closed state: a controller crash must not reopen a half-finished snapshot.
+            state.update(phase="ERROR", gate="closed", error="SnapshotInterrupted",
+                         errorMessage="snapshot did not finish; recover before reopening", since=self._now_ms())
+            self._write(state)
+            try:
+                self.backend.save_and_freeze(current)
+                self.backend.stop(current)
+                if self.backend.observe():
+                    raise RuntimeError("workshop not confirmed stopped")
+                meta = self.maps.create(map_id, actor, note)
+                self.export_maps()
+                state.update(phase="STARTING", error=None, errorMessage=None, since=self._now_ms())
+                self._write(state)
+                self.backend.start(current.goal)
+                return meta
+            except Exception as error:
+                state.update(phase="ERROR", gate="closed", error=type(error).__name__, errorMessage=str(error))
+                self._write(state)
+                raise
+
     def _apply(self, request_id: str, document: dict) -> int | None:
         kind = document.get("kind")
         if kind == "members":
@@ -708,7 +739,7 @@ class Controller:
                 raise ValueError("map publishing is not configured")
             actor = {"draslId": document["actor"]["draslId"], "name": document["actor"]["name"]}
             if kind == "candidate":
-                self.maps.create(document.get("mapId"), actor, document.get("note", ""))
+                self._snapshot(document.get("mapId"), actor, document.get("note", ""))
             elif kind == "publish":
                 self.maps.publish(document.get("candidateId"), actor, force=force)
             elif kind == "reject":

@@ -110,7 +110,7 @@ or reject on the site. Inbox kinds (same envelope and validation as above):
 - `candidate` `{mapId, note?}`: snapshot `<BF_WORKSHOP_DATA>/world/dimensions/blockfield_workshop/<mapId>/{region,entities,poi}`
   plus the markup JSON (`world/blockfield_workshop/maps/*.json` with that id, else the image's `blockfield/maps`) into
   `<BF_CANDIDATES_DIR>/<id>.zip` (map_package layout v1, validated) + `<id>.json`. While the workshop runs its saving is
-  held: `save-off`, `save-all flush`, copy, `save-on` (RCON, allowlisted). Empty placeholder region files are skipped.
+  stopped: the controller closes entry, flushes and stops the workshop, confirms the JVM exited, then copies world and JSON. It restarts the same session and opens entry only after readiness. Save/stop/export/start failures remain closed and recoverable. Empty placeholder region files are skipped.
 - `publish` `{candidateId, force?}`: pending only, and never over a newer published version of the same map. The draft's
   base (`blockfield-base.json`, written by the mod when it copies a template into the workshop: sha256 over the sorted
   `<kind>/<file>\0<sha256>\n` lines of region/entities/poi, `candidates.template_digest`) must equal the live template's

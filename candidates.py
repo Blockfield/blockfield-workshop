@@ -2,7 +2,7 @@
 
 Flow (blockfield-releases#8, owner decision 2026-09-24 "через проверку"):
   candidate  -- snapshot of one map's workshop world + its markup JSON into an immutable ZIP (map_package layout v1),
-                taken with the workshop's saving held (save-off / save-all flush / save-on);
+                taken after the controller saves and fully stops the workshop;
   publish    -- an admin accepts a pending candidate: the game template (templates/maps/<id>) and the published map
                 JSON (lobby/blockfield-published/maps, which the game prefers over the image's JSON) are replaced,
                 the previous ones kept as a backup; new matches pick the map up, running ones finish on the old one;
@@ -73,7 +73,6 @@ class MapStore:
         world = self.workshop_data / "world" / "dimensions" / "blockfield_workshop" / map_id
         if not (world / "region").is_dir():
             raise ValueError("the map was never opened in the workshop")
-        config = self._map_json(map_id)
         self.candidates.mkdir(parents=True, exist_ok=True)
         candidate_id = uuid4().hex
         now_ms = int(self._now() * 1000)
@@ -82,6 +81,7 @@ class MapStore:
         files = {}
         try:
             with self.hold_saves(), zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+                config = self._map_json(map_id)
                 config_bytes = json.dumps(config, ensure_ascii=False, indent=2).encode()
                 archive.writestr("map.json", config_bytes)
                 files["map.json"] = hashlib.sha256(config_bytes).hexdigest()
