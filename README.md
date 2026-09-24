@@ -111,26 +111,39 @@ or reject on the site. Inbox kinds (same envelope and validation as above):
   plus the markup JSON (`world/blockfield_workshop/maps/*.json` with that id, else the image's `blockfield/maps`) into
   `<BF_CANDIDATES_DIR>/<id>.zip` (map_package layout v1, validated) + `<id>.json`. While the workshop runs its saving is
   stopped: the controller closes entry, flushes and stops the workshop, confirms the JVM exited, then copies world and JSON. It restarts the same session and opens entry only after readiness. Save/stop/export/start failures remain closed and recoverable. Empty placeholder region files are skipped.
-- `publish` `{candidateId, force?}`: pending only, and never over a newer published version of the same map. The draft's
-  base (`blockfield-base.json`, written by the mod when it copies a template into the workshop: sha256 over the sorted
-  `<kind>/<file>\0<sha256>\n` lines of region/entities/poi, `candidates.template_digest`) must equal the live template's
-  digest; otherwise the result is an error starting with `base changed` (the template changed since the copy) or
-  `base unknown` (a draft from before base tracking), and only `force: true` publishes. After a publish the draft's
-  marker is rewritten to the new template. Needs the unpacked size + 256 MiB free; the template is swapped with one
-  `renameat2(RENAME_EXCHANGE)` (a match copying it sees old or new, never nothing) and restored if the JSON write fails. The template
-  `BF_TEMPLATES_DIR/<mapId>` is swapped for the candidate's world (staged next to it, then renamed; owner 1000) and the JSON
-  goes to `BF_PUBLISHED_MAPS_DIR/<mapId>.json`, which the game prefers over the image's JSON (blockfield-mod
-  `MapConfigManager` overlay, re-read every 5 s: new matches take it, running ones finish). The previous template/JSON
-  go to `BF_MAP_BACKUPS_DIR/<mapId>-<ms>/` (3 kept per map).
-- `reject` `{candidateId}`; `rollback` `{mapId}`: restore the newest backup (what was live becomes a backup itself).
-- `admin/candidates.json` `{schema:1, candidates:[{id, mapId, status: pending|published|rejected|superseded|rolled_back,
-  author, createdAt, sha256, size, regions, base, baseMatches?, decidedBy?, decidedAt?, forced?}], backups:{mapId: count},
-  overlays:{mapId: {differsFromRepo}}}`. 30 decided candidates kept. While a map has a pending candidate the mod keeps it
-  read-only for everybody (it reads this file from the admin mount).
-- A published JSON equal to the game's image copy (`BF_GAME_MAPS_DIR`, default `/srv/minecraft/lobby/blockfield/maps`,
-  i.e. git after a release) is removed on the next step, so git edits of that map apply again. To get there:
-  `tools/workshop/fetch-map.py <mapId>` copies the published JSON into `server/lobby/blockfield/maps` and the prod template
-  into the local rig; commit and release.
+- `publish` `{candidateId, force?}` (the site's «Принять»): pending only, and never over a newer accepted version of the
+  same map. The draft's base (`blockfield-base.json`, written by the mod when it copies a template into the workshop:
+  sha256 over the sorted `<kind>/<file>\0<sha256>\n` lines of region/entities/poi, `candidates.template_digest`) must
+  equal the live template's digest; otherwise the result is an error starting with `base changed` or `base unknown`,
+  and only `force: true` accepts (recorded as `forced`). Acceptance changes **nothing** in the game: the candidate
+  becomes `accepted`, and the controller copies its archive, checksum-verified and read-only, to
+  `admin/packages/<sha256>.zip` for the site's «Скачать пакет».
+- `reject` `{candidateId}`. `rollback` is refused: a map goes back through a release pinned to its previous package.
+- `admin/candidates.json` `{schema:1, candidates:[{id, mapId, status: pending|accepted|rejected (older: published|
+  superseded|rolled_back), author, createdAt, sha256, size, regions, base, baseMatches?, decidedBy?, decidedAt?,
+  forced?}], backups, overlays}`. 30 decided candidates kept (accepted ones always). While a map has a pending
+  candidate the mod keeps it read-only for everybody (it reads this file from the admin mount).
+
+## Delivering an accepted map (release)
+
+Maps reach the game only through an ordinary pack release (`v*` tag), and the release decides them completely:
+
+1. `python3 tools/workshop/publish_map.py --candidates <dir with <id>.zip and <id>.json> --id <candidateId>` on a
+   workstation with `gh` (copy the two files from `/srv/minecraft/workshop/candidates` or use «Скачать пакет»). It
+   validates the package, uploads it as the asset `<mapId>.zip` of the private release `map-<mapId>-<sha16>` (an
+   existing one is re-downloaded and compared, never replaced) and opens a PR that pins it in
+   `distribution/maps.lock.json` and writes its `map.json` into `server/lobby/blockfield/maps`.
+2. Merge the PR, bump the pack version and tag as usual. The release job downloads the pins
+   (`tools/workshop/release_maps.py`), and `build-distribution.py` replaces exactly those maps of the world seed with
+   the pinned worlds after checking that the committed JSON equals the package's (never a new world with old JSON).
+3. On start the game profile copies every map of the image over `/data/maps` (`start-container.sh sync_maps`; on
+   prod that is the host's `/srv/minecraft/templates/maps`, which the workshop reads for drafts and base checks), so
+   an existing data volume cannot keep an old world. Maps are replaced only with the backend stopped.
+
+Rollback of one map: run `publish_map.py` with the older accepted candidate (or restore the previous pin in git) and
+release. Local copy of a release's maps: `python3 tools/workshop/release_maps.py` (packages into `sources/maps`) or the
+full server tree via `build-distribution.py` / `dev/devstack.py setup`. Hand edits of `/srv/minecraft/templates/maps` are
+overwritten by the next game start: change maps through a new `world-seed-vN` or a pinned package instead.
 
 ## Playtest (profile test)
 
@@ -138,7 +151,7 @@ A closed test match of one candidate, in the **workshop app** (same data volume,
 `mode` `{profile: test, candidateId}` from phase `workshop`; the controller saves and stops the workshop, unpacks the
 candidate into `<workshop data>/test-candidate` and starts the app with `profile.json` `profile: test`.
 `start-container.sh` then runs the game profile on a fresh copy: level `test-world` from the lobby seed, all templates
-plus the candidate's world in `/data/test-maps`, its JSON as the published overlay, `BLOCKFIELD_STATS_EXPORT_ENABLED=false`,
+of the image's release plus the candidate's world in `/data/test-maps`, its JSON as the published overlay, `BLOCKFIELD_STATS_EXPORT_ENABLED=false`,
 `BLOCKFIELD_SESSION_PURPOSE=test`. The gate is `testers` (the workshop members, backend workshop). Returning with
 `mode workshop` (`session: resume`) deletes the copy on start: nothing of a test reaches the drafts or the statistics.
 
@@ -244,5 +257,5 @@ Unknown mod sidecars are rejected, NOT silently omitted. Full export compatibili
 
 ## Still open
 
-A draft is not re-based when its template changes (publish then needs `force`); resetting a draft to the template is a
-manual host operation. The world-seed release is not rebuilt from published maps (fresh installs keep the old world).
+A draft is not re-based when its template changes (acceptance then needs `force`); resetting a draft to the template
+is a manual host operation.

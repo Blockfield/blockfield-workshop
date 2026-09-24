@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from dataclasses import replace, asdict, dataclass
 import fcntl
 import json
+import hashlib
+import shutil
 import os
 import re
 import secrets
@@ -651,6 +653,25 @@ class Controller:
             return
         for map_id in self.maps.retire_merged_overlays():
             print(f"maps: published {map_id}.json now equals the repo copy, overlay retired", file=sys.stderr, flush=True)
+        packages = self.admin_dir / "packages"
+        packages.mkdir(exist_ok=True)
+        for meta in self.maps.list():
+            if meta["status"] != "accepted":
+                continue
+            source = self.maps.candidates / (meta["id"] + ".zip")
+            destination = packages / (meta["sha256"] + ".zip")
+            if not destination.exists():
+                temporary = destination.with_suffix(".tmp")
+                try:
+                    shutil.copyfile(source, temporary)
+                    with temporary.open("rb") as handle:
+                        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                    if digest != meta["sha256"]:
+                        raise ValueError("accepted package checksum mismatch")
+                    temporary.chmod(0o444)
+                    temporary.replace(destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
         self._replace_if_changed(self.admin_dir / "candidates.json", self.maps.export(), keep=())
 
     @staticmethod

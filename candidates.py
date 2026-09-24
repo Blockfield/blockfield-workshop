@@ -1,18 +1,6 @@
-"""Workshop map candidates: snapshot a map from the workshop, review it on the site, publish it to the game.
-
-Flow (blockfield-releases#8, owner decision 2026-09-24 "через проверку"):
-  candidate  -- snapshot of one map's workshop world + its markup JSON into an immutable ZIP (map_package layout v1),
-                taken after the controller saves and fully stops the workshop;
-  publish    -- an admin accepts a pending candidate: the game template (templates/maps/<id>) and the published map
-                JSON (lobby/blockfield-published/maps, which the game prefers over the image's JSON) are replaced,
-                the previous ones kept as a backup; new matches pick the map up, running ones finish on the old one;
-  reject     -- an admin declines a pending candidate;
-  rollback   -- restore the map's previous template and JSON from the newest backup.
-Everything runs in the root controller on the host; the site only writes inbox requests and reads candidates.json.
-"""
+"""Immutable workshop candidates. Acceptance never modifies game templates; delivery requires a pack release."""
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import json
 import os
@@ -31,10 +19,8 @@ WORLD_KINDS = ("region", "entities", "poi")
 MAP_ID = re.compile(r"[a-z0-9_]{1,32}")
 CANDIDATE_ID = re.compile(r"[0-9a-f]{32}")
 CANDIDATES_KEPT = 30
-BACKUPS_KEPT = 3
 OWNER = (1000, 1000)  # the game and the workshop run as uid/gid 1000 and read these files
 BASE_MARKER = "blockfield-base.json"  # written by blockfield-mod WorkshopMaps when it seeds a draft from the template
-MIN_FREE_BYTES = 256 << 20
 
 
 def template_digest(root: Path) -> str | None:
@@ -111,7 +97,7 @@ class MapStore:
 
     def publish(self, candidate_id: str, actor: dict, *, force: bool = False) -> dict:
         meta = self._pending(candidate_id)
-        newer = [m for m in self.list() if m["mapId"] == meta["mapId"] and m["status"] == "published"
+        newer = [m for m in self.list() if m["mapId"] == meta["mapId"] and m["status"] in {"accepted", "published"}
                  and m["createdAt"] > meta["createdAt"]]
         if newer:
             raise ValueError("a newer version of this map is already published")
@@ -127,55 +113,8 @@ class MapStore:
                 raise ValueError("base unknown: the draft predates base tracking; confirm to publish anyway")
             if meta["base"] != live:
                 raise ValueError("base changed: the map's template changed after this draft was copied; confirm to overwrite")
-        with zipfile.ZipFile(archive_path) as archive:
-            needed = sum(entry.file_size for entry in archive.infolist())
-            if shutil.disk_usage(self.templates).free < needed + MIN_FREE_BYTES:
-                raise OSError("not enough free space to publish the map")
-            config = map_package._json(archive.read("map.json"))
-            stamp = int(self._now() * 1000)
-            staged = self.templates / f".{map_id}.new-{stamp}"
-            try:
-                for entry in archive.infolist():
-                    if entry.filename.startswith("world/") and not entry.is_dir():
-                        # Names are validated by map_package (world/<kind>/r.X.Z.mca only): no traversal possible.
-                        destination = staged / entry.filename[len("world/"):]
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        destination.write_bytes(archive.read(entry))
-                _chown_tree(staged)
-            except BaseException:
-                shutil.rmtree(staged, ignore_errors=True)
-                raise
-        backup = self.backups / f"{map_id}-{stamp}"
-        backup.mkdir(parents=True)
-        json_path = self.published / f"{map_id}.json"
-        if json_path.exists():
-            shutil.copy2(json_path, backup / "map.json")
-        self.published.mkdir(parents=True, exist_ok=True)
-        if current.exists():
-            # Exchanged in one rename: a match copying the template at this moment sees the old or the new world,
-            # never a missing directory. The old one then moves into the backup.
-            _exchange(staged, current)
-            os.replace(staged, backup / "template")
-        else:
-            os.replace(staged, current)
-        try:
-            _atomic_json(json_path, config)
-        except BaseException:
-            # World and JSON go live together or not at all; the half-made backup must not become a rollback target.
-            if (backup / "template").exists():
-                _exchange(backup / "template", current)
-            else:
-                shutil.rmtree(current, ignore_errors=True)
-            shutil.rmtree(backup, ignore_errors=True)
-            raise
-        meta.update(status="published", decidedBy=actor, decidedAt=stamp, backup=backup.name, forced=force)
-        for other in self.list():
-            if other["mapId"] == map_id and other["status"] == "published" and other["id"] != candidate_id:
-                other.update(status="superseded")
-                self._write_meta(other)
+        meta.update(status="accepted", decidedBy=actor, decidedAt=int(self._now() * 1000), forced=force)
         self._write_meta(meta)
-        self._prune_backups(map_id)
-        self._rebase_draft(map_id)
         return meta
 
     def reject(self, candidate_id: str, actor: dict) -> dict:
@@ -185,31 +124,7 @@ class MapStore:
         return meta
 
     def rollback(self, map_id: str, actor: dict) -> dict:
-        if not isinstance(map_id, str) or not MAP_ID.fullmatch(map_id):
-            raise ValueError("invalid map id")
-        backups = self._backups(map_id)
-        if not backups:
-            raise ValueError("no backup of this map to roll back to")
-        backup = backups[-1]
-        stamp = int(self._now() * 1000)
-        current, json_path = self.templates / map_id, self.published / f"{map_id}.json"
-        # What is live now becomes a backup too, so a mistaken rollback can itself be undone.
-        undo = self.backups / f"{map_id}-{stamp}"
-        undo.mkdir(parents=True)
-        if current.exists():
-            os.replace(current, undo / "template")
-        if json_path.exists():
-            os.replace(json_path, undo / "map.json")
-        if (backup / "template").exists():
-            os.replace(backup / "template", current)
-        if (backup / "map.json").exists():
-            os.replace(backup / "map.json", json_path)
-        shutil.rmtree(backup, ignore_errors=True)
-        for meta in self.list():
-            if meta["mapId"] == map_id and meta["status"] == "published":
-                meta.update(status="rolled_back", decidedBy=actor, decidedAt=stamp)
-                self._write_meta(meta)
-        return {"mapId": map_id, "restored": backup.name}
+        raise ValueError("map rollback requires a new pack release pinned to the previous package")
 
     # ------------------------------------------------------------------ export for the site
 
@@ -315,13 +230,6 @@ class MapStore:
             return None
         return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
 
-    def _rebase_draft(self, map_id: str) -> None:
-        """The draft now descends from the template it just became; the next candidate from it needs no force."""
-        world = self.workshop_data / "world" / "dimensions" / "blockfield_workshop" / map_id
-        digest = template_digest(self.templates / map_id)
-        if world.is_dir() and digest:
-            _atomic_json(world / BASE_MARKER, {"schema": 1, "templateDigest": digest, "seededAt": int(self._now() * 1000)})
-
     def _cached_digest(self, map_id: str) -> str | None:
         root = self.templates / map_id
         try:
@@ -341,26 +249,14 @@ class MapStore:
             return False
 
     def _published_version(self, map_id: str) -> str:
-        published = [m for m in self.list() if m["mapId"] == map_id and m["status"] == "published"]
+        published = [m for m in self.list() if m["mapId"] == map_id and m["status"] in {"accepted", "published"}]
         return f"ws-{published[0]['createdAt']}" if published else "template"
 
     def _write_meta(self, meta: dict) -> None:
         _atomic_json(self.candidates / f"{meta['id']}.json", meta, owner=False)
 
-    def _backups(self, map_id: str) -> list[Path]:
-        found = []
-        for path in self.backups.glob(f"{map_id}-*") if self.backups.is_dir() else []:
-            stamp = path.name[len(map_id) + 1:]
-            if stamp.isdigit():
-                found.append((int(stamp), path))
-        return [path for _, path in sorted(found)]
-
-    def _prune_backups(self, map_id: str) -> None:
-        for path in self._backups(map_id)[:-BACKUPS_KEPT]:
-            shutil.rmtree(path, ignore_errors=True)
-
     def _prune(self) -> None:
-        decided = [m for m in self.list() if m["status"] not in {"pending", "published"}]
+        decided = [m for m in self.list() if m["status"] not in {"pending", "accepted", "published"}]
         for meta in decided[CANDIDATES_KEPT:]:
             (self.candidates / f"{meta['id']}.zip").unlink(missing_ok=True)
             (self.candidates / f"{meta['id']}.json").unlink(missing_ok=True)
@@ -372,17 +268,6 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1 << 20):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-_RENAME_EXCHANGE = 2
-
-
-def _exchange(a: Path, b: Path) -> None:
-    """Atomically swap two paths on one filesystem (renameat2 RENAME_EXCHANGE, Linux 3.15+)."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.renameat2(-100, os.fsencode(a), -100, os.fsencode(b), _RENAME_EXCHANGE) != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), str(a))
 
 
 def _atomic_json(path: Path, value, *, owner: bool = True) -> None:

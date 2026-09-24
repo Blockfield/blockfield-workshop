@@ -2,6 +2,7 @@
 import json
 import tempfile
 import time
+import zipfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -99,23 +100,23 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(self.held, ["off", "on"])
         self.assertEqual((meta["status"], meta["regions"]), ("pending", 1))
         self.store.publish(meta["id"], ACTOR)
-        self.assertEqual(json.loads((self.published / "konstaxa.json").read_text())["name"], "edited")
+        with zipfile.ZipFile(self.store.candidates / (meta["id"] + ".zip")) as archive:
+            self.assertEqual(json.loads(archive.read("map.json"))["name"], "edited")
 
-    def test_publish_replaces_template_and_keeps_a_backup_then_rollback_restores_it(self):
+    def test_acceptance_preserves_live_world_json_and_archive(self):
         meta = self.store.create("konstaxa", ACTOR)
-        published = self.store.publish(meta["id"], ACTOR)
-        self.assertEqual((self.templates / "konstaxa" / "region" / "r.0.0.mca").read_bytes(), b"edited-region")
-        self.assertEqual((self.templates / "konstaxa" / "entities" / "r.0.0.mca").read_bytes(), b"entities")
-        self.assertFalse((self.templates / "konstaxa" / "region" / "r.1.0.mca").exists())
-        self.assertEqual(published["status"], "published")
-        self.assertEqual(self.store.export()["backups"], {"konstaxa": 1})
+        archive = self.store.candidates / (meta["id"] + ".zip")
+        before = archive.read_bytes()
+        accepted = self.store.publish(meta["id"], ACTOR)
+        self.assertEqual(accepted["status"], "accepted")
+        self.assertEqual(archive.read_bytes(), before)
+        self.assertEqual((self.templates / "konstaxa/region/r.0.0.mca").read_bytes(), b"old-region")
+        self.assertFalse(self.published.exists())
+        self.assertFalse(self.store.backups.exists())
         with self.assertRaises(ValueError):
-            self.store.publish(meta["id"], ACTOR)  # not pending any more
-        self.clock[0] += 1
-        self.store.rollback("konstaxa", ACTOR)
-        self.assertEqual((self.templates / "konstaxa" / "region" / "r.0.0.mca").read_bytes(), b"old-region")
-        self.assertFalse((self.published / "konstaxa.json").exists(), "no published JSON before the first publish")
-        self.assertEqual(self.store.list()[0]["status"], "rolled_back")
+            self.store.publish(meta["id"], ACTOR)
+        with self.assertRaisesRegex(ValueError, "pack release"):
+            self.store.rollback("konstaxa", ACTOR)
 
     def test_an_older_candidate_cannot_replace_a_newer_published_one(self):
         old = self.store.create("konstaxa", ACTOR)
@@ -125,7 +126,7 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "newer"):
             self.store.publish(old["id"], ACTOR)
         self.store.reject(old["id"], ACTOR)
-        self.assertEqual({m["id"]: m["status"] for m in self.store.list()}, {old["id"]: "rejected", new["id"]: "published"})
+        self.assertEqual({m["id"]: m["status"] for m in self.store.list()}, {old["id"]: "rejected", new["id"]: "accepted"})
 
     def test_unknown_or_unopened_maps_are_refused(self):
         for bad in ("../etc", "fields", ""):
@@ -166,7 +167,7 @@ class BaseAndPlaytestTests(unittest.TestCase):
         self.assertEqual(template_digest(root), hashlib.sha256(line.encode()).hexdigest())
         self.assertIsNone(template_digest(self.root / "nothing"))
 
-    def test_changed_or_unknown_base_needs_force_and_a_publish_rebases_the_draft(self):
+    def test_changed_or_unknown_base_needs_force_and_acceptance_keeps_draft_base(self):
         meta = self.store.create("konstaxa", ACTOR)
         self.assertEqual(self.store.export()["candidates"][0]["baseMatches"], True)
         (self.templates / "konstaxa" / "region" / "r.0.0.mca").write_bytes(b"someone-else-published")
@@ -176,9 +177,9 @@ class BaseAndPlaytestTests(unittest.TestCase):
         self.assertEqual((self.templates / "konstaxa" / "region" / "r.0.0.mca").read_bytes(), b"someone-else-published")
         self.assertTrue(self.store.publish(meta["id"], ACTOR, force=True)["forced"])
         marker = json.loads((self.world / "blockfield-base.json").read_text())["templateDigest"]
-        self.assertEqual(marker, template_digest(self.templates / "konstaxa"))
+        self.assertNotEqual(marker, template_digest(self.templates / "konstaxa"))
         self.clock[0] += 1
-        self.assertEqual(self.store.publish(self.store.create("konstaxa", ACTOR)["id"], ACTOR)["status"], "published")
+        self.assertEqual(self.store.publish(self.store.create("konstaxa", ACTOR)["id"], ACTOR, force=True)["status"], "accepted")
         (self.world / "blockfield-base.json").unlink()
         self.clock[0] += 1
         unknown = self.store.create("konstaxa", ACTOR)
@@ -188,9 +189,6 @@ class BaseAndPlaytestTests(unittest.TestCase):
 
     def test_failed_publish_leaves_template_and_no_staging(self):
         meta = self.store.create("konstaxa", ACTOR)
-        with mock.patch.object(candidates.shutil, "disk_usage", return_value=mock.Mock(free=0)):
-            with self.assertRaises(OSError):
-                self.store.publish(meta["id"], ACTOR)
         with mock.patch.object(candidates, "_atomic_json", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 self.store.publish(meta["id"], ACTOR)
@@ -211,7 +209,8 @@ class BaseAndPlaytestTests(unittest.TestCase):
             self.store.sha256_of("0" * 32)
 
     def test_published_json_merged_into_git_is_retired(self):
-        self.store.publish(self.store.create("konstaxa", ACTOR)["id"], ACTOR)
+        self.published.mkdir()
+        (self.published / "konstaxa.json").write_text('{"id":"konstaxa"}')
         self.assertEqual(self.store.export()["overlays"], {"konstaxa": {"differsFromRepo": True}})
         self.assertEqual(self.store.retire_merged_overlays(), [])
         (self.repo / "konstaxa.json").write_text((self.published / "konstaxa.json").read_text())
