@@ -92,6 +92,20 @@ class CandidateTests(unittest.TestCase):
             state.update(phase="workshop", gate="builders", error=None, errorMessage=None)
             control._write(state)
 
+    def test_snapshot_of_a_map_without_draft_does_not_stop_the_workshop(self):
+        backend = FakeBackend()
+        goal = Goal("workshop", "v1", str(uuid4()))
+        from controller import Process
+        backend.processes = [Process(goal, True)]
+        control = Controller(self.root / "controller", backend, maps=self.store)
+        control.request(str(uuid4()), goal, 0)
+        self.assertEqual(control.step()["gate"], "builders")
+        for bad in ("dust2", "../konstaxa", None):
+            with self.assertRaises(ValueError):
+                control._snapshot(bad, ACTOR, "")
+        self.assertEqual((control.status()["phase"], control.status()["gate"]), ("workshop", "builders"))
+        self.assertEqual(backend.events, [])
+
     def test_snapshot_holds_saves_and_prefers_the_markup_copy(self):
         overlay = self.data / "world" / "blockfield_workshop" / "maps"
         overlay.mkdir(parents=True)

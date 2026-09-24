@@ -708,6 +708,8 @@ class Controller:
         return document, None
 
     def _snapshot(self, map_id: str, actor: dict, note: str) -> dict:
+        # A map that is not a draft is refused before entry closes and the workshop stops (stand acceptance 2026-09-24).
+        self.maps.check(map_id)
         with self._locked():
             state = self._read()
             if state["phase"] not in {"game", "workshop"}:

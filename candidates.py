@@ -53,12 +53,18 @@ class MapStore:
 
     # ------------------------------------------------------------------ requests
 
-    def create(self, map_id: str, author: dict, note: str = "") -> dict:
+    def check(self, map_id) -> Path:
+        """The draft of a map that can be snapshotted; raises before the controller stops anything."""
         if not isinstance(map_id, str) or not MAP_ID.fullmatch(map_id):
             raise ValueError("invalid map id")
         world = self.workshop_data / "world" / "dimensions" / "blockfield_workshop" / map_id
         if not (world / "region").is_dir():
             raise ValueError("the map was never opened in the workshop")
+        self._map_json(map_id)
+        return world
+
+    def create(self, map_id: str, author: dict, note: str = "") -> dict:
+        world = self.check(map_id)
         self.candidates.mkdir(parents=True, exist_ok=True)
         # Exports run under the controller lock, so any temporary archive here was left by one that was killed.
         for stale in self.candidates.glob(".*.zip.tmp"):
