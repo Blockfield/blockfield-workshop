@@ -60,6 +60,9 @@ class MapStore:
         if not (world / "region").is_dir():
             raise ValueError("the map was never opened in the workshop")
         self.candidates.mkdir(parents=True, exist_ok=True)
+        # Exports run under the controller lock, so any temporary archive here was left by one that was killed.
+        for stale in self.candidates.glob(".*.zip.tmp"):
+            stale.unlink(missing_ok=True)
         candidate_id = uuid4().hex
         now_ms = int(self._now() * 1000)
         target = self.candidates / f"{candidate_id}.zip"

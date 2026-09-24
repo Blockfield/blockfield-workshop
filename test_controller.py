@@ -50,6 +50,19 @@ class ControllerTests(unittest.TestCase):
         self.controller.step()
         self.backend.processes = [Process(self.goal, True)]
         return self.controller.step()
+    def test_low_disk_does_not_close_a_running_stable_backend(self):
+        # Stand acceptance 2026-09-24: preflight ran on every timer step, so low free space put a healthy game in ERROR.
+        self.controller.request(self.op, Goal("game", "v1"), 0)
+        self.assertEqual(self.controller.step()["gate"], "public")
+        def full(goal): raise OSError("not enough free space for the backend data")
+        self.backend.preflight = full
+        state = self.controller.step()
+        self.assertEqual((state["phase"], state["gate"], state["error"]), ("game", "public", None))
+        with self.assertRaises(OSError):
+            self.controller.request(str(uuid4()), self.goal, state["revision"])
+        self.assertEqual(self.controller.status()["phase"], "game")
+        self.assertEqual(self.backend.events, [])
+
     def test_game_release_deploy_is_followed_without_restart(self):
         self.controller.request(self.op, Goal("game", "v1"), 0)
         self.assertEqual(self.controller.step()["gate"], "public")

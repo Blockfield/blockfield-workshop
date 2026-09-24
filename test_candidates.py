@@ -128,6 +128,15 @@ class CandidateTests(unittest.TestCase):
         self.store.reject(old["id"], ACTOR)
         self.assertEqual({m["id"]: m["status"] for m in self.store.list()}, {old["id"]: "rejected", new["id"]: "accepted"})
 
+    def test_an_interrupted_export_leaves_no_archive_behind(self):
+        # Stand acceptance 2026-09-24: a controller killed mid-export left a 1.8 MB .zip.tmp forever.
+        self.store.candidates.mkdir(parents=True, exist_ok=True)
+        stale = self.store.candidates / f".{'0' * 32}.zip.tmp"
+        stale.write_bytes(b"partial")
+        meta = self.store.create("konstaxa", ACTOR)
+        self.assertFalse(stale.exists())
+        self.assertEqual(sorted(p.name for p in self.store.candidates.iterdir()), sorted([f"{meta['id']}.zip", f"{meta['id']}.json"]))
+
     def test_unknown_or_unopened_maps_are_refused(self):
         for bad in ("../etc", "fields", ""):
             with self.assertRaises(ValueError):

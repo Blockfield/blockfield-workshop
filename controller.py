@@ -467,7 +467,6 @@ class Controller:
                     self._write(state)
 
             try:
-                self.backend.preflight(goal)
                 if recover and previous_phase in {"STARTING", "ERROR"}:
                     commit(previous_phase, "closed", state.get("error"), state.get("errorMessage"))
                     self.backend.fence_pending_starts()
@@ -495,6 +494,9 @@ class Controller:
                     # restart resurrected another backend mid-start. Either way: wait for the deadline,
                     # fencing off anything unexpected instead of erroring out and requiring root recovery.
                     return self._starting_wait(state, goal, unexpected=current)
+                # Only work that stops or starts a backend is gated by space/lock checks: a stable, ready backend
+                # must not be closed to everybody because free space dipped (it keeps running either way).
+                self.backend.preflight(goal)
                 if current is not None:
                     if current.goal.profile == "game":
                         commit("DRAINING", "draining")
