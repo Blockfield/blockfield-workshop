@@ -18,11 +18,11 @@ import time
 
 
 def lock_holder(locks: str, inode: int) -> int | None:
-    """PID holding a flock on the inode, from /proc/locks ("FLOCK ADVISORY WRITE <pid> maj:min:ino ...")."""
+    """Read the recorded lock PID from /proc/locks; ignore blocked waiters (->)."""
     for line in locks.splitlines():
         fields = line.split()
-        if len(fields) >= 5 and fields[0] == "FLOCK" and fields[4].rsplit(":", 1)[-1] == str(inode):
-            return int(fields[3])
+        if len(fields) >= 6 and fields[1:4] == ["FLOCK", "ADVISORY", "WRITE"] and fields[5].rsplit(":", 1)[-1] == str(inode):
+            return int(fields[4])
     return None
 
 
@@ -63,8 +63,8 @@ def check(records: list[dict]) -> list[str]:
             violations.append(f"{r['t']}: {java} java processes")
         if r.get("gate") in ("public", "draining") and (r.get("workshop_java") or r.get("backend") != "game"):
             violations.append(f"{r['t']}: gate {r['gate']} outside the game backend")
-        if r.get("gate") == "builders" and (r.get("game_java") or r.get("backend") != "workshop"):
-            violations.append(f"{r['t']}: builders gate while game runs")
+        if r.get("gate") in ("builders", "testers") and (r.get("game_java") or r.get("backend") != "workshop"):
+            violations.append(f"{r['t']}: {r['gate']} gate outside the workshop backend")
     return violations
 
 
