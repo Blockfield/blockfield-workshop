@@ -7,7 +7,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
-from candidates import MapStore
+import hashlib
+from unittest import mock
+
+import candidates
+from candidates import MapStore, template_digest
 from controller import Controller, Goal
 from test_controller import FakeBackend
 
@@ -31,7 +35,11 @@ class CandidateTests(unittest.TestCase):
         self.templates = self.root / "templates"
         (self.templates / "konstaxa" / "region").mkdir(parents=True)
         (self.templates / "konstaxa" / "region" / "r.0.0.mca").write_bytes(b"old-region")
+        self.world = world
+        (world / "blockfield-base.json").write_text(json.dumps({"schema": 1, "templateDigest": template_digest(self.templates / "konstaxa")}))
         self.published = self.root / "published"
+        self.repo = self.root / "repo-maps"
+        self.repo.mkdir()
         self.held = []
         self.clock = [1000.0]
 
@@ -42,7 +50,7 @@ class CandidateTests(unittest.TestCase):
             self.held.append("on")
 
         self.store = MapStore(self.data, self.templates, self.published, self.root / "candidates",
-                              self.root / "backups", hold_saves=hold, now=lambda: self.clock[0])
+                              self.root / "backups", repo_maps=self.repo, hold_saves=hold, now=lambda: self.clock[0])
 
     def test_snapshot_holds_saves_and_prefers_the_markup_copy(self):
         overlay = self.data / "world" / "blockfield_workshop" / "maps"
@@ -106,3 +114,68 @@ class CandidateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BaseAndPlaytestTests(unittest.TestCase):
+    setUp = CandidateTests.setUp
+
+    def test_digest_matches_the_mod_algorithm(self):
+        root = self.root / "vector"
+        (root / "region").mkdir(parents=True)
+        (root / "region" / "r.0.0.mca").write_bytes(b"abc")
+        line = "region/r.0.0.mca\0ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
+        self.assertEqual(template_digest(root), hashlib.sha256(line.encode()).hexdigest())
+        self.assertIsNone(template_digest(self.root / "nothing"))
+
+    def test_changed_or_unknown_base_needs_force_and_a_publish_rebases_the_draft(self):
+        meta = self.store.create("konstaxa", ACTOR)
+        self.assertEqual(self.store.export()["candidates"][0]["baseMatches"], True)
+        (self.templates / "konstaxa" / "region" / "r.0.0.mca").write_bytes(b"someone-else-published")
+        self.assertEqual(self.store.export()["candidates"][0]["baseMatches"], False)
+        with self.assertRaisesRegex(ValueError, "^base changed"):
+            self.store.publish(meta["id"], ACTOR)
+        self.assertEqual((self.templates / "konstaxa" / "region" / "r.0.0.mca").read_bytes(), b"someone-else-published")
+        self.assertTrue(self.store.publish(meta["id"], ACTOR, force=True)["forced"])
+        marker = json.loads((self.world / "blockfield-base.json").read_text())["templateDigest"]
+        self.assertEqual(marker, template_digest(self.templates / "konstaxa"))
+        self.clock[0] += 1
+        self.assertEqual(self.store.publish(self.store.create("konstaxa", ACTOR)["id"], ACTOR)["status"], "published")
+        (self.world / "blockfield-base.json").unlink()
+        self.clock[0] += 1
+        unknown = self.store.create("konstaxa", ACTOR)
+        self.assertIsNone(self.store.export()["candidates"][0]["baseMatches"])
+        with self.assertRaisesRegex(ValueError, "^base unknown"):
+            self.store.publish(unknown["id"], ACTOR)
+
+    def test_failed_publish_leaves_template_and_no_staging(self):
+        meta = self.store.create("konstaxa", ACTOR)
+        with mock.patch.object(candidates.shutil, "disk_usage", return_value=mock.Mock(free=0)):
+            with self.assertRaises(OSError):
+                self.store.publish(meta["id"], ACTOR)
+        with mock.patch.object(candidates, "_atomic_json", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.store.publish(meta["id"], ACTOR)
+        self.assertEqual((self.templates / "konstaxa" / "region" / "r.0.0.mca").read_bytes(), b"old-region")
+        self.assertEqual([p.name for p in self.templates.iterdir()], ["konstaxa"])
+        self.assertEqual(self.store.export()["backups"], {}, "a failed publish leaves no rollback target")
+        self.assertEqual(self.store.list()[0]["status"], "pending")
+
+    def test_extract_for_the_playtest(self):
+        meta = self.store.create("konstaxa", ACTOR)
+        target = self.data / "test-candidate"
+        self.assertEqual(self.store.extract(self.store.sha256_of(meta["id"]), target), "konstaxa")
+        self.assertEqual((target / "map-id").read_text().strip(), "konstaxa")
+        self.assertEqual((target / "world" / "region" / "r.0.0.mca").read_bytes(), b"edited-region")
+        self.assertEqual(json.loads((target / "map.json").read_text())["id"], "konstaxa")
+        self.assertFalse((target / "manifest.json").exists())
+        with self.assertRaises(ValueError):
+            self.store.sha256_of("0" * 32)
+
+    def test_published_json_merged_into_git_is_retired(self):
+        self.store.publish(self.store.create("konstaxa", ACTOR)["id"], ACTOR)
+        self.assertEqual(self.store.export()["overlays"], {"konstaxa": {"differsFromRepo": True}})
+        self.assertEqual(self.store.retire_merged_overlays(), [])
+        (self.repo / "konstaxa.json").write_text((self.published / "konstaxa.json").read_text())
+        self.assertEqual(self.store.export()["overlays"], {"konstaxa": {"differsFromRepo": False}})
+        self.assertEqual(self.store.retire_merged_overlays(), ["konstaxa"])
+        self.assertFalse((self.published / "konstaxa.json").exists())

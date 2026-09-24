@@ -42,6 +42,7 @@ def _map_store(env, backend):
                     Path(env.get("BF_PUBLISHED_MAPS_DIR", "/srv/minecraft/lobby/blockfield-published/maps")),
                     Path(env.get("BF_CANDIDATES_DIR", "/srv/minecraft/workshop/candidates")),
                     Path(env.get("BF_MAP_BACKUPS_DIR", "/srv/minecraft/workshop/map-backups")),
+                    repo_maps=Path(env.get("BF_GAME_MAPS_DIR", "/srv/minecraft/lobby/blockfield/maps")),
                     hold_saves=getattr(backend, "workshop_saves_held", None))
 
 
@@ -84,6 +85,8 @@ def main(argv=None, backend_factory=None) -> int:
                                 drain_health_grace=float(env.get("BF_DRAIN_HEALTH_GRACE_S", 60)),
                                 start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
                                 maps=_map_store(env, backend))
+        if hasattr(backend, "maps"):
+            backend.maps = controller.maps
         os.chmod(state_dir, 0o700)
         if args.command == "status":
             result = {"state": controller.status(), "members": controller.members()}

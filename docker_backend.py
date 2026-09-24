@@ -49,6 +49,13 @@ class DockerBackend:
         self.stop_timeout = stop_timeout
         self.poll = poll
         self.min_free_bytes = min_free_bytes
+        # candidates.MapStore (workshopctl wires it): extracts a candidate for the test profile.
+        self.maps = None
+
+    @staticmethod
+    def app_of(profile: str) -> str:
+        """The playtest (test) runs in the workshop app: same data volume, still one backend."""
+        return "workshop" if profile == "test" else profile
 
     @classmethod
     def from_env(cls, env=os.environ) -> "DockerBackend":
@@ -135,7 +142,7 @@ class DockerBackend:
             data = json.loads(path.read_bytes()[:16384])
         except FileNotFoundError:
             return None
-        if (not isinstance(data, dict) or data.get("schema") != 1 or data.get("profile") not in self.apps
+        if (not isinstance(data, dict) or data.get("schema") != 1 or data.get("profile") not in {*self.apps, "test"}
                 or not isinstance(data.get("release"), str) or not data["release"]):
             raise ValueError("invalid profile.json")
         UUID(data.get("generation"))
@@ -151,20 +158,24 @@ class DockerBackend:
         return data if isinstance(data, dict) else None
 
     @staticmethod
-    def _goal(profile: str, release, session) -> Goal:
+    def _goal(profile: str, release, session, candidate=None) -> Goal:
         try:
-            return Goal(profile, release, None if profile == "game" else session)
+            return Goal(profile, release, None if profile == "game" else session, candidate if profile == "test" else None)
         except (ValueError, TypeError):
+            if profile == "test":
+                return Goal("workshop", "unknown", UNKNOWN_SESSION)
             return Goal(profile, "unknown", None if profile == "game" else UNKNOWN_SESSION)
 
     # ------------------------------------------------------------------ Backend protocol
 
     def preflight(self, goal: Goal) -> None:
-        if goal.profile not in self.apps:
+        if self.app_of(goal.profile) not in self.apps:
             raise ValueError(f"profile {goal.profile} has no app in this stage")
+        if goal.profile == "test" and self.maps is None:
+            raise ValueError("test needs the map candidates store")
         if self.lock_dir.is_symlink() or not self.lock_dir.is_dir():
             raise FileNotFoundError("backend lock directory missing")
-        data = self.apps[goal.profile].data
+        data = self.apps[self.app_of(goal.profile)].data
         if data.is_symlink() or not data.is_dir():
             raise FileNotFoundError(f"data directory for {goal.profile} missing")
         if shutil.disk_usage(data).free < self.min_free_bytes:
@@ -177,16 +188,17 @@ class DockerBackend:
         selection = self.selection()
         selected = selection["profile"] if selection else "game"
         processes = []
-        for profile in self.apps:
-            counts = inventory[profile]
+        for app in self.apps:
+            counts = inventory[app]
             if counts["java"] > 1:
-                raise RuntimeError(f"{profile} runs several java processes")
+                raise RuntimeError(f"{app} runs several java processes")
             # A task of an unselected profile waits in start-container.sh without java.
-            if counts["java"] == 0 and not (counts["tasks"] and profile == selected):
+            if counts["java"] == 0 and not (counts["tasks"] and app == self.app_of(selected)):
                 continue
-            ready = self.readiness(profile)
+            ready = self.readiness(app)
+            profile = selected if app == self.app_of(selected) else app
             if selection and selection["profile"] == profile:
-                goal = self._goal(profile, selection["release"], selection.get("session"))
+                goal = self._goal(profile, selection["release"], selection.get("session"), selection.get("candidate"))
                 expected = {key: selection.get(key) for key in ("profile", "generation", "session", "release")}
                 if profile == "game" and ready and ready.get("release"):
                     # Game images are deployed as :latest by release tags, outside the controller: follow the build.
@@ -209,6 +221,7 @@ class DockerBackend:
 
     def _rcon(self, profile: str, *command: str) -> str | None:
         """None when the profile runs no java (nothing to drain or save)."""
+        profile = self.app_of(profile)
         if self.inventory(tasks=False)[profile]["java"] == 0:
             return None
         container = self._container(profile)
@@ -247,7 +260,7 @@ class DockerBackend:
         self._rcon(process.goal.profile, "save-all", "flush")
 
     def _scale(self, profile: str, replicas: int) -> None:
-        self.run(["docker", "service", "scale", "--detach", f"{self.apps[profile].service}={replicas}"])
+        self.run(["docker", "service", "scale", "--detach", f"{self.apps[self.app_of(profile)].service}={replicas}"])
 
     def _wait_gone(self, profiles: list[str]) -> None:
         deadline = time.monotonic() + self.stop_timeout
@@ -262,11 +275,11 @@ class DockerBackend:
 
     def stop(self, process: Process) -> None:
         self._scale(process.goal.profile, 0)
-        self._wait_gone([process.goal.profile])
+        self._wait_gone([self.app_of(process.goal.profile)])
 
     def fence_pending_starts(self) -> None:
         selection = self.selection()
-        others = [p for p in self.apps if p != (selection["profile"] if selection else "game")]
+        others = [p for p in self.apps if p != self.app_of(selection["profile"] if selection else "game")]
         for profile in others:
             self._scale(profile, 0)
         deadline = time.monotonic() + self.stop_timeout
@@ -279,8 +292,14 @@ class DockerBackend:
             time.sleep(self.poll)
 
     def start(self, goal: Goal) -> None:
+        data = self.apps[self.app_of(goal.profile)].data
+        if goal.profile == "test":
+            # start-container.sh builds the playtest copy from this before java starts.
+            self.maps.extract(goal.candidate, data / "test-candidate")
         document = {"schema": 1, "profile": goal.profile, "generation": str(uuid4()),
                     "session": goal.session, "release": goal.release}
+        if goal.candidate:
+            document["candidate"] = goal.candidate
         atomic_write(self.lock_dir / "profile.json", json.dumps(document, sort_keys=True).encode(), 0o644)
-        (self.apps[goal.profile].data / READY_FILE).unlink(missing_ok=True)
+        (data / READY_FILE).unlink(missing_ok=True)
         self._scale(goal.profile, 1)

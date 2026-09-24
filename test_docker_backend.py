@@ -270,6 +270,39 @@ class DockerBackendTests(unittest.TestCase):
         self.assertLess(calls.index(["docker", "service", "scale", "--detach", "bf-workshop=0"]),
                         calls.index(["docker", "service", "scale", "--detach", "bf-game=1"]))
 
+    def test_playtest_runs_in_the_workshop_app_and_returns(self):
+        session, sha = str(uuid4()), "ab" * 32
+        extracted = []
+        self.backend.maps = mock.Mock(extract=lambda digest, target: extracted.append((digest, target)) or "dust2")
+        self.running("workshop")
+        self.backend.start(Goal("workshop", "v1", session))
+        generation = json.loads((self.lock / "profile.json").read_text())["generation"]
+        self.ready("workshop", generation=generation, session=session, release="v1")
+        controller = Controller(Path(self.temp.name) / "controller", self.backend)
+        controller.request(str(uuid4()), Goal("workshop", "v1", session), 0)
+        self.assertEqual(controller.step()["gate"], "builders")
+
+        test = Goal("test", "v1", session, sha)
+        controller.request(str(uuid4()), test, 1)
+        self.assertEqual(controller.step()["phase"], "STARTING")
+        selection = json.loads((self.lock / "profile.json").read_text())
+        self.assertEqual((selection["profile"], selection["candidate"]), ("test", sha))
+        self.assertEqual(extracted, [(sha, self.data["workshop"] / "test-candidate")])
+        self.assertEqual(self.backend.observe(), [Process(test, False)])
+        (self.data["workshop"] / READY_FILE).write_text(json.dumps(
+            {"profile": "test", "generation": selection["generation"], "session": session, "release": "v1"}))
+        self.assertEqual(controller.step()["gate"], "testers")
+
+        controller.request(str(uuid4()), Goal("workshop", "v1", session), 2)
+        self.assertEqual(controller.step()["phase"], "STARTING")
+        generation = json.loads((self.lock / "profile.json").read_text())["generation"]
+        self.ready("workshop", generation=generation, session=session, release="v1")
+        self.assertEqual(controller.step()["gate"], "builders")
+        calls = self.calls()
+        self.assertNotIn(["OVERLAP"], calls)
+        self.assertNotIn(["docker", "service", "scale", "--detach", "bf-game=1"], calls)
+        self.assertEqual(calls.count(["docker", "service", "scale", "--detach", "bf-workshop=0"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

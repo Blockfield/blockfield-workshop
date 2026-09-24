@@ -210,6 +210,7 @@ class Controller:
         self.gate_file = Path(gate_file) if gate_file else self.directory / "gate.json"
         self.public_file = Path(public_file) if public_file else self.directory / "public.json"
         self.message_file = self.directory / "message.json"
+        self.session_file = self.directory / "session.json"
         self.default_message = message.strip()[:500] or DEFAULT_MESSAGE
         self.admin_dir = Path(admin_dir) if admin_dir else None
         self.inbox_dir = Path(inbox_dir) if inbox_dir else None
@@ -337,24 +338,52 @@ class Controller:
     def status(self) -> dict:
         return self._read()
 
+    def session(self) -> dict | None:
+        """The last workshop session (id, maps offered in it, who started it); None before the first one."""
+        try:
+            value = json.loads(self.session_file.read_bytes()[:65536])
+            return value if isinstance(value, dict) and value.get("schema") == 1 else None
+        except (OSError, ValueError):
+            return None
+
+    def _session_for(self, document: dict, actor: dict) -> dict:
+        """New or resumed session for a mode->workshop request; maps: map ids offered in the workshop, None = all."""
+        choice, previous = document.get("session", "new"), self.session()
+        if choice not in {"new", "resume"}:
+            raise ValueError("session must be new or resume")
+        maps = document.get("maps") if "maps" in document else (previous or {}).get("maps") if choice == "resume" else None
+        if maps is not None:
+            if not isinstance(maps, list) or not maps or any(not isinstance(m, str) for m in maps) or len(set(maps)) != len(maps):
+                raise ValueError("maps must be a non-empty list of distinct map ids or null")
+            if set(maps) - MAP_IDS:
+                raise ValueError(f"unknown map id: {sorted(set(maps) - MAP_IDS)}")
+        if choice == "resume" and previous:
+            return {**previous, "maps": maps}
+        return {"schema": 1, "id": str(uuid4()), "maps": maps, "startedAt": self._now_ms(), "startedBy": actor}
+
     def _export(self, state: dict, *, deadline: int | None = None) -> None:
         """Proxy gate (private ACL) and public site status. Rewritten only when content changes.
 
         deadline is passed in by the caller for the ticks where it is live (DRAINING/STARTING wait
         loops); it is derived from "since" rather than persisted, so it is never stale on disk.
         """
-        gate = state["gate"] if state["gate"] in {"public", "draining", "builders"} else "closed"
+        gate = state["gate"] if state["gate"] in {"public", "draining", "builders", "testers"} else "closed"
         profile = (state.get("desired") or {}).get("profile", "game")
-        backend = "workshop" if gate == "builders" or (gate == "closed" and profile == "workshop") else "game"
+        # The playtest (profile test) runs in the workshop app for the same members.
+        members_gate = gate in {"builders", "testers"}
+        backend = "workshop" if members_gate or (gate == "closed" and profile in {"workshop", "test"}) else "game"
         gate_doc = {"schema": 1, "revision": state["revision"], "gate": gate, "backend": backend,
                     "message": "" if gate == "public" else self.message,
-                    "allowed": self.members() if gate == "builders" else []}
+                    "allowed": self.members() if members_gate else []}
         self._replace_if_changed(self.gate_file, gate_doc, keep=())
-        mode = {"public": "game", "draining": "draining", "builders": "workshop"}.get(gate, "maintenance")
+        mode = {"public": "game", "draining": "draining", "builders": "workshop", "testers": "workshop"}.get(gate, "maintenance")
         public = {"mode": mode, "message": "" if mode == "game" else self.message, "since": int(time.time() * 1000)}
         self._replace_if_changed(self.public_file, public, keep=("since",))
         if self.admin_dir:
             self._replace_if_changed(self.admin_dir / "members.json", self.members(), keep=())
+            session = self.session()
+            if session is not None:
+                self._replace_if_changed(self.admin_dir / "session.json", session, keep=())
             status = {"schema": 1, "revision": state["revision"], "phase": state["phase"], "gate": state["gate"],
                       "error": state.get("error"), "errorMessage": state.get("errorMessage"),
                       "since": state.get("since"), "deadline": deadline,
@@ -620,6 +649,8 @@ class Controller:
         """admin/candidates.json for the site: candidate list with status, backups per map."""
         if self.maps is None or not self.admin_dir:
             return
+        for map_id in self.maps.retire_merged_overlays():
+            print(f"maps: published {map_id}.json now equals the repo copy, overlay retired", file=sys.stderr, flush=True)
         self._replace_if_changed(self.admin_dir / "candidates.json", self.maps.export(), keep=())
 
     @staticmethod
@@ -670,13 +701,16 @@ class Controller:
             # Unprivileged recovery: an admin cancels a stuck DRAINING/STARTING switch without root.
             return self.cancel()["revision"]
         if kind in {"candidate", "publish", "reject", "rollback"}:
+            force = document.get("force", False)
+            if type(force) is not bool:
+                raise ValueError("force must be a boolean")
             if self.maps is None:
                 raise ValueError("map publishing is not configured")
             actor = {"draslId": document["actor"]["draslId"], "name": document["actor"]["name"]}
             if kind == "candidate":
                 self.maps.create(document.get("mapId"), actor, document.get("note", ""))
             elif kind == "publish":
-                self.maps.publish(document.get("candidateId"), actor)
+                self.maps.publish(document.get("candidateId"), actor, force=force)
             elif kind == "reject":
                 self.maps.reject(document.get("candidateId"), actor)
             else:
@@ -686,19 +720,35 @@ class Controller:
         if kind != "mode":
             raise ValueError("unknown kind")
         profile, expected, recover = document.get("profile"), document.get("expectedRevision"), document.get("recover", False)
-        if profile not in {"game", "workshop"} or type(expected) is not int or type(recover) is not bool:
+        if profile not in {"game", "workshop", "test"} or type(expected) is not int or type(recover) is not bool:
             raise ValueError("invalid mode request")
         if recover and profile != "game":
             raise ValueError("recover is only allowed toward game")
-        state = self.status()
+        state, session = self.status(), None
         if state.get("operation") == request_id:
             goal = Goal(**state["desired"])
         else:
             release = (state.get("desired") or {}).get("release")
             if not release:
                 raise ValueError("controller is not initialised")
-            goal = Goal("workshop", release, str(uuid4())) if profile == "workshop" else Goal("game", release)
+            if profile == "workshop":
+                actor = {"draslId": document["actor"]["draslId"], "name": document["actor"]["name"]}
+                session = self._session_for(document, actor)
+                goal = Goal("workshop", release, session["id"])
+            elif profile == "test":
+                # A closed playtest of one candidate, started from the running workshop and returning to it.
+                if state.get("phase") != "workshop":
+                    raise ValueError("a test starts only from the running workshop")
+                if self.maps is None:
+                    raise ValueError("map publishing is not configured")
+                goal = Goal("test", release, state["desired"]["session"], self.maps.sha256_of(document.get("candidateId")))
+            else:
+                goal = Goal("game", release)
         state = self.request(request_id, goal, expected, recover=recover)
+        if session is not None:
+            with self._locked():
+                atomic_write(self.session_file, json.dumps(session, ensure_ascii=False, sort_keys=True).encode())
+                self._export(self._read())
         if recover:
             state = self.step(recover=True)
             if state["phase"] == "ERROR":

@@ -7,6 +7,7 @@ import os
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from uuid import uuid4
 from controller import Controller, DEFAULT_MESSAGE, Goal, Process
@@ -296,3 +297,56 @@ class InboxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionAndPlaytestTests(unittest.TestCase):
+    setUp = InboxTests.setUp
+    process, put, result = InboxTests.process, InboxTests.put, InboxTests.result
+
+    def enter_workshop(self, **fields):
+        request_id = self.put("mode", profile="workshop", expectedRevision=self.controller.status()["revision"], **fields)
+        self.process()
+        self.assertTrue(self.result(request_id)["ok"], self.result(request_id))
+        self.backend.is_drained = True
+        self.controller.step()
+        self.backend.processes = [Process(Goal(**self.controller.status()["desired"]), True)]
+        self.controller.step()
+        return json.loads((self.admin / "session.json").read_text())
+
+    def test_new_session_offers_chosen_maps_and_resume_keeps_it(self):
+        first = self.enter_workshop(session="new", maps=["dust2", "mirage"])
+        self.assertEqual((first["maps"], first["startedBy"]["name"]), (["dust2", "mirage"], "Nether"))
+        self.assertEqual(self.controller.status()["desired"]["session"], first["id"])
+        back = self.put("mode", profile="game", expectedRevision=self.controller.status()["revision"])
+        self.process(); self.assertTrue(self.result(back)["ok"])
+        self.backend.processes = [Process(Goal("game", "v1"), True)]
+        self.controller.step()
+        resumed = self.enter_workshop(session="resume")
+        self.assertEqual((resumed["id"], resumed["maps"]), (first["id"], ["dust2", "mirage"]))
+
+    def test_session_maps_are_validated(self):
+        for fields in ({"maps": ["atlantis"]}, {"maps": []}, {"maps": ["dust2", "dust2"]}, {"session": "later"}):
+            request_id = self.put("mode", profile="workshop", expectedRevision=1, **fields)
+            self.process()
+            self.assertFalse(self.result(request_id)["ok"], fields)
+        self.assertFalse((self.admin / "session.json").exists())
+
+    def test_playtest_only_from_the_workshop_and_gate_testers(self):
+        sha = "ab" * 32
+        self.controller.set_members([ADMIN])
+        self.controller.maps = unittest.mock.Mock(sha256_of=lambda candidate: sha)
+        early = self.put("mode", profile="test", expectedRevision=1, candidateId="c" * 32)
+        self.process()
+        self.assertIn("only from the running workshop", self.result(early)["error"])
+        session = self.enter_workshop()
+        test = self.put("mode", profile="test", expectedRevision=self.controller.status()["revision"], candidateId="c" * 32)
+        self.process()
+        self.assertTrue(self.result(test)["ok"], self.result(test))
+        desired = self.controller.status()["desired"]
+        self.assertEqual((desired["profile"], desired["session"], desired["candidate"]), ("test", session["id"], sha))
+        self.controller.step()
+        self.backend.processes = [Process(Goal(**desired), True)]
+        self.assertEqual(self.controller.step()["gate"], "testers")
+        gate = json.loads((self.dir / "gate.json").read_text())
+        self.assertEqual((gate["gate"], gate["backend"], [m["name"] for m in gate["allowed"]]), ("testers", "workshop", ["Nether"]))
+        self.assertEqual(json.loads((self.dir / "public.json").read_text())["mode"], "workshop")
