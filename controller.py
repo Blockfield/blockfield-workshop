@@ -724,21 +724,36 @@ class Controller:
             state.update(phase="ERROR", gate="closed", error="SnapshotInterrupted",
                          errorMessage="snapshot did not finish; recover before reopening", since=self._now_ms())
             self._write(state)
+            def fail(error: Exception) -> None:
+                state.update(phase="ERROR", gate="closed", error=type(error).__name__, errorMessage=str(error))
+                self._write(state)
+
             try:
                 self.backend.save_and_freeze(current)
                 self.backend.stop(current)
                 if self.backend.observe():
                     raise RuntimeError("workshop not confirmed stopped")
+            except Exception as error:
+                fail(error)
+                raise
+            # Saved and stopped: a failed copy (e.g. ENOSPC, prod 2026-09-25) leaves the drafts intact, so the workshop
+            # comes back either way; only the request reports the error.
+            meta, copy_error = None, None
+            try:
                 meta = self.maps.create(map_id, actor, note)
                 self.export_maps()
+            except Exception as error:
+                copy_error = error
+            try:
                 state.update(phase="STARTING", error=None, errorMessage=None, since=self._now_ms())
                 self._write(state)
                 self.backend.start(current.goal)
-                return meta
             except Exception as error:
-                state.update(phase="ERROR", gate="closed", error=type(error).__name__, errorMessage=str(error))
-                self._write(state)
+                fail(error)
                 raise
+            if copy_error is not None:
+                raise copy_error
+            return meta
 
     def _apply(self, request_id: str, document: dict) -> int | None:
         kind = document.get("kind")

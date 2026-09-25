@@ -83,7 +83,12 @@ class CandidateTests(unittest.TestCase):
             with mock.patch.object(self.store, "create", side_effect=OSError("disk full") if failure == "copy" else snapshot):
                 with self.assertRaises((OSError, RuntimeError)):
                     control._snapshot("konstaxa", ACTOR, "")
-            self.assertEqual(control.status()["phase"], "ERROR")
+            if failure == "copy":
+                # The drafts survived the saved stop: the workshop restarts instead of waiting for recovery.
+                self.assertEqual(control.status()["phase"], "STARTING")
+                self.assertEqual(backend.events[-1], "start")
+            else:
+                self.assertEqual(control.status()["phase"], "ERROR")
             self.assertEqual(control.step()["gate"], "closed")
             self.assertLessEqual(len(backend.processes), 1)
             # Restore a ready workshop fixture for the next independent fault.
@@ -103,6 +108,11 @@ class CandidateTests(unittest.TestCase):
         for bad in ("dust2", "../konstaxa", None):
             with self.assertRaises(ValueError):
                 control._snapshot(bad, ACTOR, "")
+        self.assertEqual((control.status()["phase"], control.status()["gate"]), ("workshop", "builders"))
+        self.assertEqual(backend.events, [])
+        with mock.patch.object(candidates.shutil, "disk_usage", return_value=mock.Mock(free=1 << 20)):
+            with self.assertRaisesRegex(OSError, "free space"):
+                control._snapshot("konstaxa", ACTOR, "")
         self.assertEqual((control.status()["phase"], control.status()["gate"]), ("workshop", "builders"))
         self.assertEqual(backend.events, [])
 

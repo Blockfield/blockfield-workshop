@@ -19,6 +19,7 @@ WORLD_KINDS = ("region", "entities", "poi")
 MAP_ID = re.compile(r"[a-z0-9_]{1,32}")
 CANDIDATE_ID = re.compile(r"[0-9a-f]{32}")
 CANDIDATES_KEPT = 30
+SNAPSHOT_MARGIN = 16 << 20
 OWNER = (1000, 1000)  # the game and the workshop run as uid/gid 1000 and read these files
 BASE_MARKER = "blockfield-base.json"  # written by blockfield-mod WorkshopMaps when it seeds a draft from the template
 
@@ -61,6 +62,11 @@ class MapStore:
         if not (world / "region").is_dir():
             raise ValueError("the map was never opened in the workshop")
         self._map_json(map_id)
+        # Deflate never grows region files much, so the draft's size plus a margin bounds the archive.
+        need = sum(p.stat().st_size for kind in WORLD_KINDS for p in (world / kind).glob("*.mca")) + SNAPSHOT_MARGIN
+        target = self.candidates if self.candidates.is_dir() else self.candidates.parent
+        if shutil.disk_usage(target).free < need:
+            raise OSError(f"not enough free space for the candidate: need {need >> 20} MiB")
         return world
 
     def create(self, map_id: str, author: dict, note: str = "") -> dict:
