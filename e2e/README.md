@@ -16,7 +16,7 @@ portable, repeatable version of the same scenarios.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `BF_WORKSPACE` | parent of this repo checkout | directory containing sibling repos (`BlockField-Private-Project`, `blockfield-web`) |
+| `BF_WORKSPACE` | parent of this repo checkout | directory containing sibling repos (`BlockField-Private-Project`, `blockfield-site`) |
 | `STAND_DIR` | `$XDG_CACHE_HOME/bf-workshop-stand` or `~/.cache/bf-workshop-stand` | stand data: `game/`, `workshop/`, `lock/`, `controller/`, `candidates/`, `evidence/` (not `tools/workshop/e2e/` itself, which is code) |
 | `JAVA` | `mise which java` (run in `dev/rig`, same Temurin 21 pin) | java binary for the stand JVM |
 | `CLAUDE_CODE_SESSION_ID` / `BF_RIG_OWNER` | — (required) | `agent-process` owner; whichever is set first |
