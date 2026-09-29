@@ -142,7 +142,7 @@ Maps reach the game only through an ordinary pack release (`v*` tag), and the re
 
 Rollback of one map: run `publish_map.py` with the older accepted candidate (or restore the previous pin in git) and
 release. Local copy of a release's maps: `python3 tools/workshop/release_maps.py` (packages into `sources/maps`) or the
-full server tree via `build-distribution.py` / `dev/devstack.py setup`. Hand edits of `/srv/minecraft/templates/maps` are
+full server tree via `build-distribution.py` / `scripts/dev/devstack.py setup` (blockfield-modpack). Hand edits of `/srv/minecraft/templates/maps` are
 overwritten by the next game start: change maps through a new `world-seed-vN` or a pinned package instead.
 
 ## Playtest (profile test)
