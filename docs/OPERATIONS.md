@@ -179,7 +179,8 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    install -d -o 1000 -g 1000 /srv/minecraft/workshop/data
    install -d /opt/blockfield-workshop/scripts /etc/blockfield
    install -m 0644 {controller,docker_backend,workshopctl,journal,candidates,map_package}.py map_ids.json /opt/blockfield-workshop/
-   install -m 0644 scripts/toolchain.py /opt/blockfield-workshop/scripts/
+   install -m 0644 scripts/{toolchain,quality}.py /opt/blockfield-workshop/scripts/
+   install -m 0644 justfile /opt/blockfield-workshop/
    python3 /opt/blockfield-workshop/scripts/toolchain.py -c 'import sys,zlib; print(sys.version, zlib.ZLIB_RUNTIME_VERSION)'
    install -m 0600 systemd/workshop.env.example /etc/blockfield/workshop.env   # edit service names
    install -m 0644 systemd/blockfield-workshop.{service,timer,path} /etc/systemd/system/
