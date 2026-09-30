@@ -1,4 +1,4 @@
-# Blockfield Workshop
+# Мастерская Blockfield
 
 Контроллер переключения game/workshop/test, проверка кандидатов карт и отдельный
 образ мастерской. Исходники выделены из `blockfield-server/tools/workshop`
@@ -21,16 +21,19 @@ Linux проверяет весь контроллер. Windows проверяе
 
 ## Образ и интеграция
 
-`Publish workshop image` запускается вручную на `main` после проверок обеих ОС.
-Публикует только `ghcr.io/blockfield/blockfield-workshop:sha-<полный SHA>`,
-без тега `prod`, webhook или автоматического деплоя. Для чтения приватного
+`Deploy workshop` запускается вручную на `main` после подтверждения владельца.
+После проверок обеих ОС публикует `ghcr.io/blockfield/blockfield-workshop:latest`
+и `:sha-<полный SHA>`, затем вызывает секрет `DOKPLOY_WORKSHOP_WEBHOOK`.
+Dokploy использует `:latest`, существующий GHCR registry и `replicas=0`;
+workflow сообщает о постановке Deploy в очередь, проверка rollout — отдельно.
+Push в main выполняет только проверки. Для чтения приватного
 parent-образа в GHCR `blockfield-server` → Package settings → Manage Actions access
 добавьте `Blockfield/blockfield-workshop` с ролью Read. Используется `GITHUB_TOKEN`,
 локальные credentials в Actions не копируются. Dockerfile закрепляет
 проверенный серверный образ по digest; ресурсы игры не копируются в Git.
 
 Сервис мастерской сохраняет прежние mounts, healthcheck и `replicas=0`;
-переключение на новый образ требует отдельного подтверждения Deploy.
+каждый ручной запуск Deploy требует отдельного подтверждения владельца.
 Кандидаты ZIP используют Python 3.12.14 / zlib 1.3.2; неверный compressor
 останавливает snapshot до закрытия входа. `just` и systemd используют pinned Python.
 Контроллер остаётся host-systemd service: запускать второй controller в контейнере нельзя.
@@ -41,3 +44,5 @@ parent-образа в GHCR `blockfield-server` → Package settings → Manage 
 в [blockfield-server/scripts/maps](https://github.com/Blockfield/blockfield-server/tree/main/scripts/maps);
 server получает validator и map IDs по полному SHA и checksum.
 Исторические архивные релизы не изменяются.
+
+Условия использования: [LICENSE](LICENSE).
