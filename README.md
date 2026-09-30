@@ -23,7 +23,10 @@ Linux проверяет весь контроллер. Windows проверяе
 
 `Publish workshop image` запускается вручную на `main` после проверок обеих ОС.
 Публикует только `ghcr.io/blockfield/blockfield-workshop:sha-<полный SHA>`,
-без тега `prod`, webhook или автоматического деплоя. Dockerfile закрепляет
+без тега `prod`, webhook или автоматического деплоя. Для чтения приватного
+parent-образа в GHCR `blockfield-server` → Package settings → Manage Actions access
+добавьте `Blockfield/blockfield-workshop` с ролью Read. Используется `GITHUB_TOKEN`,
+локальные credentials в Actions не копируются. Dockerfile закрепляет
 проверенный серверный образ по digest; ресурсы игры не копируются в Git.
 
 Сервис мастерской сохраняет прежние mounts, healthcheck и `replicas=0`;
