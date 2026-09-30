@@ -2,7 +2,7 @@
 
 Integration/E2E harness that drives the **real** `workshopctl`/`controller.py` (and, for the proxy/site
 scenarios, the real Velocity+blockfield-proxy+Limbo and the site admin) against native JVMs on this
-machine instead of the Docker Swarm services `README.md` targets in production. One
+machine instead of the Docker Swarm services `docs/OPERATIONS.md` targets in production. One
 physical backend at a time, same as prod: `StandBackend` (`stand.py`) mirrors `docker_backend.DockerBackend`
 but starts/stops `fabric-server-launch.jar` directly through `agent-process` and reads `.blockfield-ready.json`
 from two plain directories instead of two Dokploy apps.
@@ -95,7 +95,7 @@ wait
 
 Expected: one accepts, the other exits 1 with "stale state revision" (or exit 75 if it hit the controller lock
 mid-step); only one switch proceeds. Proves the same criterion as #2 ("... including concurrent requests"), plus
-`README.md`'s CAS/lock design.
+`docs/OPERATIONS.md`'s CAS/lock design.
 
 ### 4. Crash / SIGKILL restart
 
@@ -150,7 +150,7 @@ python3 e2e/probe.py Player115 "$STAND_DIR/evidence/acl.jsonl" "//set stone"   #
 ```
 
 Expected: op/console-only commands refused for a builder; `//set`/`//undo`/`//redo` on permitted maps work; a
-forged `/api/workshop/submit`/`/api/workshop/access` (site-side, see `README.md`) without a valid
+forged `/api/workshop/submit`/`/api/workshop/access` (site-side, see `docs/OPERATIONS.md`) without a valid
 key/actor/map is rejected; after revocation the account is sent to the lobby on the proxy's next tick and further
 edits are refused. Proves the ACL/WorldEdit/revocation criterion.
 
@@ -173,7 +173,7 @@ Proves "documented limits and measured container/RSS/heap memory during building
 ## Package validation (criterion 14, unit side)
 
 `../test_map_package_attacks.py` (in ``, runs under
-`python3 -m unittest discover -s tools/workshop`) builds its own valid candidate package in a temp dir and
+`just test`) builds its own valid candidate package in a temp dir and
 feeds `map_package.validate()`a battery of hostile archives, so this part of criterion 14 runs in the release
 job instead of needing a live stand. See that file's docstring for which of the original 19 hostile cases from
 the ad-hoc`package_attacks.py`are new coverage vs. already-identical existing tests in`test_map_package.py`.
@@ -183,4 +183,4 @@ the ad-hoc`package_attacks.py`are new coverage vs. already-identical existing te
 Disk-full/ENOSPC (the ad-hoc run could only simulate it without root — see
 `/var/mnt/projects/.bf-accept8/evidence/c9-failures`), a real Dokploy redeploy or `systemctl restart docker`
 mid-switch, and the launcher's own maintenance-screen rendering are Docker/prod-specific or need root; they stay
-manual per `README.md`'s "Process journal acceptance test" section.
+manual per `docs/OPERATIONS.md`'s "Process journal acceptance test" section.

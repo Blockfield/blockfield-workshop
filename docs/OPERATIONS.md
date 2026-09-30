@@ -3,7 +3,7 @@
 Refs netherg-io/blockfield-releases#8 (stage a); draining follows #6. Python 3.11+ on Linux, stdlib only.
 
 ```sh
-python3 -m unittest discover -s tools/workshop -p 'test_*.py' -v   # controller, Docker adapter, CLI, journal, packages
+just test   # controller, Docker adapter, CLI, journal, packages
 bash distribution/test-backend-lock.sh                              # start-container.sh flock/profile guard
 (cd proxy/plugin && ./gradlew test)                                 # proxy gate parsing/routing
 python3 map_package.py candidate.zip --sha256 <pinned-archive-sha256>
@@ -141,9 +141,9 @@ Maps reach the game only through an ordinary pack release (`v*` tag), and the re
    prod that is the host's `/srv/minecraft/templates/maps`, which the workshop reads for drafts and base checks), so
    an existing data volume cannot keep an old world. Maps are replaced only with the backend stopped.
 
-Rollback of one map: run `publish_map.py` with the older accepted candidate (or restore the previous pin in git) and
+Rollback of one map: in blockfield-server run `just python scripts/maps/publish_map.py` with the older accepted candidate (or restore the previous pin in git) and
 release. Local copy of a release's maps: `just python scripts/maps/release_maps.py` in blockfield-server (packages into `sources/maps`) or the
-full server tree via `build-distribution.py` / `dev/devstack.py setup`. Hand edits of `/srv/minecraft/templates/maps` are
+full server tree via `just build` in blockfield-server / `just setup` in blockfield-workspace. Hand edits of `/srv/minecraft/templates/maps` are
 overwritten by the next game start: change maps through a new `world-seed-vN` or a pinned package instead.
 
 ## Playtest (profile test)
@@ -165,10 +165,11 @@ Deploy with the same tag after returning to the game.
 Defaults: `BF_CANDIDATES_DIR=/srv/minecraft/workshop/candidates`, `BF_MAP_BACKUPS_DIR=/srv/minecraft/workshop/map-backups`,
 `BF_TEMPLATES_DIR=/srv/minecraft/templates/maps`, `BF_PUBLISHED_MAPS_DIR=/srv/minecraft/lobby/blockfield-published/maps`.
 
-## Owner setup (not done by this PR)
+## New installation (requires owner approval)
 
-Dependencies: server image with blockfield-mod#30 (readiness + workshop profile, stacked on #28 DRAINING), proxy image
-from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
+Dependencies: compatible published Blockfield server, proxy, site and launcher with
+workshop readiness, gate and admin-inbox support. For an existing installation, preserve
+its environment, mounts, controller state and enabled units; this bootstrap is not a migration.
 
 1. Host (root):
    ```sh
@@ -178,18 +179,18 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    install -d -m 0770 -o root -g 1000 /srv/minecraft/workshop/inbox   # site container uid/gid 1000 writes requests
    install -d -o 1000 -g 1000 /srv/minecraft/workshop/data
    install -d /opt/blockfield-workshop/scripts /etc/blockfield
-   install -m 0644 {controller,docker_backend,workshopctl,journal,candidates,map_package}.py map_ids.json /opt/blockfield-workshop/
-   install -m 0644 scripts/{toolchain,quality}.py /opt/blockfield-workshop/scripts/
+   install -m 0644 controller.py docker_backend.py workshopctl.py journal.py candidates.py map_package.py map_ids.json /opt/blockfield-workshop/
+   install -m 0644 scripts/toolchain.py scripts/quality.py /opt/blockfield-workshop/scripts/
    install -m 0644 justfile /opt/blockfield-workshop/
    python3 /opt/blockfield-workshop/scripts/toolchain.py -c 'import sys,zlib; print(sys.version, zlib.ZLIB_RUNTIME_VERSION)'
    install -m 0600 systemd/workshop.env.example /etc/blockfield/workshop.env   # edit service names
-   install -m 0644 systemd/blockfield-workshop.{service,timer,path} /etc/systemd/system/
+   install -m 0644 systemd/blockfield-workshop.service systemd/blockfield-workshop.timer systemd/blockfield-workshop.path /etc/systemd/system/
    systemctl daemon-reload            # do NOT enable the timer yet
    ```
 2. Dokploy `blockfield-server` (game): add bind mount `/srv/minecraft/backend-lock` -> `/backend-lock`; env
-   `BLOCKFIELD_PROFILE=game`; set **rollback order stop-first** (currently start-first; update order is already stop-first).
+   `BLOCKFIELD_PROFILE=game`; set **rollback order stop-first** (update order must also be stop-first).
    Keep the existing `/srv/minecraft/lobby` and templates mounts (make templates `:ro`).
-3. Dokploy: create `blockfield-workshop` from the same image `ghcr.io/blockfield/blockfield-workshop@sha256:<published-digest>`, **replicas 0**,
+3. Dokploy: create `blockfield-workshop` from the independent image `ghcr.io/blockfield/blockfield-workshop@sha256:<published-digest>`, **replicas 0**,
    restart policy any, update and rollback order stop-first, same network as the proxy. Mounts:
    `/srv/minecraft/workshop/data` -> `/data`, `/srv/minecraft/templates/maps` -> `/data/maps` read-only,
    `/srv/minecraft/backend-lock` -> `/backend-lock`. Env: `BLOCKFIELD_PROFILE=workshop`,
@@ -197,7 +198,7 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    as the game app, own `RCON_PASSWORD`, same `FABRIC_PROXY_SECRET`; **no** `BLOCKFIELD_STATS_INGEST_*` variables.
    Health check as the game app (`mc-health`, interval 30s, **start period 600s**, 6 retries): the itzg image default
    (start period 120s, 2 retries) kills the workshop as unhealthy mid-startup (2026-09-23 prod smoke test).
-   Put the resulting service name into `/etc/blockfield/workshop.env` and into `proxy/velocity.toml` (`workshop = ...`).
+   Put the resulting service name into `/etc/blockfield/workshop.env` and into the independent blockfield-proxy Velocity configuration (`workshop = ...`).
 4. Proxy app: env `BLOCKFIELD_GATE_FILE=/workshop-gate/gate.json`, mount `/srv/minecraft/workshop/gate` -> `/workshop-gate` read-only.
    Site app: env `BLOCKFIELD_GATE_FILE=/workshop-public/public.json`, mount `/srv/minecraft/workshop/public` read-only;
    for the admin also mount `/srv/minecraft/workshop/admin` read-only and `/srv/minecraft/workshop/inbox` read-write.
@@ -209,7 +210,7 @@ from this PR, site with blockfield-web#5, launcher with Blockfield-Launcher#4.
    systemctl enable --now blockfield-workshop.timer
    ```
 6. **Announced proxy restart window** (all players are disconnected once): announce in Discord/hub, wait for no running
-   Ranked campaign, deploy the proxy (`Deploy` with `proxy: true`), check `gate.json` is read (proxy log `Gate ...`) and
+   Ranked campaign, run the independent blockfield-proxy Deploy workflow, check `gate.json` is read (proxy log `Gate ...`) and
    that a normal login still reaches the game. Roll back by removing `BLOCKFIELD_GATE_FILE` from the proxy env.
 
 ## Operations
