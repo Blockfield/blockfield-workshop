@@ -243,6 +243,7 @@ def tests():
                     "test_map_package*.py",
                     "test_package_review.py",
                     "test_journal.py",
+                    "test_toolchain.py",
                 ]
                 print(
                     "Windows: portable workshop checks; Docker controller suite runs on Linux."
@@ -276,11 +277,11 @@ def main():
                 env=child_env(),
             ).returncode
         )
-    files = sources()
     mode = sys.argv[1]
     if mode == "run":
         run(*sys.argv[2:])
         return
+    files = sources()
     if mode == "setup":
         if (ROOT / "package.json").is_file():
             if (ROOT / "pnpm-lock.yaml").is_file():

@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,8 +12,12 @@ from pathlib import Path
 
 class ToolchainScript(unittest.TestCase):
     def test_isolated_script_imports_adjacent_modules_and_preserves_arguments(self):
-        root = Path(__file__).resolve().parent
+        repository = Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "installation without git"
+            (root / "scripts").mkdir(parents=True)
+            for name in ("toolchain.py", "quality.py"):
+                shutil.copyfile(repository / "scripts" / name, root / "scripts" / name)
             directory = Path(temporary) / "script with spaces"
             directory.mkdir()
             (directory / "adjacent.py").write_text("VALUE = 42\n")
