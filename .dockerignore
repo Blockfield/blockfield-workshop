@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!controller.py
+!docker_backend.py
+!workshopctl.py
+!journal.py
+!candidates.py
+!map_package.py
+!map_ids.json

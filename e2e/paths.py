@@ -9,9 +9,11 @@ import shutil
 from pathlib import Path
 
 E2E = Path(__file__).resolve().parent
-WORKSHOP = E2E.parent  # tools/workshop: controller.py, workshopctl.py, journal.py, candidates.py, map_package.py
-MODPACK = WORKSHOP.parents[1]  # the blockfield-modpack repo (or worktree) root
-WORKSPACE = Path(os.environ.get("BF_WORKSPACE", MODPACK.parent))
+WORKSHOP = E2E.parent
+REPOSITORY = WORKSHOP
+WORKSPACE = Path(
+    os.environ.get("BF_WORKSPACE", REPOSITORY.parent / "blockfield-workspace")
+)
 MOD = WORKSPACE / "localmods" / "blockfield-mod"
 RIG = MOD / "dev" / "rig"  # rcon.py, rig.sh, server.sh, agent-process
 STAND = Path(

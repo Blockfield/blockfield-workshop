@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import time
 import zipfile
+import zlib
 from contextlib import nullcontext
 from pathlib import Path
 from uuid import uuid4
@@ -72,6 +73,10 @@ class MapStore:
 
     def check(self, map_id) -> Path:
         """The draft of a map that can be snapshotted; raises before the controller stops anything."""
+        if (zlib.ZLIB_VERSION, zlib.ZLIB_RUNTIME_VERSION) != ("1.3.2", "1.3.2"):
+            raise RuntimeError(
+                "Candidate ZIPs require zlib 1.3.2; install the pinned workshop Python"
+            )
         if not isinstance(map_id, str) or not MAP_ID.fullmatch(map_id):
             raise ValueError("invalid map id")
         world = (

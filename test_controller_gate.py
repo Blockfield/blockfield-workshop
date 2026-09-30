@@ -180,8 +180,8 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.gate()["allowed"], [builder])
 
     def test_map_ids_match_lobby_maps(self):
-        maps = Path(__file__).resolve().parents[2] / "server/lobby/blockfield/maps"
-        self.assertEqual(MAP_IDS, {f.stem for f in maps.glob("*.json")})
+        maps = Path(__file__).resolve().with_name("map_ids.json")
+        self.assertEqual(MAP_IDS, set(json.loads(maps.read_text())))
 
     def test_since_survives_unchanged_mode(self):
         self.controller.request(str(uuid4()), self.goal, 0)

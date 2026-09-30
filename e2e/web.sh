@@ -4,8 +4,8 @@
 # "BF_INBOX_DIR": "...", ...same admin/gate env the site's README documents} plus its own DB/session secrets.
 set -eu
 STAND_DIR="${STAND_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/bf-workshop-stand}"
-WORKSPACE="${BF_WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)}"
-WEB_DIR="${BF_WEB_DIR:-$WORKSPACE/blockfield-site}"
+WORKSPACE="${BF_WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
+WEB_DIR="${BF_WEB_DIR:?set BF_WEB_DIR to your isolated blockfield-site checkout}"
 eval "$(python3 -c "import json,shlex;[print(f'export {k}={shlex.quote(v)}') for k,v in json.load(open('$STAND_DIR/web-runtime-env.json')).items()]")"
 cd "$WEB_DIR"
 NODE_BIN="${NODE:-$(command -v node)}"

@@ -106,28 +106,7 @@ DEFAULT_MESSAGE = (
 OPEN_GATES = {"game": "public", "workshop": "builders", "test": "testers"}
 ROLES = {"builder", "lead", "admin"}
 # server/lobby/blockfield/maps/*.json ids (blockfield-mod); the controller only validates, it does not read the mod's data.
-MAP_IDS = frozenset(
-    {
-        "ancient",
-        "anubis",
-        "baxmut",
-        "berdichev",
-        "dm_arena",
-        "dust2",
-        "fields",
-        "firing_range",
-        "inferno",
-        "konstaxa",
-        "kozyatyn",
-        "mirage",
-        "nuke",
-        "overpass",
-        "snipers_towers",
-        "train",
-        "vertigo",
-        "zaliznichne",
-    }
-)
+MAP_IDS = frozenset(json.loads(Path(__file__).with_name("map_ids.json").read_text()))
 # Access scopes a builder's "maps" may name: every map plus the workshop hub itself (blockfield-mod WorkshopMembers.HUB).
 SCOPE_IDS = MAP_IDS | {"hub"}
 NAME = re.compile(r"[A-Za-z0-9_]{3,16}")

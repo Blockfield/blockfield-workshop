@@ -21,6 +21,11 @@ ACTOR = {"draslId": "e10438e4797b49718cfecec6a8fa171b", "name": "Nether"}
 
 
 class CandidateTests(unittest.TestCase):
+    def test_wrong_compressor_fails_before_snapshot(self):
+        with mock.patch.object(candidates.zlib, "ZLIB_RUNTIME_VERSION", "1.2.13"):
+            with self.assertRaisesRegex(RuntimeError, "zlib 1.3.2"):
+                self.store.check("fields")
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
