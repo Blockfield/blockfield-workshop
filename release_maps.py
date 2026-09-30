@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import zipfile
 
-import map_package
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import map_package  # noqa: E402
 
 REPOSITORY = "netherg-io/blockfield-modpack"
 
