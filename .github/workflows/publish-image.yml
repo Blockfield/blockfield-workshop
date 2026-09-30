@@ -1,4 +1,4 @@
-name: Publish workshop image
+name: Deploy workshop
 on:
   workflow_dispatch:
 permissions:
@@ -38,6 +38,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/blockfield/blockfield-workshop:sha-${{ github.sha }}
+            ghcr.io/blockfield/blockfield-workshop:latest
           build-args: REVISION=${{ github.sha }}
       - name: Record immutable deployment reference
         env:
@@ -46,3 +47,10 @@ jobs:
         run: |
           printf 'Commit: %s\n\nImage: ghcr.io/blockfield/blockfield-workshop@%s\n' \
             "$IMAGE_REVISION" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Queue deployment through Dokploy webhook
+        env:
+          WEBHOOK: ${{ secrets.DOKPLOY_WORKSHOP_WEBHOOK }}
+        run: |
+          test -n "$WEBHOOK" || { echo "::error::DOKPLOY_WORKSHOP_WEBHOOK is missing"; exit 1; }
+          curl --silent --fail --max-time 30 --output /dev/null -X POST "$WEBHOOK"
+          echo 'Deployment queued in Dokploy; check the zero-replica application rollout.' >> "$GITHUB_STEP_SUMMARY"

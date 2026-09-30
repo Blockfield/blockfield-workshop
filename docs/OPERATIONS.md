@@ -1,20 +1,19 @@
 # Workshop: GAME <-> WORKSHOP switch with one Minecraft backend
 
-Refs netherg-io/blockfield-releases#8 (stage a); draining follows #6. Python 3.11+ on Linux, stdlib only.
+Production controller: Linux, Python 3.12.14 / zlib 1.3.2, stdlib only.
+Historical design: netherg-io/blockfield-releases#8 (stage a), draining #6.
 
 ```sh
 just test   # controller, Docker adapter, CLI, journal, packages
-bash distribution/test-backend-lock.sh                              # start-container.sh flock/profile guard
-(cd proxy/plugin && ./gradlew test)                                 # proxy gate parsing/routing
-python3 map_package.py candidate.zip --sha256 <pinned-archive-sha256>
+just python map_package.py candidate.zip --sha256 <pinned-archive-sha256>
 ```
 
 None of these are live Docker/Minecraft acceptance tests; the process journal below is.
 
 ## Architecture (owner decision 2026-09-14)
 
-- Two Dokploy apps on the **same server image**: `blockfield-server` (profile `game`) and `blockfield-workshop`
-  (profile `workshop`, 0 replicas outside the workshop, own data, no stats keys, templates read-only).
+- Two Dokploy apps on compatible images: `blockfield-server` (profile `game`) and `blockfield-workshop`
+  (its independent image wraps a pinned published server digest; profile `workshop`, 0 replicas outside the workshop, own data, no stats keys, templates read-only).
 - Both mount `/srv/minecraft/backend-lock` as `/backend-lock`. `distribution/start-container.sh` takes
   `flock` on `/backend-lock/backend.lock` and starts java only while holding it **and** only if
   `/backend-lock/profile.json` selects its `BLOCKFIELD_PROFILE`. Java inherits the lock fd. A Swarm restart,
@@ -156,6 +155,24 @@ of the image's release plus the candidate's world in `/data/test-maps`, its JSON
 `BLOCKFIELD_SESSION_PURPOSE=test`. The gate is `testers` (the workshop members, backend workshop). Returning with
 `mode workshop` (`session: resume`) deletes the copy on start: nothing of a test reaches the drafts or the statistics.
 
+## Workshop image deployment
+
+The existing `.github/workflows/publish-image.yml` is named **Deploy workshop**.
+Run it manually from `main` only after the owner's explicit Deploy approval.
+It checks Linux/Windows, publishes `ghcr.io/blockfield/blockfield-workshop:latest`
+and the immutable `:sha-<full commit>` tag, records the digest, then POSTs
+`DOKPLOY_WORKSHOP_WEBHOOK` once with a 30-second timeout. Missing secrets or HTTP
+failures fail the job; the webhook is never printed. A successful POST queues a
+Dokploy rollout, it does not establish runtime acceptance.
+
+Configure the existing workshop Docker application to use `:latest`, its existing
+global GHCR registry, unchanged mounts/environment/healthcheck and `replicas=0`.
+Store only its native deploy webhook as the repository secret; no Dokploy API key
+or per-application registry credentials. Normal `main` pushes run checks only.
+The controller remains an independent host-systemd installation: the image webhook
+does not replace host files, change ACL/state, switch profiles or start the workshop.
+After each rollout verify the resolved digest and zero replicas in Swarm separately.
+
 ## Deploys during the workshop
 
 `deploy.yml` refuses (red job, nothing changed) while `admin/status.json` has any phase other than `game`: the game task
@@ -190,7 +207,7 @@ its environment, mounts, controller state and enabled units; this bootstrap is n
 2. Dokploy `blockfield-server` (game): add bind mount `/srv/minecraft/backend-lock` -> `/backend-lock`; env
    `BLOCKFIELD_PROFILE=game`; set **rollback order stop-first** (update order must also be stop-first).
    Keep the existing `/srv/minecraft/lobby` and templates mounts (make templates `:ro`).
-3. Dokploy: create `blockfield-workshop` from the independent image `ghcr.io/blockfield/blockfield-workshop@sha256:<published-digest>`, **replicas 0**,
+3. Dokploy: create `blockfield-workshop` from the independent image `ghcr.io/blockfield/blockfield-workshop:latest`, **replicas 0**,
    restart policy any, update and rollback order stop-first, same network as the proxy. Mounts:
    `/srv/minecraft/workshop/data` -> `/data`, `/srv/minecraft/templates/maps` -> `/data/maps` read-only,
    `/srv/minecraft/backend-lock` -> `/backend-lock`. Env: `BLOCKFIELD_PROFILE=workshop`,
