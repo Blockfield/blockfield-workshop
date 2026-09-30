@@ -1,4 +1,5 @@
 """Regression tests for uncertain starts and persisted-state validation; no live backend."""
+
 import json
 from pathlib import Path
 import tempfile
@@ -24,6 +25,7 @@ class ReviewTests(unittest.TestCase):
         def delayed_start(goal):
             self.backend.events.append("start")
             # The infrastructure accepted the start, but no process is observable yet.
+
         self.backend.start = delayed_start
         self.assertEqual(self.controller.step()["phase"], "STARTING")
         for _ in range(5):
@@ -45,15 +47,19 @@ class ReviewTests(unittest.TestCase):
         # Recovery must ask the adapter to fence old accepted starts before retrying.
         self.controller.step(recover=True)
         self.assertEqual(self.backend.events.count("start"), 1)
-        self.assertLess(self.backend.events.index("fence"), self.backend.events.index("start"))
+        self.assertLess(
+            self.backend.events.index("fence"), self.backend.events.index("start")
+        )
 
     def test_failed_recovery_fence_prevents_retry(self):
         self.backend.processes = []
         state = self.controller._read()
         state["phase"] = "STARTING"
         self.controller._write(state)
+
         def cannot_fence():
             raise OSError("cannot establish cancellation")
+
         self.backend.fence_pending_starts = cannot_fence
         self.assertEqual(self.controller.step(recover=True)["phase"], "ERROR")
         self.assertNotIn("start", self.backend.events)
@@ -61,10 +67,16 @@ class ReviewTests(unittest.TestCase):
     def test_unknown_or_inconsistent_state_rejected_before_side_effects(self):
         baseline = self.controller._read()
         mutations = [
-            {"schema": True}, {"phase": "surprise"}, {"gate": "public"},
-            {"phase": "ERROR", "gate": "builders"}, {"operation": "not-a-uuid"},
-            {"desired": None}, {"revision": 0}, {"phase": "game"},
-            {"desired": []}, {"revision": True},
+            {"schema": True},
+            {"phase": "surprise"},
+            {"gate": "public"},
+            {"phase": "ERROR", "gate": "builders"},
+            {"operation": "not-a-uuid"},
+            {"desired": None},
+            {"revision": 0},
+            {"phase": "game"},
+            {"desired": []},
+            {"revision": True},
         ]
         for mutation in mutations:
             with self.subTest(mutation=mutation):

@@ -8,13 +8,16 @@ SESSION="${BF_PW_SESSION:-bf8admin}"
 URL="${3:-http://127.0.0.1:${BF_WEB_PORT:-4331}}/admin#workshop"
 mkdir -p "$STAND_DIR/pw"
 cd "$STAND_DIR/pw"
-P(){ playwright-cli -s="$SESSION" "$@"; }
+P() { playwright-cli -s="$SESSION" "$@"; }
 P resize 1440 1000 >/dev/null
-P goto "$URL" >/dev/null; sleep 3
+P goto "$URL" >/dev/null
+sleep 3
 P snapshot --filename=sa.yml >/dev/null
 B=$(grep -oE "button \"Принять $2\" \[ref=[a-z0-9]+\]" sa.yml | tail -1 | grep -oE 'ref=[a-z0-9]+' | cut -d= -f2)
-P click "$B" >/dev/null; sleep 1
-P click "getByRole('dialog').getByRole('button', { name: 'Принять', exact: true })" >/dev/null; sleep 1
+P click "$B" >/dev/null
+sleep 1
+P click "getByRole('dialog').getByRole('button', { name: 'Принять', exact: true })" >/dev/null
+sleep 1
 (cd "$A" && ./settle.sh workshop 2 >/dev/null)
 sleep 4
 P snapshot --filename=sa2.yml >/dev/null

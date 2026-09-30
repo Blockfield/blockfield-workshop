@@ -6,6 +6,7 @@ workshopctl request game [--release vX.Y.Z] [--recover]
 workshopctl members [draslId:name[:role[:mapId+mapId...]] ...]
 workshopctl step | status | cancel      # step applies the site admin inbox first
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,8 +28,14 @@ BUSY = 75
 def parse_member(text: str) -> dict:
     parts = text.split(":")
     if len(parts) not in (2, 3, 4):
-        raise ValueError(f"member must be draslId:name[:role[:mapId+mapId...]], got {text!r}")
-    result = {"draslId": parts[0], "name": parts[1], "role": parts[2] if len(parts) >= 3 else "builder"}
+        raise ValueError(
+            f"member must be draslId:name[:role[:mapId+mapId...]], got {text!r}"
+        )
+    result = {
+        "draslId": parts[0],
+        "name": parts[1],
+        "role": parts[2] if len(parts) >= 3 else "builder",
+    }
     if len(parts) == 4:
         result["maps"] = parts[3].split("+") if parts[3] else []
     return result
@@ -37,61 +44,109 @@ def parse_member(text: str) -> dict:
 def _map_store(env, backend):
     """Map candidates (candidates.py) with the host paths; saving is held through the backend when it can."""
     from candidates import MapStore
-    return MapStore(Path(env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")),
-                    Path(env.get("BF_TEMPLATES_DIR", "/srv/minecraft/templates/maps")),
-                    Path(env.get("BF_PUBLISHED_MAPS_DIR", "/srv/minecraft/lobby/blockfield-published/maps")),
-                    Path(env.get("BF_CANDIDATES_DIR", "/srv/minecraft/workshop/candidates")),
-                    Path(env.get("BF_MAP_BACKUPS_DIR", "/srv/minecraft/workshop/map-backups")),
-                    repo_maps=Path(env.get("BF_GAME_MAPS_DIR", "/srv/minecraft/lobby/blockfield/maps")),
-                    hold_saves=getattr(backend, "workshop_saves_held", None))
+
+    return MapStore(
+        Path(env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")),
+        Path(env.get("BF_TEMPLATES_DIR", "/srv/minecraft/templates/maps")),
+        Path(
+            env.get(
+                "BF_PUBLISHED_MAPS_DIR",
+                "/srv/minecraft/lobby/blockfield-published/maps",
+            )
+        ),
+        Path(env.get("BF_CANDIDATES_DIR", "/srv/minecraft/workshop/candidates")),
+        Path(env.get("BF_MAP_BACKUPS_DIR", "/srv/minecraft/workshop/map-backups")),
+        repo_maps=Path(
+            env.get("BF_GAME_MAPS_DIR", "/srv/minecraft/lobby/blockfield/maps")
+        ),
+        hold_saves=getattr(backend, "workshop_saves_held", None),
+    )
 
 
 def main(argv=None, backend_factory=None) -> int:
     env = os.environ
-    parser = argparse.ArgumentParser(prog="workshopctl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--state-dir", default=env.get("BF_STATE_DIR", "/srv/minecraft/workshop/controller"))
-    parser.add_argument("--gate-file", default=env.get("BF_GATE_FILE", "/srv/minecraft/workshop/gate/gate.json"))
-    parser.add_argument("--public-file", default=env.get("BF_PUBLIC_FILE", "/srv/minecraft/workshop/public/public.json"))
-    parser.add_argument("--admin-dir", default=env.get("BF_ADMIN_DIR", "/srv/minecraft/workshop/admin"))
-    parser.add_argument("--inbox-dir", default=env.get("BF_INBOX_DIR", "/srv/minecraft/workshop/inbox"))
+    parser = argparse.ArgumentParser(
+        prog="workshopctl",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--state-dir",
+        default=env.get("BF_STATE_DIR", "/srv/minecraft/workshop/controller"),
+    )
+    parser.add_argument(
+        "--gate-file",
+        default=env.get("BF_GATE_FILE", "/srv/minecraft/workshop/gate/gate.json"),
+    )
+    parser.add_argument(
+        "--public-file",
+        default=env.get("BF_PUBLIC_FILE", "/srv/minecraft/workshop/public/public.json"),
+    )
+    parser.add_argument(
+        "--admin-dir", default=env.get("BF_ADMIN_DIR", "/srv/minecraft/workshop/admin")
+    )
+    parser.add_argument(
+        "--inbox-dir", default=env.get("BF_INBOX_DIR", "/srv/minecraft/workshop/inbox")
+    )
     commands = parser.add_subparsers(dest="command", required=True)
-    request = commands.add_parser("request").add_subparsers(dest="profile", required=True)
+    request = commands.add_parser("request").add_subparsers(
+        dest="profile", required=True
+    )
     workshop = request.add_parser("workshop")
     workshop.add_argument("--session", required=True)
     workshop.add_argument("--release")
     game = request.add_parser("game")
     game.add_argument("--release")
-    game.add_argument("--recover", action="store_true", help="leave ERROR toward game: fence, save, stop, start game")
+    game.add_argument(
+        "--recover",
+        action="store_true",
+        help="leave ERROR toward game: fence, save, stop, start game",
+    )
     commands.add_parser("step")
     commands.add_parser("status")
-    commands.add_parser("cancel", help="unprivileged rollback of a stuck DRAINING/STARTING switch")
-    members = commands.add_parser("members", help="replace the workshop ACL; no arguments clears it")
+    commands.add_parser(
+        "cancel", help="unprivileged rollback of a stuck DRAINING/STARTING switch"
+    )
+    members = commands.add_parser(
+        "members", help="replace the workshop ACL; no arguments clears it"
+    )
     members.add_argument("member", nargs="*")
     args = parser.parse_args(argv)
 
     try:
         if backend_factory is None:
             from docker_backend import DockerBackend
+
             backend_factory = DockerBackend.from_env
         state_dir = Path(args.state_dir)
         for path in (Path(args.gate_file), Path(args.public_file)):
             path.parent.mkdir(parents=True, exist_ok=True)
         backend = backend_factory()
-        controller = Controller(state_dir, backend, gate_file=Path(args.gate_file),
-                                public_file=Path(args.public_file), message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE),
-                                admin_dir=Path(args.admin_dir), inbox_dir=Path(args.inbox_dir),
-                                drain_timeout=float(env.get("BF_DRAIN_TIMEOUT_S", 600)),
-                                drain_timeout_ranked=float(env.get("BF_DRAIN_TIMEOUT_RANKED_S", 3600)),
-                                drain_health_grace=float(env.get("BF_DRAIN_HEALTH_GRACE_S", 60)),
-                                start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
-                                maps=_map_store(env, backend))
+        controller = Controller(
+            state_dir,
+            backend,
+            gate_file=Path(args.gate_file),
+            public_file=Path(args.public_file),
+            message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE),
+            admin_dir=Path(args.admin_dir),
+            inbox_dir=Path(args.inbox_dir),
+            drain_timeout=float(env.get("BF_DRAIN_TIMEOUT_S", 600)),
+            drain_timeout_ranked=float(env.get("BF_DRAIN_TIMEOUT_RANKED_S", 3600)),
+            drain_health_grace=float(env.get("BF_DRAIN_HEALTH_GRACE_S", 60)),
+            start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
+            maps=_map_store(env, backend),
+        )
         if hasattr(backend, "maps"):
             backend.maps = controller.maps
         os.chmod(state_dir, 0o700)
         if args.command == "status":
             result = {"state": controller.status(), "members": controller.members()}
         elif args.command == "members":
-            result = {"members": controller.set_members([parse_member(m) for m in args.member])}
+            result = {
+                "members": controller.set_members(
+                    [parse_member(m) for m in args.member]
+                )
+            }
         elif args.command == "cancel":
             result = controller.cancel()
         elif args.command == "step":
@@ -105,7 +160,9 @@ def main(argv=None, backend_factory=None) -> int:
             # A switch in flight is followed every few seconds inside this run instead of once per 15 s timer tick:
             # the next phase (drained, stopped, ready) is acted on almost at once. Bounded, so the timer stays the clock.
             deadline = time.monotonic() + float(env.get("BF_STEP_FOLLOW_S", 12))
-            while result.get("phase") in FOLLOWED_PHASES and time.monotonic() < deadline:
+            while (
+                result.get("phase") in FOLLOWED_PHASES and time.monotonic() < deadline
+            ):
                 time.sleep(float(env.get("BF_STEP_POLL_S", 2)))
                 result = controller.step()
         else:
@@ -113,13 +170,21 @@ def main(argv=None, backend_factory=None) -> int:
             release = args.release or (state.get("desired") or {}).get("release")
             if not release:
                 raise ValueError("--release is required for the first request")
-            goal = Goal("workshop", release, args.session) if args.profile == "workshop" else Goal("game", release)
+            goal = (
+                Goal("workshop", release, args.session)
+                if args.profile == "workshop"
+                else Goal("game", release)
+            )
             recover = getattr(args, "recover", False)
-            result = controller.request(str(uuid4()), goal, state["revision"], recover=recover)
+            result = controller.request(
+                str(uuid4()), goal, state["revision"], recover=recover
+            )
             if recover:
                 result = controller.step(recover=True)
     except BlockingIOError:
-        print("workshopctl: another controller operation holds the lock", file=sys.stderr)
+        print(
+            "workshopctl: another controller operation holds the lock", file=sys.stderr
+        )
         return BUSY
     except (ValueError, RuntimeError, OSError) as error:
         print(f"workshopctl: {error}", file=sys.stderr)

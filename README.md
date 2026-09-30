@@ -30,16 +30,16 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 
 ### Contracts
 
-| File (host path) | Writer | Reader | Content |
-| --- | --- | --- | --- |
-| `/srv/minecraft/backend-lock/profile.json` | controller `start()` | `start-container.sh`, mod | `{schema:1, profile, generation, session, release, candidate?}` (profile `test` runs in the workshop app) |
-| `<data>/.blockfield-ready.json` | mod on SERVER_STARTED (deleted by container start, SERVER_STARTING/STOPPING and controller before start) | controller | `{profile, generation, session, release}` |
-| `/srv/minecraft/workshop/gate/gate.json` | controller after every state write | proxy (`BLOCKFIELD_GATE_FILE`) | `{schema:1, revision, gate: public/draining/closed/builders/testers, backend: game/workshop, message, allowed:[{draslId,name,role,maps?}]}` |
-| `/srv/minecraft/workshop/public/public.json` | controller | site (`BLOCKFIELD_GATE_FILE`) | `{mode: game/draining/workshop/maintenance, message, since}` |
-| `/srv/minecraft/workshop/controller/` (0700) | controller | — | `state.json`, `members.json`, `message.json`, `controller.lock`, `inbox.lock` |
-| `/srv/minecraft/workshop/admin/` (0755, files 0644, `BF_ADMIN_DIR`) | controller | site admin and workshop server (read-only mounts) | `members.json` (current ACL), `workshop.key` (0640 root:1000, created once: the tablet's grant/revoke → site `/api/workshop/access`), `status.json` `{schema:1, revision, phase, gate, error, errorMessage, since, deadline, desired, message, updatedAt}`,
-`session.json` `{schema:1, id, maps: [mapId]|null, startedAt, startedBy}` (the mod offers only these maps), `candidates.json` (below), `results/<requestId>.json` `{id, ok, error, revision, doneAt}` (newest 200 kept) |
-| `/srv/minecraft/workshop/inbox/` (root:1000 0770, `BF_INBOX_DIR`) | site admin (uid 1000, `.<id>.tmp` + rename) | controller | `<id>.json` `{schema:1, id, kind: mode/members/message, actor:{draslId,name}, createdAt, ...}` |
+| File (host path)                                                    | Writer                                                                                                                                                                 | Reader                                            | Content                                                                                                                                                                                                                                                     |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/srv/minecraft/backend-lock/profile.json`                          | controller `start()`                                                                                                                                                   | `start-container.sh`, mod                         | `{schema:1, profile, generation, session, release, candidate?}` (profile `test` runs in the workshop app)                                                                                                                                                   |
+| `<data>/.blockfield-ready.json`                                     | mod on SERVER_STARTED (deleted by container start, SERVER_STARTING/STOPPING and controller before start)                                                               | controller                                        | `{profile, generation, session, release}`                                                                                                                                                                                                                   |
+| `/srv/minecraft/workshop/gate/gate.json`                            | controller after every state write                                                                                                                                     | proxy (`BLOCKFIELD_GATE_FILE`)                    | `{schema:1, revision, gate: public/draining/closed/builders/testers, backend: game/workshop, message, allowed:[{draslId,name,role,maps?}]}`                                                                                                                 |
+| `/srv/minecraft/workshop/public/public.json`                        | controller                                                                                                                                                             | site (`BLOCKFIELD_GATE_FILE`)                     | `{mode: game/draining/workshop/maintenance, message, since}`                                                                                                                                                                                                |
+| `/srv/minecraft/workshop/controller/` (0700)                        | controller                                                                                                                                                             | —                                                 | `state.json`, `members.json`, `message.json`, `controller.lock`, `inbox.lock`                                                                                                                                                                               |
+| `/srv/minecraft/workshop/admin/` (0755, files 0644, `BF_ADMIN_DIR`) | controller                                                                                                                                                             | site admin and workshop server (read-only mounts) | `members.json` (current ACL), `workshop.key` (0640 root:1000, created once: the tablet's grant/revoke → site `/api/workshop/access`), `status.json` `{schema:1, revision, phase, gate, error, errorMessage, since, deadline, desired, message, updatedAt}`, |
+| `session.json` `{schema:1, id, maps: [mapId]                        | null, startedAt, startedBy}`(the mod offers only these maps),`candidates.json`(below),`results/<requestId>.json` `{id, ok, error, revision, doneAt}` (newest 200 kept) |
+| `/srv/minecraft/workshop/inbox/` (root:1000 0770, `BF_INBOX_DIR`)   | site admin (uid 1000, `.<id>.tmp` + rename)                                                                                                                            | controller                                        | `<id>.json` `{schema:1, id, kind: mode/members/message, actor:{draslId,name}, createdAt, ...}`                                                                                                                                                              |
 
 `release` is `build` from the image's `/opt/blockfield-build.json` (the modpack tag, e.g. `v2.27.0`). Readiness counts only
 when all four fields equal `profile.json` and exactly one java of that app runs. Before the first controller start
@@ -51,6 +51,7 @@ and a single-file bind mount would keep showing the old inode.
 ## Controller behaviour
 
 `request()` durably stores intent with CAS revisions; `step()` reconciles once under a non-blocking lock.
+
 - Stable phases and DRAINING are written only when phase/gate/error change: no gate flapping, exports keep their mtime.
 - `game -> workshop`: gate `draining` (existing game members may still connect), `/bf maintenance drain`, wait for
   `drained=true`, `save-all flush`, scale game to 0 and wait until no task and no java, write `profile.json`, delete
@@ -67,7 +68,7 @@ and a single-file bind mount would keep showing the old inode.
   (default 600s: a cold pack start takes ~2.5 min on homeserver, and a missed deadline costs a second full
   restart of the game) tune this; sizing "the longest match" beyond the ranked default is a manual env override, not
   auto-detected from match length.
-- A backend of the *wrong* profile appearing while STARTING is unresolved (an external restart, as above) is fenced
+- A backend of the _wrong_ profile appearing while STARTING is unresolved (an external restart, as above) is fenced
   and retried instead of raising; unrecoverable failures still surface as `ERROR` with `error`+`errorMessage`.
   Any error -> `ERROR`, gate `closed`. The timer never leaves ERROR. `workshopctl request game --recover` fences the
   unselected app (scale 0, wait), then saves/stops whatever runs and starts game.
@@ -120,8 +121,8 @@ or reject on the site. Inbox kinds (same envelope and validation as above):
   `admin/packages/<sha256>.zip` for the site's «Скачать пакет».
 - `reject` `{candidateId}`. `rollback` is refused: a map goes back through a release pinned to its previous package.
 - `admin/candidates.json` `{schema:1, candidates:[{id, mapId, status: pending|accepted|rejected (older: published|
-  superseded|rolled_back), author, createdAt, sha256, size, regions, base, baseMatches?, decidedBy?, decidedAt?,
-  forced?}], backups, overlays}`. 30 decided candidates kept (accepted ones always). While a map has a pending
+superseded|rolled_back), author, createdAt, sha256, size, regions, base, baseMatches?, decidedBy?, decidedAt?,
+forced?}], backups, overlays}`. 30 decided candidates kept (accepted ones always). While a map has a pending
   candidate the mod keeps it read-only for everybody (it reads this file from the admin mount).
 
 ## Delivering an accepted map (release)

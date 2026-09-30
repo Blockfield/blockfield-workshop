@@ -1,4 +1,5 @@
 """Phase deadlines, automatic rollback, the unattended-restart convergence path, and cancel()."""
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,10 +10,13 @@ from test_controller import FakeBackend
 
 class Clock:
     """Controller-injectable fake time.time, so deadlines fire without a real sleep."""
+
     def __init__(self, start: float = 1_700_000_000.0):
         self.t = start
+
     def __call__(self) -> float:
         return self.t
+
     def advance(self, seconds: float) -> None:
         self.t += seconds
 
@@ -34,7 +38,11 @@ class TimeoutTests(unittest.TestCase):
         self.assertEqual(controller.step()["phase"], "game")
 
     def start_switch_to_workshop(self, controller: Controller) -> dict:
-        controller.request(str(uuid4()), Goal("workshop", "v1", self.session), controller.status()["revision"])
+        controller.request(
+            str(uuid4()),
+            Goal("workshop", "v1", self.session),
+            controller.status()["revision"],
+        )
         return controller.step()
 
     def test_drain_timeout_rolls_back_without_touching_the_running_game(self):
@@ -43,19 +51,30 @@ class TimeoutTests(unittest.TestCase):
         state = self.start_switch_to_workshop(controller)
         self.assertEqual(state["phase"], "DRAINING")
         self.clock.advance(50)
-        self.assertEqual(controller.step()["phase"], "DRAINING")  # still within the deadline
+        self.assertEqual(
+            controller.step()["phase"], "DRAINING"
+        )  # still within the deadline
         self.clock.advance(51)
         state = controller.step()
-        self.assertEqual((state["phase"], state["gate"], state["desired"]["profile"]), ("game", "public", "game"))
+        self.assertEqual(
+            (state["phase"], state["gate"], state["desired"]["profile"]),
+            ("game", "public", "game"),
+        )
         self.assertIn("timed out", state["errorMessage"])
-        self.assertNotIn("save", self.backend.events)  # DRAINING never touched the old backend
+        self.assertNotIn(
+            "save", self.backend.events
+        )  # DRAINING never touched the old backend
         self.assertNotIn("stop", self.backend.events)
 
     def test_drain_health_grace_rolls_back_fast_when_nothing_is_at_risk(self):
         # The 2026-09-18 incident: rooms=ranked=pending=0 but the stats-persistence flag stuck unhealthy.
-        self.backend.drain_rooms = self.backend.drain_ranked = self.backend.drain_pending = 0
+        self.backend.drain_rooms = self.backend.drain_ranked = (
+            self.backend.drain_pending
+        ) = 0
         self.backend.drain_healthy = False
-        controller = self.controller(drain_health_grace=30, drain_timeout=10_000, drain_timeout_ranked=10_000)
+        controller = self.controller(
+            drain_health_grace=30, drain_timeout=10_000, drain_timeout_ranked=10_000
+        )
         self.to_stable_game(controller)
         self.start_switch_to_workshop(controller)
         self.clock.advance(31)
@@ -67,12 +86,16 @@ class TimeoutTests(unittest.TestCase):
         controller = self.controller(start_timeout=100)
         self.to_stable_game(controller)
         self.backend.is_drained = True
-        self.start_switch_to_workshop(controller)  # DRAINING -> SAVING -> STARTING, workshop not ready
+        self.start_switch_to_workshop(
+            controller
+        )  # DRAINING -> SAVING -> STARTING, workshop not ready
         state = controller.step()
         self.assertEqual(state["phase"], "STARTING")
         self.clock.advance(101)
         state = controller.step()
-        self.assertEqual(state["phase"], "STARTING")  # rolling back = starting "game" again
+        self.assertEqual(
+            state["phase"], "STARTING"
+        )  # rolling back = starting "game" again
         self.assertEqual(state["desired"]["profile"], "game")
         self.assertIn("timed out", state["errorMessage"])
         self.backend.processes = [Process(Goal("game", "v1"), True)]
@@ -87,7 +110,9 @@ class TimeoutTests(unittest.TestCase):
         self.backend.is_drained = True
         self.start_switch_to_workshop(controller)
         self.assertEqual(controller.step()["phase"], "STARTING")
-        self.backend.processes = [Process(Goal("game", "v1"), True)]  # stray, external restart
+        self.backend.processes = [
+            Process(Goal("game", "v1"), True)
+        ]  # stray, external restart
         state = controller.step()
         self.assertEqual(state["phase"], "STARTING")
         self.assertNotEqual(state.get("error"), "RuntimeError")
@@ -100,7 +125,9 @@ class TimeoutTests(unittest.TestCase):
     def test_error_carries_a_human_readable_message(self):
         controller = self.controller()
         self.to_stable_game(controller)
-        self.backend.processes.append(Process(Goal("game", "v1"), True))  # a second full backend
+        self.backend.processes.append(
+            Process(Goal("game", "v1"), True)
+        )  # a second full backend
         state = controller.step()
         self.assertEqual(state["phase"], "ERROR")
         self.assertEqual(state["error"], "RuntimeError")
@@ -124,12 +151,16 @@ class TimeoutTests(unittest.TestCase):
     def test_error_message_clears_once_recovery_reaches_a_stable_phase(self):
         controller = self.controller()
         self.to_stable_game(controller)
-        self.backend.processes.append(Process(Goal("game", "v1"), True))  # force a real ERROR
+        self.backend.processes.append(
+            Process(Goal("game", "v1"), True)
+        )  # force a real ERROR
         state = controller.step()
         self.assertEqual(state["phase"], "ERROR")
         self.assertTrue(state["errorMessage"])
         self.backend.processes = self.backend.processes[:1]  # clear the second backend
-        controller.request(str(uuid4()), Goal("game", "v1"), state["revision"], recover=True)
+        controller.request(
+            str(uuid4()), Goal("game", "v1"), state["revision"], recover=True
+        )
         state = controller.step(recover=True)
         self.assertEqual(state["phase"], "game")
         self.assertIsNone(state["error"])

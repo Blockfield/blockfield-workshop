@@ -1,4 +1,5 @@
 """Immutable workshop candidates. Acceptance never modifies game templates; delivery requires a pack release."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +10,7 @@ import shutil
 import tempfile
 import time
 import zipfile
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,7 +21,10 @@ MAP_ID = re.compile(r"[a-z0-9_]{1,32}")
 CANDIDATE_ID = re.compile(r"[0-9a-f]{32}")
 CANDIDATES_KEPT = 30
 SNAPSHOT_MARGIN = 16 << 20
-OWNER = (1000, 1000)  # the game and the workshop run as uid/gid 1000 and read these files
+OWNER = (
+    1000,
+    1000,
+)  # the game and the workshop run as uid/gid 1000 and read these files
 BASE_MARKER = "blockfield-base.json"  # written by blockfield-mod WorkshopMaps when it seeds a draft from the template
 
 
@@ -34,12 +38,24 @@ def template_digest(root: Path) -> str | None:
         for path in (root / kind).rglob("*") if (root / kind).is_dir() else []:
             if path.is_file() and not path.is_symlink():
                 lines.append((path.relative_to(root).as_posix(), _sha256(path)))
-    return hashlib.sha256("".join(f"{name}\0{digest}\n" for name, digest in sorted(lines)).encode()).hexdigest()
+    return hashlib.sha256(
+        "".join(f"{name}\0{digest}\n" for name, digest in sorted(lines)).encode()
+    ).hexdigest()
 
 
 class MapStore:
-    def __init__(self, workshop_data: Path, templates: Path, published: Path, candidates: Path, backups: Path,
-                 *, repo_maps: Path | None = None, hold_saves=None, now=time.time):
+    def __init__(
+        self,
+        workshop_data: Path,
+        templates: Path,
+        published: Path,
+        candidates: Path,
+        backups: Path,
+        *,
+        repo_maps: Path | None = None,
+        hold_saves=None,
+        now=time.time,
+    ):
         self.workshop_data = Path(workshop_data)
         self.templates = Path(templates)
         self.published = Path(published)
@@ -58,15 +74,26 @@ class MapStore:
         """The draft of a map that can be snapshotted; raises before the controller stops anything."""
         if not isinstance(map_id, str) or not MAP_ID.fullmatch(map_id):
             raise ValueError("invalid map id")
-        world = self.workshop_data / "world" / "dimensions" / "blockfield_workshop" / map_id
+        world = (
+            self.workshop_data / "world" / "dimensions" / "blockfield_workshop" / map_id
+        )
         if not (world / "region").is_dir():
             raise ValueError("the map was never opened in the workshop")
         self._map_json(map_id)
         # Deflate never grows region files much, so the draft's size plus a margin bounds the archive.
-        need = sum(p.stat().st_size for kind in WORLD_KINDS for p in (world / kind).glob("*.mca")) + SNAPSHOT_MARGIN
+        need = (
+            sum(
+                p.stat().st_size
+                for kind in WORLD_KINDS
+                for p in (world / kind).glob("*.mca")
+            )
+            + SNAPSHOT_MARGIN
+        )
         target = self.candidates if self.candidates.is_dir() else self.candidates.parent
         if shutil.disk_usage(target).free < need:
-            raise OSError(f"not enough free space for the candidate: need {need >> 20} MiB")
+            raise OSError(
+                f"not enough free space for the candidate: need {need >> 20} MiB"
+            )
         return world
 
     def create(self, map_id: str, author: dict, note: str = "") -> dict:
@@ -81,39 +108,66 @@ class MapStore:
         temporary = self.candidates / f".{candidate_id}.zip.tmp"
         files = {}
         try:
-            with self.hold_saves(), zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            with (
+                self.hold_saves(),
+                zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive,
+            ):
                 config = self._map_json(map_id)
                 config_bytes = json.dumps(config, ensure_ascii=False, indent=2).encode()
                 archive.writestr("map.json", config_bytes)
                 files["map.json"] = hashlib.sha256(config_bytes).hexdigest()
                 for kind in WORLD_KINDS:
-                    for region in sorted((world / kind).glob("r.*.*.mca")) if (world / kind).is_dir() else []:
+                    for region in (
+                        sorted((world / kind).glob("r.*.*.mca"))
+                        if (world / kind).is_dir()
+                        else []
+                    ):
                         data = region.read_bytes()
                         if not data:
                             continue  # an empty region file is a never-written placeholder, not map data
                         name = f"world/{kind}/{region.name}"
                         archive.writestr(name, data)
                         files[name] = hashlib.sha256(data).hexdigest()
-                manifest = {"schemaVersion": 1, "mapId": map_id, "version": f"ws-{now_ms}",
-                            "baseVersion": self._published_version(map_id), "files": files}
-                archive.writestr("manifest.json", json.dumps(manifest, sort_keys=True).encode())
+                manifest = {
+                    "schemaVersion": 1,
+                    "mapId": map_id,
+                    "version": f"ws-{now_ms}",
+                    "baseVersion": self._published_version(map_id),
+                    "files": files,
+                }
+                archive.writestr(
+                    "manifest.json", json.dumps(manifest, sort_keys=True).encode()
+                )
             digest = _sha256(temporary)
             map_package.validate(temporary, digest)
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
-        meta = {"id": candidate_id, "mapId": map_id, "status": "pending", "author": author, "note": str(note)[:200],
-                "createdAt": now_ms, "sha256": digest, "size": target.stat().st_size,
-                "regions": sum(1 for name in files if name.startswith("world/region/")),
-                "base": self._draft_base(world)}
+        meta = {
+            "id": candidate_id,
+            "mapId": map_id,
+            "status": "pending",
+            "author": author,
+            "note": str(note)[:200],
+            "createdAt": now_ms,
+            "sha256": digest,
+            "size": target.stat().st_size,
+            "regions": sum(1 for name in files if name.startswith("world/region/")),
+            "base": self._draft_base(world),
+        }
         self._write_meta(meta)
         self._prune()
         return meta
 
     def publish(self, candidate_id: str, actor: dict, *, force: bool = False) -> dict:
         meta = self._pending(candidate_id)
-        newer = [m for m in self.list() if m["mapId"] == meta["mapId"] and m["status"] in {"accepted", "published"}
-                 and m["createdAt"] > meta["createdAt"]]
+        newer = [
+            m
+            for m in self.list()
+            if m["mapId"] == meta["mapId"]
+            and m["status"] in {"accepted", "published"}
+            and m["createdAt"] > meta["createdAt"]
+        ]
         if newer:
             raise ValueError("a newer version of this map is already published")
         archive_path = self.candidates / f"{candidate_id}.zip"
@@ -125,21 +179,34 @@ class MapStore:
         # copy), publishing would silently throw those changes away. Only an explicit second confirmation may.
         if not force:
             if meta.get("base") is None:
-                raise ValueError("base unknown: the draft predates base tracking; confirm to publish anyway")
+                raise ValueError(
+                    "base unknown: the draft predates base tracking; confirm to publish anyway"
+                )
             if meta["base"] != live:
-                raise ValueError("base changed: the map's template changed after this draft was copied; confirm to overwrite")
-        meta.update(status="accepted", decidedBy=actor, decidedAt=int(self._now() * 1000), forced=force)
+                raise ValueError(
+                    "base changed: the map's template changed after this draft was copied; confirm to overwrite"
+                )
+        meta.update(
+            status="accepted",
+            decidedBy=actor,
+            decidedAt=int(self._now() * 1000),
+            forced=force,
+        )
         self._write_meta(meta)
         return meta
 
     def reject(self, candidate_id: str, actor: dict) -> dict:
         meta = self._pending(candidate_id)
-        meta.update(status="rejected", decidedBy=actor, decidedAt=int(self._now() * 1000))
+        meta.update(
+            status="rejected", decidedBy=actor, decidedAt=int(self._now() * 1000)
+        )
         self._write_meta(meta)
         return meta
 
     def rollback(self, map_id: str, actor: dict) -> dict:
-        raise ValueError("map rollback requires a new pack release pinned to the previous package")
+        raise ValueError(
+            "map rollback requires a new pack release pinned to the previous package"
+        )
 
     # ------------------------------------------------------------------ export for the site
 
@@ -163,16 +230,29 @@ class MapStore:
         for meta in candidates:
             if meta.get("status") == "pending":
                 base = meta.get("base")
-                meta["baseMatches"] = None if base is None else base == self._cached_digest(meta["mapId"])
+                meta["baseMatches"] = (
+                    None if base is None else base == self._cached_digest(meta["mapId"])
+                )
         overlays = {}
-        for path in sorted(self.published.glob("*.json")) if self.published.is_dir() else []:
+        for path in (
+            sorted(self.published.glob("*.json")) if self.published.is_dir() else []
+        ):
             overlays[path.stem] = {"differsFromRepo": not self._matches_repo(path)}
-        return {"schema": 1, "candidates": candidates, "backups": backups, "overlays": overlays}
+        return {
+            "schema": 1,
+            "candidates": candidates,
+            "backups": backups,
+            "overlays": overlays,
+        }
 
     def retire_merged_overlays(self) -> list[str]:
         """A published JSON that git (the image's copy in the game) now has verbatim is dropped: later git edits apply again."""
         retired = []
-        for path in sorted(self.published.glob("*.json")) if self.published.is_dir() and self.repo_maps else []:
+        for path in (
+            sorted(self.published.glob("*.json"))
+            if self.published.is_dir() and self.repo_maps
+            else []
+        ):
             if MAP_ID.fullmatch(path.stem) and self._matches_repo(path):
                 path.unlink()
                 retired.append(path.stem)
@@ -181,7 +261,9 @@ class MapStore:
     # ------------------------------------------------------------------ playtest
 
     def sha256_of(self, candidate_id) -> str:
-        if not isinstance(candidate_id, str) or not CANDIDATE_ID.fullmatch(candidate_id):
+        if not isinstance(candidate_id, str) or not CANDIDATE_ID.fullmatch(
+            candidate_id
+        ):
             raise ValueError("invalid candidate id")
         try:
             meta = json.loads((self.candidates / f"{candidate_id}.json").read_text())
@@ -204,7 +286,9 @@ class MapStore:
             for entry in archive.infolist():
                 if entry.is_dir() or entry.filename == "manifest.json":
                     continue
-                destination = target / entry.filename  # validated layout: map.json and world/<kind>/r.X.Z.mca
+                destination = (
+                    target / entry.filename
+                )  # validated layout: map.json and world/<kind>/r.X.Z.mca
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(archive.read(entry))
         (target / "map-id").write_text(manifest["mapId"] + "\n")
@@ -214,7 +298,9 @@ class MapStore:
     # ------------------------------------------------------------------ helpers
 
     def _pending(self, candidate_id) -> dict:
-        if not isinstance(candidate_id, str) or not CANDIDATE_ID.fullmatch(candidate_id):
+        if not isinstance(candidate_id, str) or not CANDIDATE_ID.fullmatch(
+            candidate_id
+        ):
             raise ValueError("invalid candidate id")
         path = self.candidates / f"{candidate_id}.json"
         if not path.exists():
@@ -226,8 +312,10 @@ class MapStore:
 
     def _map_json(self, map_id: str) -> dict:
         """The workshop's edited copy (markup) wins over the JSON the workshop got from the image."""
-        for directory in (self.workshop_data / "world" / "blockfield_workshop" / "maps",
-                          self.workshop_data / "blockfield" / "maps"):
+        for directory in (
+            self.workshop_data / "world" / "blockfield_workshop" / "maps",
+            self.workshop_data / "blockfield" / "maps",
+        ):
             for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
                 try:
                     config = json.loads(path.read_text())
@@ -243,12 +331,22 @@ class MapStore:
             value = json.loads((world / BASE_MARKER).read_text()).get("templateDigest")
         except (OSError, ValueError, AttributeError):
             return None
-        return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
+        return (
+            value
+            if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            else None
+        )
 
     def _cached_digest(self, map_id: str) -> str | None:
         root = self.templates / map_id
         try:
-            key = tuple(sorted((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()))
+            key = tuple(
+                sorted(
+                    (str(p), p.stat().st_size, p.stat().st_mtime_ns)
+                    for p in root.rglob("*")
+                    if p.is_file()
+                )
+            )
         except OSError:
             return None
         if self._digests.get(map_id, (None,))[0] != key:
@@ -259,19 +357,29 @@ class MapStore:
         if not self.repo_maps:
             return False
         try:
-            return json.loads(published.read_text()) == json.loads((self.repo_maps / published.name).read_text())
+            return json.loads(published.read_text()) == json.loads(
+                (self.repo_maps / published.name).read_text()
+            )
         except (OSError, ValueError):
             return False
 
     def _published_version(self, map_id: str) -> str:
-        published = [m for m in self.list() if m["mapId"] == map_id and m["status"] in {"accepted", "published"}]
+        published = [
+            m
+            for m in self.list()
+            if m["mapId"] == map_id and m["status"] in {"accepted", "published"}
+        ]
         return f"ws-{published[0]['createdAt']}" if published else "template"
 
     def _write_meta(self, meta: dict) -> None:
         _atomic_json(self.candidates / f"{meta['id']}.json", meta, owner=False)
 
     def _prune(self) -> None:
-        decided = [m for m in self.list() if m["status"] not in {"pending", "accepted", "published"}]
+        decided = [
+            m
+            for m in self.list()
+            if m["status"] not in {"pending", "accepted", "published"}
+        ]
         for meta in decided[CANDIDATES_KEPT:]:
             (self.candidates / f"{meta['id']}.zip").unlink(missing_ok=True)
             (self.candidates / f"{meta['id']}.json").unlink(missing_ok=True)

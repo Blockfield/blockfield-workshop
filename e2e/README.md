@@ -14,13 +14,13 @@ portable, repeatable version of the same scenarios.
 
 ## Env
 
-| Var | Default | Meaning |
-|---|---|---|
-| `BF_WORKSPACE` | parent of this repo checkout | directory containing sibling repos (`BlockField-Private-Project`, `blockfield-site`) |
-| `STAND_DIR` | `$XDG_CACHE_HOME/bf-workshop-stand` or `~/.cache/bf-workshop-stand` | stand data: `game/`, `workshop/`, `lock/`, `controller/`, `candidates/`, `evidence/` (not `tools/workshop/e2e/` itself, which is code) |
-| `JAVA` | `mise which java` (run in `dev/rig`, same Temurin 21 pin) | java binary for the stand JVM |
-| `CLAUDE_CODE_SESSION_ID` / `BF_RIG_OWNER` | — (required) | `agent-process` owner; whichever is set first |
-| `STAND_XMX` | `1536m` | stand JVM heap; raise if you need production-realistic memory numbers and the host has headroom |
+| Var                                       | Default                                                                               | Meaning                                                                                                                                |
+| ----------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `BF_WORKSPACE`                            | parent of this repo checkout                                                          | directory containing sibling repos (`BlockField-Private-Project`, `blockfield-site`)                                                   |
+| `STAND_DIR`                               | `$XDG_CACHE_HOME/bf-workshop-stand` or `~/.cache/bf-workshop-stand`                   | stand data: `game/`, `workshop/`, `lock/`, `controller/`, `candidates/`, `evidence/` (not `tools/workshop/e2e/` itself, which is code) |
+| `JAVA`                                    | `JAVA_HOME/bin/java` or native `java` on PATH (run in `dev/rig`, same Temurin 21 pin) | java binary for the stand JVM                                                                                                          |
+| `CLAUDE_CODE_SESSION_ID` / `BF_RIG_OWNER` | — (required)                                                                          | `agent-process` owner; whichever is set first                                                                                          |
+| `STAND_XMX`                               | `1536m`                                                                               | stand JVM heap; raise if you need production-realistic memory numbers and the host has headroom                                        |
 
 All scripts import `paths.py` for this resolution; nothing else in the directory hardcodes a machine path.
 
@@ -59,6 +59,7 @@ python3 tools/workshop/e2e/stand.py members <adminDraslId>:Nether:admin <builder
 python3 tools/workshop/e2e/stand.py request workshop --session "$(python3 -c 'import uuid;print(uuid.uuid4())')"
 bash tools/workshop/e2e/settle.sh workshop
 ```
+
 Expected: phase settles on `workshop`, gate `builders`, `STAND_DIR/workshop-admin/session.json` has the new
 session id and the two maps. Re-running `request workshop --session <same-id>` resumes it (same maps, no new
 session). Proves: criterion "administrator creates/resumes a session, picks available maps and members without
@@ -77,6 +78,7 @@ python3 tools/workshop/e2e/stand.py request game --recover
 bash tools/workshop/e2e/settle.sh game
 python3 tools/workshop/e2e/journal_stand.py check "$STAND_DIR/evidence/journal.jsonl"
 ```
+
 `faults.json` keys (`stand.py fault()`): `preflight`, `save`, `stop`, `start`, `start_crash` — value `true`
 (every attempt) or `"once"` (consumed after firing, logged to `evidence/faults-fired.log`). Expected: the
 faulted transition ends in `ERROR` with an `errorMessage`, never a second java process; `--recover` returns to
@@ -90,6 +92,7 @@ python3 tools/workshop/e2e/stand.py request workshop --session "$(python3 -c 'im
 python3 tools/workshop/e2e/stand.py request workshop --session "$(python3 -c 'import uuid;print(uuid.uuid4())')"
 wait
 ```
+
 Expected: one accepts, the other exits 1 with "stale state revision" (or exit 75 if it hit the controller lock
 mid-step); only one switch proceeds. Proves the same criterion as #2 ("... including concurrent requests"), plus
 `tools/workshop/README.md`'s CAS/lock design.
@@ -103,6 +106,7 @@ PID=$(python3 -c "import json;print(json.load(open('$STAND_DIR/rig-process.json'
 kill -9 "$(agent-process status "$PID" --owner "$CLAUDE_CODE_SESSION_ID" | python3 -c 'import json,sys;print(json.load(sys.stdin)["pid"])')"
 bash tools/workshop/e2e/settle.sh workshop 40   # controller notices, restarts the same session
 ```
+
 Expected: the controller brings the same session back up (no data loss, no second java); world/draft files on
 disk are unchanged. Proves persistence-under-crash and the "recoverable, closed while uncertain" acceptance line.
 
@@ -116,6 +120,7 @@ bash tools/workshop/e2e/settle.sh workshop
 python3 tools/workshop/e2e/inbox.py mode profile=workshop session=resume maps='["fields"]'   # drop konstaxa from the session
 bash tools/workshop/e2e/settle.sh workshop
 ```
+
 Expected: draft world files for the removed map stay on disk (only the session's map list shrinks); resuming
 with the full list again still finds the draft. Proves "world and settings survive a normal and crash restart,
 pause/resume, and removing a map from the session; match cleanup doesn't delete working data."
@@ -129,6 +134,7 @@ python3 tools/workshop/e2e/fake_drasl.py 8085 &
 python3 tools/workshop/e2e/ping.py 127.0.0.1 <proxy-port>       # MOTD while backend is game vs workshop vs stopped
 python3 tools/workshop/e2e/probe.py Player115 "$STAND_DIR/evidence/probe.jsonl" "chat hi" "sleep 1"
 ```
+
 Expected: an allowed builder reaches the workshop; an ordinary account gets the maintenance message on connect,
 reconnect and backend switch, and is never auto-returned to the workshop; direct connection to the backend port
 is refused ("requires you to connect with Velocity"). Proves the proxy-gate criteria.
@@ -142,6 +148,7 @@ python3 tools/workshop/e2e/inbox.py members members='[{"draslId":"<adminId>","na
 bash tools/workshop/e2e/settle.sh workshop
 python3 tools/workshop/e2e/probe.py Player115 "$STAND_DIR/evidence/acl.jsonl" "//set stone"   # after revoke
 ```
+
 Expected: op/console-only commands refused for a builder; `//set`/`//undo`/`//redo` on permitted maps work; a
 forged `/api/workshop/submit`/`/api/workshop/access` (site-side, see `tools/workshop/README.md`) without a valid
 key/actor/map is rejected; after revocation the account is sent to the lobby on the proxy's next tick and further
@@ -159,6 +166,7 @@ print('max rss_mb', max((r.get('rss_mb',0) for r in rows), default=0))
 print('max heap used_mb', max((r['heap']['used_mb'] for r in rows if r.get('heap')), default=0))
 "
 ```
+
 Expected: exactly one JVM's RSS/heap at a time (no second heap requirement); numbers stay under `STAND_XMX`.
 Proves "documented limits and measured container/RSS/heap memory during building, switching and testing."
 

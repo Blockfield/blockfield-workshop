@@ -8,6 +8,6 @@ WORKSPACE="${BF_WORKSPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && 
 WEB_DIR="${BF_WEB_DIR:-$WORKSPACE/blockfield-site}"
 eval "$(python3 -c "import json,shlex;[print(f'export {k}={shlex.quote(v)}') for k,v in json.load(open('$STAND_DIR/web-runtime-env.json')).items()]")"
 cd "$WEB_DIR"
-NODE_BIN="${NODE:-$(mise which node)}"
+NODE_BIN="${NODE:-$(command -v node)}"
 export PATH="$(dirname "$NODE_BIN"):$PATH"
 exec node_modules/.bin/astro dev --host 127.0.0.1 --port "${BF_WEB_PORT:-4331}"
