@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from toolchain import canonical_python, child_env, download, native, tool  # noqa: E402
+from toolchain import canonical_python, child_env, download, native, python_args, tool  # noqa: E402
 
 
 def run(*args, capture=False, input=None, cwd=ROOT):
@@ -29,8 +29,7 @@ def run(*args, capture=False, input=None, cwd=ROOT):
         executable = native(name)
     command = [
         executable,
-        *(["-I", "-X", "utf8"] if name == "python" else []),
-        *map(str, args[1:]),
+        *(python_args(args[1:]) if name == "python" else map(str, args[1:])),
     ]
     if name == "actionlint":
         with subprocess.Popen(command, cwd=cwd, env=child_env()) as process:

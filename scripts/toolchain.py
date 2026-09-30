@@ -292,6 +292,19 @@ def tool(name):
     return binary
 
 
+def python_args(args):
+    args = list(map(str, args))
+    if args and not args[0].startswith("-"):
+        loader = (
+            "import runpy,sys; from pathlib import Path; "
+            "script=sys.argv.pop(1); "
+            "sys.path.insert(0,str(Path(script).resolve().parent)); "
+            "runpy.run_path(script,run_name='__main__')"
+        )
+        args = ["-c", loader, *args]
+    return ["-I", "-X", "utf8", *args]
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--ci"]:
         tool("just")
@@ -301,4 +314,4 @@ if __name__ == "__main__":
         ) as output:
             output.write(str(CACHE / "bin") + "\n" + str(python.parent) + "\n")
     else:
-        call(canonical_python(), "-I", "-X", "utf8", *sys.argv[1:])
+        call(canonical_python(), *python_args(sys.argv[1:]))
