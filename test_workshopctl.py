@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 from controller import Goal, Process
 from test_controller import FakeBackend
@@ -25,6 +26,45 @@ class WorkshopctlTests(unittest.TestCase):
         # The fake backend never becomes ready by itself: following a switch would only burn the real-time budget.
         os.environ["BF_STEP_FOLLOW_S"] = "0"
         self.addCleanup(os.environ.pop, "BF_STEP_FOLLOW_S", None)
+        templates = self.root / "templates"
+        configurations = self.root / "game-maps"
+        configurations.mkdir()
+        for map_id in ("konstaxa", "fields"):
+            (templates / map_id / "region").mkdir(parents=True)
+            (templates / map_id / "region/r.0.0.mca").write_bytes(map_id.encode())
+            (configurations / f"{map_id}.json").write_text(
+                json.dumps(
+                    {
+                        "id": map_id,
+                        "name": map_id,
+                        "bounds": {"minX": 0, "maxX": 10, "minZ": 0, "maxZ": 10},
+                        "mode_data": {},
+                    }
+                )
+            )
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "BF_MAP_ARCHIVE_DIR": str(self.root / "history"),
+                "BF_MAP_ACTIVE_DIR": str(self.root / "active"),
+                "BF_TEMPLATES_DIR": str(templates),
+                "BF_CANDIDATES_DIR": str(self.root / "candidates"),
+                "BF_LEGACY_CANDIDATES_DIR": str(self.root / "legacy"),
+                "BF_WORKSHOP_DATA": str(self.root / "workshop-data"),
+                "BF_PUBLISHED_MAPS_DIR": str(self.root / "published"),
+                "BF_GAME_MAPS_DIR": str(self.root / "game-maps"),
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        store = workshopctl._map_store(os.environ, self.backend)
+        for map_id in ("konstaxa", "fields"):
+            version = store.versions.import_template(
+                map_id, templates / map_id, configurations / f"{map_id}.json"
+            )
+            store.versions.activate(
+                map_id, version, {"draslId": "fixture", "name": "fixture"}, None
+            )
 
     def ctl(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -167,6 +207,116 @@ class WorkshopctlTests(unittest.TestCase):
             self.assertEqual(
                 self.ctl("request", "game", "--release", "v1")[0], workshopctl.BUSY
             )
+
+    def test_offline_import_is_staged_and_activation_requires_exact_head(self):
+        self.backend.processes = []
+        world = self.root / "new-map"
+        (world / "region").mkdir(parents=True)
+        source = world / "region/r.0.0.mca"
+        source.write_bytes(b"source retained")
+        config = self.root / "new-map.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "id": "custom_arena",
+                    "kind": "arena",
+                    "name": "Independent arena",
+                    "bounds": {"minX": 0, "maxX": 175, "minZ": 0, "maxZ": 175},
+                    "mode_data": {},
+                    "supported_modes": [],
+                }
+            )
+        )
+        code, result = self.ctl(
+            "import-map",
+            "--map-id",
+            "custom_arena",
+            "--world",
+            str(world),
+            "--config",
+            str(config),
+        )
+        self.assertEqual(code, 0, result)
+        self.assertFalse(result["active"])
+        self.assertIsNone(result["expectedHead"])
+        self.assertFalse((self.root / "active/custom_arena/head.json").exists())
+        self.assertEqual(source.read_bytes(), b"source retained")
+        catalog = json.loads((self.root / "admin/maps.json").read_bytes())["maps"]
+        self.assertEqual(
+            next(
+                entry["kind"] for entry in catalog if entry["mapId"] == "custom_arena"
+            ),
+            "arena",
+        )
+        code, head = self.ctl(
+            "activate-map",
+            "--map-id",
+            "custom_arena",
+            "--version-digest",
+            result["versionDigest"],
+            "--expected-head",
+            "none",
+        )
+        self.assertEqual(code, 0, head)
+        self.assertEqual(head["versionDigest"], result["versionDigest"])
+        self.assertEqual(head["activatedBy"], {"draslId": "host", "name": "host"})
+        code, error = self.ctl(
+            "activate-map",
+            "--map-id",
+            "custom_arena",
+            "--version-digest",
+            result["versionDigest"],
+            "--expected-head",
+            "none",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("stale", error)
+        self.assertEqual(self.backend.events, [])
+
+    def test_import_refuses_running_backend_and_real_lobby_spawn_mismatch(self):
+        world = self.root / "game/world"
+        (world / "region").mkdir(parents=True)
+        (world / "region/r.0.0.mca").write_bytes(b"lobby source")
+        config = self.root / "lobby.json"
+        metadata = {
+            "id": "lobby",
+            "kind": "lobby",
+            "name": "Lobby",
+            "bounds": {"minX": -400, "maxX": -200, "minZ": 500, "maxZ": 700},
+            "mode_data": {"lobby": {"spawn": {"x": -277.5, "y": -40, "z": 604.5}}},
+            "supported_modes": [],
+        }
+        config.write_text(json.dumps(metadata))
+        from docker_backend import App
+
+        self.backend.apps = {"game": App("fake-game", self.root / "game")}
+        self.backend.container_spec = lambda profile: {}
+        self.backend.container_env = lambda spec: {}
+        command = (
+            "import-map",
+            "--map-id",
+            "lobby",
+            "--world",
+            str(world),
+            "--config",
+            str(config),
+        )
+        code, error = self.ctl(*command)
+        self.assertEqual(code, 1)
+        self.assertIn("stopped", error)
+        self.backend.processes = []
+        metadata["mode_data"]["lobby"]["spawn"]["x"] = 0
+        config.write_text(json.dumps(metadata))
+        code, error = self.ctl(*command)
+        self.assertEqual(code, 1)
+        self.assertIn("Hub spawn", error)
+        metadata["mode_data"]["lobby"]["spawn"]["x"] = -277.5
+        config.write_text(json.dumps(metadata))
+        code, result = self.ctl(*command)
+        self.assertEqual(code, 0, result)
+        self.assertFalse(result["active"])
+        self.assertEqual((world / "region/r.0.0.mca").read_bytes(), b"lobby source")
+        self.assertFalse((self.root / "active/lobby/head.json").exists())
 
 
 if __name__ == "__main__":

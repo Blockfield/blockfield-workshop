@@ -3,6 +3,8 @@
 Description=Blockfield workshop controller reconciliation step
 After=docker.service
 Requires=docker.service
+RequiresMountsFor=/mnt/media-hdd
+AssertPathIsMountPoint=/mnt/media-hdd
 
 [Service]
 Type=oneshot

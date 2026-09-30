@@ -484,7 +484,9 @@ class SessionAndPlaytestTests(unittest.TestCase):
     def test_playtest_only_from_the_workshop_and_gate_testers(self):
         sha = "ab" * 32
         self.controller.set_members([ADMIN])
-        self.controller.maps = unittest.mock.Mock(sha256_of=lambda candidate: sha)
+        self.controller.maps = unittest.mock.Mock(
+            sha256_of=lambda candidate: sha, map_ids=lambda: {"konstaxa", "fields"}
+        )
         early = self.put(
             "mode", profile="test", expectedRevision=1, candidateId="c" * 32
         )

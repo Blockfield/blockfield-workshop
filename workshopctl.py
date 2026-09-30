@@ -10,7 +10,10 @@ workshopctl step | status | cancel      # step applies the site admin inbox firs
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -45,7 +48,8 @@ def _map_store(env, backend):
     """Map candidates (candidates.py) with the host paths; saving is held through the backend when it can."""
     from candidates import MapStore
 
-    return MapStore(
+    archive = Path(env.get("BF_MAP_ARCHIVE_DIR", "/mnt/media-hdd/blockfield/maps"))
+    store = MapStore(
         Path(env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")),
         Path(env.get("BF_TEMPLATES_DIR", "/srv/minecraft/templates/maps")),
         Path(
@@ -54,13 +58,111 @@ def _map_store(env, backend):
                 "/srv/minecraft/lobby/blockfield-published/maps",
             )
         ),
-        Path(env.get("BF_CANDIDATES_DIR", "/srv/minecraft/workshop/candidates")),
-        Path(env.get("BF_MAP_BACKUPS_DIR", "/srv/minecraft/workshop/map-backups")),
+        Path(env.get("BF_CANDIDATES_DIR", str(archive / "candidates"))),
+        Path(env.get("BF_MAP_BACKUPS_DIR", str(archive / "backups"))),
         repo_maps=Path(
             env.get("BF_GAME_MAPS_DIR", "/srv/minecraft/lobby/blockfield/maps")
         ),
+        archive_root=archive,
+        active_root=Path(env.get("BF_MAP_ACTIVE_DIR", "/srv/minecraft/maps-active")),
+        legacy_candidates=Path(
+            env.get("BF_LEGACY_CANDIDATES_DIR", "/srv/minecraft/workshop/candidates")
+        ),
+        packages=Path(env.get("BF_MAP_PACKAGES_DIR", str(archive / "packages"))),
         hold_saves=getattr(backend, "workshop_saves_held", None),
     )
+    if env.get("BF_PROXY_SERVICE"):
+        from limbo import LimboArtifacts
+
+        store.limbo = LimboArtifacts(
+            Path(env.get("BF_LIMBO_DERIVED_DIR", str(archive / "limbo"))),
+            getattr(backend, "proxy_stopped", lambda: False),
+        )
+    return store
+
+
+@contextmanager
+def _offline(backend):
+    if hasattr(backend, "lock_dir"):
+        with (backend.lock_dir / "backend.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _require_stopped(backend)
+            yield
+            _require_stopped(backend)
+    else:
+        _require_stopped(backend)
+        yield
+        _require_stopped(backend)
+
+
+def _require_stopped(backend):
+    if hasattr(backend, "inventory"):
+        inventory = backend.inventory()
+        if inventory["unknown"] or any(
+            inventory[profile]["tasks"] or inventory[profile]["java"]
+            for profile in ("game", "workshop")
+        ):
+            raise ValueError(
+                "offline map import/application requires both backends at zero replicas and no Java"
+            )
+    elif backend.observe():
+        raise ValueError("offline map import/application requires stopped backends")
+
+
+def _import_map(args, controller, backend):
+    from candidates import MapVersions
+    from map_package import _json
+
+    world, config_path = Path(args.world).absolute(), Path(args.config).absolute()
+    if (
+        config_path.is_symlink()
+        or not config_path.is_file()
+        or config_path.stat().st_size > 4 << 20
+    ):
+        raise ValueError("unsafe map metadata file")
+    config = _json(config_path.read_bytes())
+    MapVersions.validate_config(args.map_id, config)
+    if config.get("kind") == "lobby":
+        if (
+            not hasattr(backend, "apps")
+            or world != backend.apps["game"].data.absolute() / "world"
+        ):
+            raise ValueError("lobby import must use the stopped game overworld")
+        environment = backend.container_env(backend.container_spec("game"))
+        actual_spawn = [
+            float(value)
+            for value in environment.get(
+                "BLOCKFIELD_LOBBY_SPAWN", "-277.5 -40 604.5"
+            ).split()
+        ]
+        spawn = config["mode_data"].get("lobby", {}).get("spawn")
+        if (
+            len(actual_spawn) != 3
+            or not all(math.isfinite(value) for value in actual_spawn)
+            or not isinstance(spawn, dict)
+            or [spawn.get(key) for key in ("x", "y", "z")] != actual_spawn
+        ):
+            raise ValueError("lobby metadata spawn must match the real Hub spawn")
+        bounds = config["bounds"]
+        if (
+            not bounds["minX"] <= spawn["x"] <= bounds["maxX"] + 1
+            or not bounds["minZ"] <= spawn["z"] <= bounds["maxZ"] + 1
+        ):
+            raise ValueError("lobby spawn must lie within supplied map bounds")
+    with controller._locked(), _offline(backend):
+        head = controller.maps.versions.head(args.map_id)
+        version = controller.maps.versions.import_template(
+            args.map_id, world, config_path
+        )
+        controller.export_maps()
+    return {
+        "mapId": args.map_id,
+        "kind": config.get("kind", "arena"),
+        "versionDigest": version,
+        "expectedHead": head["versionDigest"] if head else None,
+        "active": False,
+        "source": str(world),
+    }
 
 
 def main(argv=None, backend_factory=None) -> int:
@@ -95,6 +197,11 @@ def main(argv=None, backend_factory=None) -> int:
     workshop = request.add_parser("workshop")
     workshop.add_argument("--session", required=True)
     workshop.add_argument("--release")
+    workshop.add_argument(
+        "--maps",
+        nargs="+",
+        help="selected canonical map ids; omitted = all on new, previous selection on resume",
+    )
     game = request.add_parser("game")
     game.add_argument("--release")
     game.add_argument(
@@ -111,6 +218,29 @@ def main(argv=None, backend_factory=None) -> int:
         "members", help="replace the workshop ACL; no arguments clears it"
     )
     members.add_argument("member", nargs="*")
+    importer = commands.add_parser(
+        "import-map",
+        help="offline: record existing Anvil geometry and explicit map metadata in CAS; no activation",
+    )
+    importer.add_argument("--map-id", required=True)
+    importer.add_argument("--world", required=True)
+    importer.add_argument("--config", required=True)
+    activate = commands.add_parser(
+        "activate-map",
+        help="activate one imported version with an explicit expected current head",
+    )
+    activate.add_argument("--map-id", required=True)
+    activate.add_argument("--version-digest", required=True)
+    activate.add_argument(
+        "--expected-head",
+        required=True,
+        help="exact current SHA256, or none for initial activation",
+    )
+    limbo_export = commands.add_parser(
+        "export-limbo",
+        help="export an accepted immutable version through the ready workshop's trusted WorldEdit adapter",
+    )
+    limbo_export.add_argument("--version-digest", required=True)
     args = parser.parse_args(argv)
 
     try:
@@ -149,6 +279,32 @@ def main(argv=None, backend_factory=None) -> int:
             }
         elif args.command == "cancel":
             result = controller.cancel()
+        elif args.command == "import-map":
+            result = _import_map(args, controller, backend)
+        elif args.command == "export-limbo":
+            result = controller.export_limbo(args.version_digest)
+        elif args.command == "activate-map":
+            expected = None if args.expected_head == "none" else args.expected_head
+            with controller._locked():
+                manifest = controller.maps.versions.read(
+                    args.map_id, args.version_digest
+                )
+                if manifest["kind"] in {"lobby", "limbo"}:
+                    with _offline(backend):
+                        result = controller.maps.activate(
+                            args.map_id,
+                            args.version_digest,
+                            {"draslId": "host", "name": "host"},
+                            expected,
+                        )
+                else:
+                    result = controller.maps.activate(
+                        args.map_id,
+                        args.version_digest,
+                        {"draslId": "host", "name": "host"},
+                        expected,
+                    )
+                controller.export_maps()
         elif args.command == "step":
             try:
                 controller.process_inbox()
@@ -176,8 +332,24 @@ def main(argv=None, backend_factory=None) -> int:
                 else Goal("game", release)
             )
             recover = getattr(args, "recover", False)
+            session = None
+            if args.profile == "workshop":
+                previous = controller.session()
+                session = (
+                    previous
+                    if previous and previous.get("id") == goal.session
+                    else {
+                        "schema": 1,
+                        "id": goal.session,
+                        "maps": None,
+                        "startedAt": int(time.time() * 1000),
+                        "startedBy": None,
+                    }
+                )
+                if args.maps is not None:
+                    session = {**session, "maps": args.maps}
             result = controller.request(
-                str(uuid4()), goal, state["revision"], recover=recover
+                str(uuid4()), goal, state["revision"], recover=recover, session=session
             )
             if recover:
                 result = controller.step(recover=True)

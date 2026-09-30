@@ -52,6 +52,8 @@ class DockerBackend:
         stop_timeout: float = 300.0,
         poll: float = 2.0,
         min_free_bytes: int = 2 << 30,
+        admin_dir: Path = Path("/srv/minecraft/workshop/admin"),
+        proxy_service: str | None = None,
     ):
         if set(apps) != {"game", "workshop"} or not all(
             SERVICE.fullmatch(a.service) for a in apps.values()
@@ -65,6 +67,13 @@ class DockerBackend:
         self.stop_timeout = stop_timeout
         self.poll = poll
         self.min_free_bytes = min_free_bytes
+        self.admin_dir = Path(admin_dir)
+        if proxy_service is not None and (
+            not SERVICE.fullmatch(proxy_service)
+            or proxy_service in {app.service for app in apps.values()}
+        ):
+            raise ValueError("separate configured proxy service required")
+        self.proxy_service = proxy_service
         # candidates.MapStore (workshopctl wires it): extracts a candidate for the test profile.
         self.maps = None
 
@@ -88,16 +97,39 @@ class DockerBackend:
             },
             Path(env.get("BF_LOCK_DIR", "/srv/minecraft/backend-lock")),
             min_free_bytes=int(env.get("BF_MIN_FREE_BYTES", 2 << 30)),
+            admin_dir=Path(env.get("BF_ADMIN_DIR", "/srv/minecraft/workshop/admin")),
+            proxy_service=env.get("BF_PROXY_SERVICE") or None,
         )
 
     # ------------------------------------------------------------------ commands
 
     def allowed(self, argv: list[str]) -> bool:
         services = {app.service for app in self.apps.values()}
+        observed_services = services | (
+            {self.proxy_service} if self.proxy_service else set()
+        )
         match argv:
+            case [
+                "docker",
+                "service",
+                "inspect",
+                service,
+                "--format",
+                "{{json .Spec.TaskTemplate.ContainerSpec}}",
+            ]:
+                return service in services
             case ["docker", "service", "scale", "--detach", target]:
                 service, _, replicas = target.rpartition("=")
                 return service in services and replicas in {"0", "1"}
+            case [
+                "docker",
+                "service",
+                "inspect",
+                service,
+                "--format",
+                "{{json .Spec.Mode}}",
+            ]:
+                return self.proxy_service is not None and service == self.proxy_service
             case [
                 "docker",
                 "service",
@@ -108,7 +140,7 @@ class DockerBackend:
                 "--format",
                 "{{.CurrentState}}",
             ]:
-                return service in services
+                return service in observed_services
             case [
                 "docker",
                 "ps",
@@ -118,11 +150,18 @@ class DockerBackend:
                 "--format",
                 "{{.ID}}",
             ]:
-                return label.startswith(LABEL) and label[len(LABEL) :] in services
-            case ["docker", "exec", container, "rcon-cli", *command]:
                 return (
-                    bool(CONTAINER.fullmatch(container))
-                    and tuple(command) in RCON_COMMANDS
+                    label.startswith(LABEL) and label[len(LABEL) :] in observed_services
+                )
+            case ["docker", "exec", container, "rcon-cli", *command]:
+                return bool(CONTAINER.fullmatch(container)) and (
+                    tuple(command) in RCON_COMMANDS
+                    or len(command) == 4
+                    and command[:3] == ["bf", "workshop", "export-limbo"]
+                    and re.fullmatch(
+                        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                        command[3],
+                    )
                 )
             case ["pgrep", "-f", pattern]:
                 return pattern == JAVA_PATTERN
@@ -141,6 +180,98 @@ class DockerBackend:
         return result.stdout
 
     # ------------------------------------------------------------------ inventory
+
+    def proxy_stopped(self) -> bool:
+        if self.proxy_service is None:
+            raise ValueError("BF_PROXY_SERVICE is required for stopped Limbo selection")
+        mode = json.loads(
+            self.run(
+                [
+                    "docker",
+                    "service",
+                    "inspect",
+                    self.proxy_service,
+                    "--format",
+                    "{{json .Spec.Mode}}",
+                ]
+            )
+        )
+        replicated = mode.get("Replicated") if isinstance(mode, dict) else None
+        if (
+            not isinstance(replicated, dict)
+            or type(replicated.get("Replicas")) is not int
+            or replicated["Replicas"] != 0
+        ):
+            return False
+        tasks = self.run(
+            [
+                "docker",
+                "service",
+                "ps",
+                self.proxy_service,
+                "--filter",
+                "desired-state=running",
+                "--format",
+                "{{.CurrentState}}",
+            ]
+        )
+        containers = self.run(
+            [
+                "docker",
+                "ps",
+                "--no-trunc",
+                "--filter",
+                LABEL + self.proxy_service,
+                "--format",
+                "{{.ID}}",
+            ]
+        )
+        return not tasks.strip() and not containers.strip()
+
+    def export_limbo(self, job: str) -> None:
+        if str(UUID(job)) != job or self.maps is None or self.maps.limbo is None:
+            raise ValueError("configured native Limbo export job required")
+        self._check_workshop_mounts()
+        spec = self.container_spec("workshop")
+        target = self.container_env(spec).get("BLOCKFIELD_WORKSHOP_EXPORT_DIR", "")
+        if (
+            not Path(target).is_absolute()
+            or str(Path(target)) != target
+            or ".." in Path(target).parts
+        ):
+            raise ValueError("absolute native Limbo export directory required")
+        mounts = [
+            mount for mount in spec.get("Mounts", []) if mount.get("Target") == target
+        ]
+        if (
+            len(mounts) != 1
+            or mounts[0].get("Type") != "bind"
+            or mounts[0].get("Source") != str(self.maps.limbo.jobs)
+            or mounts[0].get("ReadOnly", False) is not False
+        ):
+            raise ValueError("isolated HDD Limbo export jobs mount required")
+        containers = self.containers("workshop")
+        selection = self.selection()
+        if (
+            len(containers) != 1
+            or selection is None
+            or selection.get("profile") != "workshop"
+        ):
+            raise ValueError(
+                "one selected workshop container required for native export"
+            )
+        self.run(
+            [
+                "docker",
+                "exec",
+                containers[0],
+                "rcon-cli",
+                "bf",
+                "workshop",
+                "export-limbo",
+                job,
+            ]
+        )
 
     def containers(self, profile: str) -> list[str]:
         out = self.run(
@@ -256,6 +387,109 @@ class DockerBackend:
 
     # ------------------------------------------------------------------ Backend protocol
 
+    def container_spec(self, profile: str) -> dict:
+        value = json.loads(
+            self.run(
+                [
+                    "docker",
+                    "service",
+                    "inspect",
+                    self.apps[self.app_of(profile)].service,
+                    "--format",
+                    "{{json .Spec.TaskTemplate.ContainerSpec}}",
+                ]
+            )
+        )
+        if not isinstance(value, dict):
+            raise ValueError("invalid backend container specification")
+        return value
+
+    @staticmethod
+    def container_env(spec: dict) -> dict:
+        result = {}
+        for value in spec.get("Env", []):
+            if not isinstance(value, str) or "=" not in value:
+                raise ValueError("invalid backend environment")
+            key, value = value.split("=", 1)
+            if key in result:
+                raise ValueError("duplicate backend environment key")
+            result[key] = value
+        return result
+
+    def _check_workshop_mounts(self) -> None:
+        spec = self.container_spec("workshop")
+        environment = self.container_env(spec)
+        active = environment.get("BF_MAP_ACTIVE_DIR", "")
+        drafts = environment.get("BLOCKFIELD_WORKSHOP_DRAFTS_DIR", "")
+        session = environment.get(
+            "BLOCKFIELD_WORKSHOP_SESSION_FILE", "/workshop-admin/session.json"
+        )
+        profile = environment.get(
+            "BLOCKFIELD_BACKEND_PROFILE_FILE", "/backend-lock/profile.json"
+        )
+        for value in (active, drafts, session, profile):
+            path = Path(value)
+            if (
+                not path.is_absolute()
+                or str(path) != value
+                or ".." in path.parts
+                or value == "/"
+            ):
+                raise ValueError(
+                    "canonical workshop paths must be explicit and absolute"
+                )
+        if environment.get("BLOCKFIELD_PROFILE") != "workshop":
+            raise ValueError("workshop container profile is not configured")
+        required = [
+            (self.maps.versions.active, active, True),
+            (self.maps.versions.active / "drafts", drafts, False),
+            (self.admin_dir, str(Path(session).parent), True),
+            (self.lock_dir, str(Path(profile).parent), False),
+        ]
+        mounts = spec.get("Mounts", [])
+        for source, target, readonly in required:
+            matches = [
+                mount
+                for mount in mounts
+                if isinstance(mount, dict) and mount.get("Target") == target
+            ]
+            if (
+                len(matches) != 1
+                or matches[0].get("Type") != "bind"
+                or matches[0].get("Source") != str(source)
+                or matches[0].get("ReadOnly", False) is not readonly
+            ):
+                raise ValueError("canonical workshop bind mounts are missing or unsafe")
+        if Path(session).name != "session.json" or Path(profile).name != "profile.json":
+            raise ValueError(
+                "canonical workshop state filenames must match controller exports"
+            )
+        for mount in mounts:
+            if (
+                not isinstance(mount, dict)
+                or not isinstance(mount.get("Source"), str)
+                or not isinstance(mount.get("Target"), str)
+            ):
+                raise ValueError("invalid workshop bind mount")
+            source, target = Path(mount["Source"]), Path(mount["Target"])
+            export_jobs = getattr(getattr(self.maps, "limbo", None), "jobs", None)
+            export_target = environment.get("BLOCKFIELD_WORKSHOP_EXPORT_DIR")
+            if source.is_relative_to(
+                self.maps.versions.archive
+            ) or self.maps.versions.archive.is_relative_to(source):
+                if (
+                    source == export_jobs
+                    and str(target) == export_target
+                    and mount.get("Type") == "bind"
+                    and mount.get("ReadOnly", False) is False
+                ):
+                    continue
+                raise ValueError("archive storage must not be mounted in Minecraft")
+            if target.is_relative_to(active) and str(target) not in {active, drafts}:
+                raise ValueError(
+                    "extra workshop mount shadows immutable active storage"
+                )
+
     def preflight(self, goal: Goal) -> None:
         if self.app_of(goal.profile) not in self.apps:
             raise ValueError(f"profile {goal.profile} has no app in this stage")
@@ -268,6 +502,11 @@ class DockerBackend:
             raise FileNotFoundError(f"data directory for {goal.profile} missing")
         if shutil.disk_usage(data).free < self.min_free_bytes:
             raise OSError("not enough free space for the backend data")
+        if (
+            goal.profile == "workshop"
+            and getattr(self.maps, "canonical_sessions", False) is True
+        ):
+            self._check_workshop_mounts()
 
     def observe(self) -> list[Process]:
         inventory = self.inventory()
@@ -426,6 +665,22 @@ class DockerBackend:
 
     def start(self, goal: Goal) -> None:
         data = self.apps[self.app_of(goal.profile)].data
+        if (
+            goal.profile == "workshop"
+            and getattr(self.maps, "canonical_sessions", False) is True
+        ):
+            self.preflight(goal)
+            session = json.loads((self.admin_dir / "session.json").read_bytes()[:65536])
+            if (
+                not isinstance(session, dict)
+                or type(session.get("schema")) is not int
+                or session["schema"] != 1
+                or session.get("id") != goal.session
+            ):
+                raise ValueError("workshop session/profile mismatch before start")
+            self.maps.prepare_session(
+                goal.session, session.get("maps"), resume_only=True
+            )
         if goal.profile == "test":
             # start-container.sh builds the playtest copy from this before java starts.
             self.maps.extract(goal.candidate, data / "test-candidate")

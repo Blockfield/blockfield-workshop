@@ -167,12 +167,12 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(self.held, ["off", "on"])
         self.assertEqual((meta["status"], meta["regions"]), ("pending", 1))
         self.store.publish(meta["id"], ACTOR)
-        with zipfile.ZipFile(self.store.candidates / (meta["id"] + ".zip")) as archive:
+        with zipfile.ZipFile(self.store.archive_path(meta["id"])) as archive:
             self.assertEqual(json.loads(archive.read("map.json"))["name"], "edited")
 
     def test_acceptance_preserves_live_world_json_and_archive(self):
         meta = self.store.create("konstaxa", ACTOR)
-        archive = self.store.candidates / (meta["id"] + ".zip")
+        archive = self.store.archive_path(meta["id"])
         before = archive.read_bytes()
         accepted = self.store.publish(meta["id"], ACTOR)
         self.assertEqual(accepted["status"], "accepted")
@@ -184,7 +184,7 @@ class CandidateTests(unittest.TestCase):
         self.assertFalse(self.store.backups.exists())
         with self.assertRaises(ValueError):
             self.store.publish(meta["id"], ACTOR)
-        with self.assertRaisesRegex(ValueError, "pack release"):
+        with self.assertRaisesRegex(ValueError, "versionDigest and expectedHead"):
             self.store.rollback("konstaxa", ACTOR)
 
     def test_an_older_candidate_cannot_replace_a_newer_published_one(self):
@@ -209,7 +209,7 @@ class CandidateTests(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertEqual(
             sorted(p.name for p in self.store.candidates.iterdir()),
-            sorted([f"{meta['id']}.zip", f"{meta['id']}.json"]),
+            [f"{meta['id']}.json"],
         )
 
     def test_unknown_or_unopened_maps_are_refused(self):

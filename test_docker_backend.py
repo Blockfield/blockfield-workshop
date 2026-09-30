@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ from pathlib import Path
 state_path, log = Path(os.environ["BF_FAKE"]), Path(os.environ["BF_FAKE_LOG"])
 proc = Path(os.environ["BF_FAKE_PROC"])
 state = json.loads(state_path.read_text())
-argv = [Path(sys.argv[0]).name] + sys.argv[1:]
+argv = [Path(sys.argv[1]).name] + sys.argv[2:]
 with log.open("a") as handle:
     handle.write(json.dumps(argv) + "\n")
 services = state["services"]
@@ -30,6 +31,11 @@ if argv[0] == "pgrep":
     sys.exit(0 if state["java"] else 1)
 if argv[1:3] == ["service", "ps"]:
     print("\n".join(["Running 1 second ago"] * services[argv[3]]["replicas"]))
+elif argv[1:3] == ["service", "inspect"]:
+    if argv[-1] == "{{json .Spec.Mode}}":
+        print(json.dumps(services[argv[3]].get("mode", {"Replicated": {"Replicas": services[argv[3]]["replicas"]}})))
+    else:
+        print(json.dumps(services[argv[3]].get("spec", {})))
 elif argv[1] == "ps":
     name = argv[4].split("=", 2)[2]
     cid = services[name]["container"]
@@ -67,7 +73,10 @@ class DockerBackendTests(unittest.TestCase):
         for path in (self.bin, self.proc, self.lock, *self.data.values()):
             path.mkdir()
         for name in ("docker", "pgrep"):
-            (self.bin / name).write_text(f"#!{sys.executable}\n" + FAKE)
+            # Kernel shebang parsing splits paths at spaces; never fall through to real docker/pgrep.
+            (self.bin / name).write_text(
+                f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(FAKE)} "$0" "$@"\n'
+            )
             (self.bin / name).chmod(0o755)
         self.state_file, self.log = root / "state.json", root / "calls.log"
         self.state = {
@@ -137,11 +146,27 @@ class DockerBackendTests(unittest.TestCase):
 
     def test_only_allowlisted_commands(self):
         good = [
+            [
+                "docker",
+                "service",
+                "inspect",
+                "bf-workshop",
+                "--format",
+                "{{json .Spec.TaskTemplate.ContainerSpec}}",
+            ],
             ["docker", "service", "scale", "--detach", "bf-game=0"],
             ["docker", "exec", GAME_CID, "rcon-cli", "bf", "maintenance", "status"],
             ["pgrep", "-f", JAVA_PATTERN],
         ]
         bad = [
+            [
+                "docker",
+                "service",
+                "inspect",
+                "other",
+                "--format",
+                "{{json .Spec.TaskTemplate.ContainerSpec}}",
+            ],
             ["docker", "rm", "-f", "bf-game"],
             ["docker", "service", "scale", "--detach", "bf-game=2"],
             ["docker", "service", "scale", "--detach", "other=1"],
@@ -158,6 +183,160 @@ class DockerBackendTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 self.backend.run(argv)
         self.assertEqual(self.calls(), [])
+
+    def test_canonical_workshop_mounts_and_session_must_agree_before_start(self):
+        from candidates import MapStore
+
+        root = Path(self.temp.name)
+        self.backend.maps = MapStore(
+            self.data["workshop"],
+            root / "templates",
+            root / "published",
+            root / "archive/candidates",
+            root / "archive/backups",
+            archive_root=root / "archive",
+            active_root=root / "active",
+        )
+        self.backend.admin_dir = root / "admin"
+        self.backend.admin_dir.mkdir()
+        spec = {
+            "Env": [
+                "BLOCKFIELD_PROFILE=workshop",
+                "BF_MAP_ACTIVE_DIR=/maps-active",
+                "BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts",
+            ],
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Source": str(root / "active"),
+                    "Target": "/maps-active",
+                    "ReadOnly": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(root / "active/drafts"),
+                    "Target": "/maps-active/drafts",
+                    "ReadOnly": False,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(root / "admin"),
+                    "Target": "/workshop-admin",
+                    "ReadOnly": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(self.lock),
+                    "Target": "/backend-lock",
+                    "ReadOnly": False,
+                },
+            ],
+        }
+        self.state["services"]["bf-workshop"]["spec"] = spec
+        self.save()
+        goal = Goal("workshop", "v1", str(uuid4()))
+        self.backend.preflight(goal)
+        spec["Mounts"][0]["ReadOnly"] = False
+        self.save()
+        with self.assertRaisesRegex(ValueError, "mount"):
+            self.backend.preflight(goal)
+        self.assertFalse((self.lock / "profile.json").exists())
+        spec["Mounts"][0]["ReadOnly"] = True
+        self.save()
+        (self.backend.admin_dir / "session.json").write_text(
+            json.dumps({"schema": 1, "id": str(uuid4()), "maps": ["limbo"]})
+        )
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            self.backend.start(goal)
+        self.assertFalse((self.lock / "profile.json").exists())
+        self.assertFalse(
+            any(call[1:3] == ["service", "scale"] for call in self.calls())
+        )
+
+    def test_proxy_stopped_proof_is_configured_read_only_and_checks_orphan_containers(
+        self,
+    ):
+        with self.assertRaisesRegex(ValueError, "BF_PROXY_SERVICE"):
+            self.backend.proxy_stopped()
+        self.backend.proxy_service = "bf-proxy"
+        self.state["services"]["bf-proxy"] = {"replicas": 0, "container": OTHER_CID}
+        self.save()
+        self.assertTrue(self.backend.proxy_stopped())
+        self.java(200, OTHER_CID)
+        self.assertFalse(self.backend.proxy_stopped())
+        self.load()
+        self.state["java"] = {}
+        self.state["services"]["bf-proxy"]["replicas"] = 1
+        self.save()
+        self.assertFalse(self.backend.proxy_stopped())
+        self.assertFalse(
+            self.backend.allowed(
+                ["docker", "service", "scale", "--detach", "bf-proxy=0"]
+            )
+        )
+        self.assertFalse(
+            any(call[1:3] == ["service", "scale"] for call in self.calls())
+        )
+
+    def test_malformed_proxy_mode_never_counts_as_stopped(self):
+        self.backend.proxy_service = "bf-proxy"
+        self.state["services"]["bf-proxy"] = {"replicas": 0, "container": OTHER_CID}
+        for mode in (
+            {"Global": {}},
+            {"Replicated": None},
+            {"Replicated": {"Replicas": False}},
+            {"Replicated": {"Replicas": "0"}},
+        ):
+            self.state["services"]["bf-proxy"]["mode"] = mode
+            self.save()
+            self.assertFalse(self.backend.proxy_stopped())
+
+    def test_native_export_command_is_one_canonical_job_not_arbitrary_rcon(self):
+        job = str(uuid4())
+        self.assertTrue(
+            self.backend.allowed(
+                [
+                    "docker",
+                    "exec",
+                    WORKSHOP_CID,
+                    "rcon-cli",
+                    "bf",
+                    "workshop",
+                    "export-limbo",
+                    job,
+                ]
+            )
+        )
+        for bad in ("../job", job.upper(), job + " extra"):
+            self.assertFalse(
+                self.backend.allowed(
+                    [
+                        "docker",
+                        "exec",
+                        WORKSHOP_CID,
+                        "rcon-cli",
+                        "bf",
+                        "workshop",
+                        "export-limbo",
+                        bad,
+                    ]
+                )
+            )
+        self.assertFalse(
+            self.backend.allowed(
+                [
+                    "docker",
+                    "exec",
+                    WORKSHOP_CID,
+                    "rcon-cli",
+                    "bf",
+                    "workshop",
+                    "import-schematic",
+                    job,
+                    "lobby.schem",
+                ]
+            )
+        )
 
     def test_legacy_game_is_adopted_only_with_readiness(self):
         self.running("game")

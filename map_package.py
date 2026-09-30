@@ -1,7 +1,7 @@
 """Read-only validator for immutable map candidates. Never extracts or activates a map.
 
 CLI: python tools/workshop/map_package.py candidate.zip --sha256 EXPECTED_SHA256
-Layout v1: manifest.json, map.json, world/{region,entities,poi}/r.X.Z.mca.
+Layout v1: manifest.json, map.json, world/{region,entities,poi}/r.X.Z.mca and external c.X.Z.mcc.
 Unknown world sidecars are rejected, not silently discarded; extend only after compatibility tests.
 """
 
@@ -20,8 +20,9 @@ import zipfile
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
 # One spelling per coordinate: \d would admit Unicode digits and 0/-0/00 aliases.
+_COORD = r"(?:0|-?[1-9][0-9]*)"
 _REGION = re.compile(
-    r"world/(region|entities|poi)/r\.(0|-?[1-9][0-9]*)\.(0|-?[1-9][0-9]*)\.mca\Z"
+    rf"world/(region|entities|poi)/(?:r\.{_COORD}\.{_COORD}\.mca|c\.{_COORD}\.{_COORD}\.mcc)\Z"
 )
 
 
@@ -130,7 +131,9 @@ def validate(
             if (
                 "manifest.json" not in files
                 or "map.json" not in files
-                or not any(n.startswith("world/region/") for n in files)
+                or not any(
+                    n.startswith("world/region/") and n.endswith(".mca") for n in files
+                )
             ):
                 raise ValueError("world and map config required together")
             if (
@@ -171,6 +174,8 @@ def validate(
             config = _json(archive.read(files["map.json"]))
             if not isinstance(config, dict) or config.get("id") != manifest["mapId"]:
                 raise ValueError("map config/world identity mismatch")
+            if config.get("kind", "arena") not in {"arena", "lobby", "limbo"}:
+                raise ValueError("unknown map kind")
             return manifest
 
 
