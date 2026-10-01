@@ -6,6 +6,7 @@
 !journal.py
 !candidates.py
 !map_package.py
+!limbo.py
 !map_ids.json
 !scripts/
 !scripts/toolchain.py

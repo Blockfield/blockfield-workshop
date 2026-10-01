@@ -2,11 +2,38 @@
 
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
 import textwrap
 import unittest
+
+
+class DockerContextTests(unittest.TestCase):
+    def test_copy_sources_match_the_restricted_context(self):
+        repository = Path(__file__).resolve().parent
+        sources = {
+            source
+            for line in (repository / "Dockerfile").read_text().splitlines()
+            if line.startswith("COPY ")
+            for source in shlex.split(line)[1:-1]
+        }
+        allowed = sources | {"Dockerfile"}
+        allowed.update(
+            f"{Path(source).parent.as_posix()}/"
+            for source in sources
+            if Path(source).parent != Path(".")
+        )
+        rules = [
+            line.strip()
+            for line in (repository / ".dockerignore").read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertCountEqual(rules, ["**", *(f"!{path}" for path in allowed)])
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertTrue((repository / source).is_file())
 
 
 @unittest.skipUnless(
