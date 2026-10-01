@@ -1,5 +1,6 @@
 * text=auto eol=lf
 *.bat text eol=crlf
+*.cmd text eol=crlf
 *.png binary
 *.jpg binary
 *.jpeg binary
@@ -12,11 +13,13 @@
 *.mp4 binary
 *.zip binary
 *.jar binary
+*.class binary
 *.mca binary
 *.nbt binary
 *.schem binary
 *.schematic binary
 *.ttf binary
+*.otf binary
 *.woff binary
 *.woff2 binary
 *.pdf binary
