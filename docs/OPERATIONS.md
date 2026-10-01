@@ -378,12 +378,17 @@ of the image's release plus the candidate's world in `/data/test-maps`, its JSON
 The Dockerfile now pins the published server v2.60.4 image (protocol 2). Workshop
 inherits its common JARs, `/opt/blockfield-build.json` and PackVersionGate;
 the workshop profile does not bypass the client identity check. A game Deploy
-does not update this independent image. After a paired release or accepted-client
-change, update the immutable base digest and rebuild/redeploy Workshop with zero
+does not update this independent image. After a paired release that changes the
+server image, update the immutable base digest and rebuild/redeploy Workshop with zero
 replicas, following [server DEPLOY](https://github.com/Blockfield/blockfield-server/blob/main/docs/DEPLOY.md).
 Before profile activation, separately verify the inherited build/contract and
 client login. This base update does not establish live Workshop acceptance or
 complete the controller/native-map migration.
+
+A client-only release has no new server image to pin. Separately validate and
+update Workshop's accepted client identity: the game Deploy/live gate does not
+automatically update it. Automation and live acceptance of this path are still
+pending; it does not require a forced paired server release.
 
 The existing `.github/workflows/publish-image.yml` is named **Deploy workshop**.
 Run it manually from `main` only after the owner's explicit Deploy approval.
