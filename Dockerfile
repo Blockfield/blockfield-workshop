@@ -1,4 +1,4 @@
-FROM ghcr.io/blockfield/blockfield-server@sha256:e6bbccc6be8e25c7aa06cc9aa7e35b19fbb5ec9fea5ce08c2fbc3b04a91bbe26
+FROM ghcr.io/blockfield/blockfield-server@sha256:c89080e32441deb66ae6591981675f023c0a6520539959db2b10c0eab5e20232
 ARG REVISION
 LABEL org.opencontainers.image.source="https://github.com/Blockfield/blockfield-workshop" \
       org.opencontainers.image.revision="${REVISION}"

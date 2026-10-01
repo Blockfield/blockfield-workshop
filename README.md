@@ -32,6 +32,13 @@ parent-образа в GHCR `blockfield-server` → Package settings → Manage 
 локальные credentials в Actions не копируются. Dockerfile закрепляет
 проверенный серверный образ по digest; ресурсы игры не копируются в Git.
 
+Текущая база — сервер v2.60.4 с протоколом 2. Workshop наследует его общие
+JAR, `build.json` и PackVersionGate. После парного выпуска или изменения
+принятого клиента обновите immutable digest базы, пересоберите и отдельно
+разверните Workshop с `replicas=0`: Deploy игрового сервера его не обновляет.
+Порядок — [server DEPLOY](https://github.com/Blockfield/blockfield-server/blob/main/docs/DEPLOY.md).
+Перед активацией нужна отдельная проверка подключения клиента к Workshop.
+
 Сервис мастерской сохраняет прежние mounts, healthcheck и `replicas=0`;
 каждый ручной запуск Deploy требует отдельного подтверждения владельца.
 Кандидаты ZIP используют Python 3.12.14 / zlib 1.3.2; неверный compressor
