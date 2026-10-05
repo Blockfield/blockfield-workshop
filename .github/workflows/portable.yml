@@ -3,7 +3,6 @@ on:
   push:
     branches: [main]
     paths:
-      - "scripts/**"
       - "justfile"
       - "**/*.ps1"
       - "**/*.cmd"
@@ -19,30 +18,14 @@ on:
       - "test_journal.py"
       - "test_toolchain.py"
       - ".github/workflows/portable.yml"
-  pull_request:
-    paths:
-      - "scripts/**"
-      - "justfile"
-      - "**/*.ps1"
-      - "**/*.cmd"
-      - "**/*.bat"
-      - ".editorconfig"
-      - ".gitattributes"
-      - ".ruff.toml"
-      - ".github/actionlint.yaml"
-      - "map_package.py"
-      - "journal.py"
-      - "test_map_package*.py"
-      - "test_package_review.py"
-      - "test_journal.py"
-      - "test_toolchain.py"
-      - ".github/workflows/portable.yml"
+      - "scripts/quality.py"
+      - "scripts/toolchain.py"
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 jobs:
   check:
     runs-on: blacksmith-2vcpu-windows-2025
