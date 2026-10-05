@@ -12,8 +12,8 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 
 ## Architecture (owner decision 2026-09-14)
 
-- Two Dokploy apps on compatible images: `blockfield-server` (profile `game`) and `blockfield-workshop`
-  (its independent image wraps a pinned published server digest; profile `workshop`, 0 replicas outside the workshop, own data, no stats keys, templates read-only).
+- Two Dokploy apps on the same server image: `blockfield-server` (profile `game`) and `blockfield-workshop`
+  (profile `workshop`, 0 replicas outside the workshop, own data, no stats keys, templates read-only).
 - Both mount `/srv/minecraft/backend-lock` as `/backend-lock`. `distribution/start-container.sh` takes
   `flock` on `/backend-lock/backend.lock` and starts java only while holding it **and** only if
   `/backend-lock/profile.json` selects its `BLOCKFIELD_PROFILE`. Java inherits the lock fd. A Swarm restart,
@@ -373,38 +373,15 @@ of the image's release plus the candidate's world in `/data/test-maps`, its JSON
 `BLOCKFIELD_SESSION_PURPOSE=test`. The gate is `testers` (the workshop members, backend workshop). Returning with
 `mode workshop` (`session: resume`) deletes the copy on start: nothing of a test reaches the drafts or the statistics.
 
-## Workshop image deployment
+## Workshop image
 
-The Dockerfile now pins the published server v2.67.0 image. Workshop
-inherits its common JARs, `/opt/blockfield-build.json` and PackVersionGate;
-the workshop profile does not bypass the client identity check. A game Deploy
-does not update this independent image. After a paired release that changes the
-server image, update the immutable base digest and rebuild/redeploy Workshop with zero
-replicas, following [server DEPLOY](https://github.com/Blockfield/blockfield-server/blob/main/docs/DEPLOY.md).
-Before profile activation, separately verify the inherited build/contract and
-client login. This base update does not establish live Workshop acceptance or
-complete the controller/native-map migration.
-
-A client-only release has no new server image to pin. Separately validate and
-update Workshop's accepted client identity: the game Deploy/live gate does not
-automatically update it. Automation and live acceptance of this path are still
-pending; it does not require a forced paired server release.
-
-The existing `.github/workflows/publish-image.yml` is named **Deploy workshop**.
-Run it manually from `main` only after the owner's explicit Deploy approval.
-It checks Linux/Windows, publishes `ghcr.io/blockfield/blockfield-workshop:latest`
-and the immutable `:sha-<full commit>` tag, records the digest, then POSTs
-`DOKPLOY_WORKSHOP_WEBHOOK` once with a 30-second timeout. Missing secrets or HTTP
-failures fail the job; the webhook is never printed. A successful POST queues a
-Dokploy rollout, it does not establish runtime acceptance.
-
-Configure the existing workshop Docker application to use `:latest`, its existing
-global GHCR registry, unchanged mounts/environment/healthcheck and `replicas=0`.
-Store only its native deploy webhook as the repository secret; no Dokploy API key
-or per-application registry credentials. Normal `main` pushes run checks only.
-The controller remains an independent host-systemd installation: the image webhook
-does not replace host files, change ACL/state, switch profiles or start the workshop.
-After each rollout verify the resolved digest and zero replicas in Swarm separately.
+Workshop has no image of its own. Its Dokploy service uses the tag `ghcr.io/blockfield/blockfield-server:latest`
+(no digest, like the game service) and the workshop env (`BLOCKFIELD_PROFILE=workshop`, see New installation).
+Swarm pulls a tag-only image for every new task, so each 0→1 scale of the workshop/test profile runs the
+`:latest` the game Deploy published; if the registry is unreachable the worker uses the local image the game
+Deploy pulled. Workshop therefore runs the game's JARs, `/opt/blockfield-build.json` and PackVersionGate,
+and its `release` (taken from the game) matches its readiness: server and client-only releases need no
+workshop rebuild or Deploy. Never pin this service to a digest: it would stop following the game.
 
 ## Deploys during the workshop
 
@@ -444,7 +421,7 @@ its environment, mounts, controller state and enabled units; this bootstrap is n
 2. Dokploy `blockfield-server` (game): add bind mount `/srv/minecraft/backend-lock` -> `/backend-lock`; env
    `BLOCKFIELD_PROFILE=game`; set **rollback order stop-first** (update order must also be stop-first).
    Keep the existing `/srv/minecraft/lobby` and templates mounts (make templates `:ro`).
-3. Dokploy: create `blockfield-workshop` from the independent image `ghcr.io/blockfield/blockfield-workshop:latest`, **replicas 0**,
+3. Dokploy: create `blockfield-workshop` from the game image `ghcr.io/blockfield/blockfield-server:latest`, **replicas 0**,
    restart policy any, update and rollback order stop-first, same network as the proxy. Mounts:
    `/srv/minecraft/workshop/data` -> `/data`, `/srv/minecraft/templates/maps` -> `/data/maps` read-only,
    `/srv/minecraft/backend-lock` -> `/backend-lock`. Env: `BLOCKFIELD_PROFILE=workshop`,
