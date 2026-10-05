@@ -375,7 +375,7 @@ of the image's release plus the candidate's world in `/data/test-maps`, its JSON
 
 ## Workshop image deployment
 
-The Dockerfile now pins the published server v2.60.4 image (protocol 2). Workshop
+The Dockerfile now pins the published server v2.67.0 image. Workshop
 inherits its common JARs, `/opt/blockfield-build.json` and PackVersionGate;
 the workshop profile does not bypass the client identity check. A game Deploy
 does not update this independent image. After a paired release that changes the
