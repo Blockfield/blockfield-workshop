@@ -2,47 +2,42 @@ name: Windows portability
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "release-notes/**"
-      - "LICENSE"
-      - "NOTICE"
-      - "systemd/**"
-      - "e2e/**"
-      - "controller.py"
-      - "docker_backend.py"
-      - "candidates.py"
-      - "limbo.py"
-      - "workshopctl.py"
-      - "map_ids.json"
-      - "test_controller*.py"
-      - "test_docker_backend.py"
-      - "test_candidates.py"
-      - "test_limbo.py"
-      - "test_workshop*.py"
-      - "test_map_versions.py"
+    paths:
+      - "scripts/**"
+      - "justfile"
+      - "**/*.ps1"
+      - "**/*.cmd"
+      - "**/*.bat"
+      - ".editorconfig"
+      - ".gitattributes"
+      - ".ruff.toml"
+      - ".github/actionlint.yaml"
+      - "map_package.py"
+      - "journal.py"
+      - "test_map_package*.py"
+      - "test_package_review.py"
+      - "test_journal.py"
+      - "test_toolchain.py"
+      - ".github/workflows/portable.yml"
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "release-notes/**"
-      - "LICENSE"
-      - "NOTICE"
-      - "systemd/**"
-      - "e2e/**"
-      - "controller.py"
-      - "docker_backend.py"
-      - "candidates.py"
-      - "limbo.py"
-      - "workshopctl.py"
-      - "map_ids.json"
-      - "test_controller*.py"
-      - "test_docker_backend.py"
-      - "test_candidates.py"
-      - "test_limbo.py"
-      - "test_workshop*.py"
-      - "test_map_versions.py"
+    paths:
+      - "scripts/**"
+      - "justfile"
+      - "**/*.ps1"
+      - "**/*.cmd"
+      - "**/*.bat"
+      - ".editorconfig"
+      - ".gitattributes"
+      - ".ruff.toml"
+      - ".github/actionlint.yaml"
+      - "map_package.py"
+      - "journal.py"
+      - "test_map_package*.py"
+      - "test_package_review.py"
+      - "test_journal.py"
+      - "test_toolchain.py"
+      - ".github/workflows/portable.yml"
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -50,7 +45,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   check:
-    runs-on: windows-latest
+    runs-on: blacksmith-2vcpu-windows-2025
     timeout-minutes: 30
     steps:
       - if: runner.os == 'Windows'

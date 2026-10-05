@@ -308,6 +308,7 @@ def python_args(args):
 if __name__ == "__main__":
     if sys.argv[1:] == ["--ci"]:
         tool("just")
+        tool("shellcheck")
         python = canonical_python()
         with Path(os.environ["GITHUB_PATH"]).open(
             "a", encoding="utf-8", newline="\n"
