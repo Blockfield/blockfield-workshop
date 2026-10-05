@@ -4,4 +4,4 @@ self-hosted-runner:
     - blockfield-deploy
     - tenki-standard-autoscale
     - blacksmith-2vcpu-windows-2025
-    - blockfield
+    - small
