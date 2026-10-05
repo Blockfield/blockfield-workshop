@@ -32,7 +32,7 @@ parent-образа в GHCR `blockfield-server` → Package settings → Manage 
 локальные credentials в Actions не копируются. Dockerfile закрепляет
 проверенный серверный образ по digest; ресурсы игры не копируются в Git.
 
-Текущая база — сервер v2.60.4 с протоколом 2. Workshop наследует его общие
+Текущая база — сервер v2.67.0. Workshop наследует его общие
 JAR, `build.json` и PackVersionGate. После парного выпуска с новым серверным
 образом обновите immutable digest базы, пересоберите и отдельно
 разверните Workshop с `replicas=0`: Deploy игрового сервера его не обновляет.
