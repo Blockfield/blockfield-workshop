@@ -45,6 +45,33 @@ class TimeoutTests(unittest.TestCase):
         )
         return controller.step()
 
+    def test_game_release_restart_waits_past_timeout_without_a_rollback(self):
+        controller = self.controller(start_timeout=100)
+        self.to_stable_game(controller)
+        release = Goal("game", "v2")
+        self.backend.processes = [Process(release, False)]
+        state = controller.step()
+        self.assertEqual((state["phase"], state["gate"]), ("STARTING", "closed"))
+        self.assertIsNone(state["rollback"])
+
+        self.clock.advance(101)
+        state = controller.step()
+        self.assertEqual((state["phase"], state["gate"]), ("STARTING", "closed"))
+        self.assertIsNone(state["error"])
+
+        self.backend.processes = []
+        controller = self.controller(start_timeout=100)
+        state = controller.step()
+        self.assertEqual((state["phase"], state["gate"]), ("STARTING", "closed"))
+        self.assertEqual(state["desired"]["release"], "v2")
+        self.assertIsNone(state["error"])
+        self.backend.processes = [Process(release, True)]
+        state = controller.step()
+        self.assertEqual((state["phase"], state["gate"]), ("game", "public"))
+        self.assertEqual(state["desired"]["release"], "v2")
+        self.assertIsNone(state["error"])
+        self.assertEqual(self.backend.events, [])
+
     def test_drain_timeout_rolls_back_without_touching_the_running_game(self):
         controller = self.controller(drain_timeout=100, drain_timeout_ranked=100)
         self.to_stable_game(controller)
@@ -121,6 +148,14 @@ class TimeoutTests(unittest.TestCase):
         self.clock.advance(101)
         state = controller.step()
         self.assertNotEqual(state["phase"], "ERROR")
+        # The rollback is now starting game with no further rollback target. Fencing still
+        # applies if the wrong profile appears after that start's deadline too.
+        self.backend.processes = [Process(Goal("workshop", "v1", self.session), True)]
+        self.backend.events.clear()
+        self.clock.advance(101)
+        state = controller.step()
+        self.assertEqual((state["phase"], state["gate"]), ("STARTING", "closed"))
+        self.assertEqual(self.backend.events, ["fence"])
 
     def test_error_carries_a_human_readable_message(self):
         controller = self.controller()

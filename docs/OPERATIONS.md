@@ -58,8 +58,8 @@ and a single-file bind mount would keep showing the old inode.
 - `workshop -> game`: `save-all flush`, stop, start game, `public` only on matching game readiness.
 - **DRAINING and STARTING have a deadline** (2026-09-18 incident: DRAINING sat for ~2h on a stuck stats-health flag,
   then a mid-operation external restart turned an unresolved STARTING into ERROR with no message). Past the deadline,
-  `step()` rolls back to the profile recorded when the switch was requested (`state["rollback"]`) instead of waiting
-  or requiring root: DRAINING never touched the old backend, so rollback just restores "desired"; STARTING already
+  `step()` rolls back if a previous profile was recorded when the switch was requested (`state["rollback"]`):
+  DRAINING never touched the old backend, so rollback just restores "desired"; STARTING already
   stopped it, so rollback stops the half-started profile and starts the old one again. `errorMessage`/`since`/`deadline`
   in `status.json` explain why. `BF_DRAIN_TIMEOUT_S` (default 600s, or `BF_DRAIN_TIMEOUT_RANKED_S`/3600s while a
   Ranked campaign is still reported), `BF_DRAIN_HEALTH_GRACE_S` (default 60s: rooms=ranked=pending=0 but stats
@@ -71,10 +71,14 @@ and a single-file bind mount would keep showing the old inode.
   and retried instead of raising; unrecoverable failures still surface as `ERROR` with `error`+`errorMessage`.
   Any error -> `ERROR`, gate `closed`. The timer never leaves ERROR. `workshopctl request game --recover` fences the
   unselected app (scale 0, wait), then saves/stops whatever runs and starts game.
+- A game image restart with the same profile follows the observed release and waits `STARTING`/`closed` for matching
+  readiness. Without a previous stable goal in `rollback`, a missed start deadline keeps observing rather than
+  starting/stopping the backend again or entering `ERROR`. When readiness returns, the timer reopens `public`.
 - `workshopctl cancel` (or inbox kind `cancel`, no root) rolls back a stuck DRAINING/STARTING switch immediately
   instead of waiting for its deadline -- the unprivileged counterpart to `--recover`, which stays root-only and
   ERROR-only.
-- STARTING without a visible process waits closed (up to its deadline) and never re-issues start (see REVIEW-2026-09-13.md).
+- STARTING without a visible process waits closed and never re-issues start (see REVIEW-2026-09-13.md). Its deadline
+  rolls back a recorded switch; without a rollback goal it keeps observing, including after a controller restart.
 - Missing/invalid `members.json` admits nobody. Any java outside the two apps (pattern `fabric-server-mc.*-launcher.*.jar`)
   is an error: do not run other Fabric servers on this host while the controller is enabled.
 
