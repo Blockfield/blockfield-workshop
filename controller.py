@@ -226,7 +226,7 @@ class Controller:
         """drain_timeout/drain_timeout_ranked: DRAINING deadline (seconds) with no/some ranked campaigns
         left; drain_health_grace: extra short-circuit when rooms=ranked=pending=0 but stats are still
         unhealthy (the 2026-09-18 incident) -- don't hold players hostage to that flag. start_timeout:
-        STARTING deadline. Any deadline exceeded rolls back to the previous stable profile automatically.
+        STARTING deadline. An exceeded deadline rolls back when a previous stable profile is recorded.
         """
         # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
         self.maps = maps
@@ -715,7 +715,7 @@ class Controller:
         phase/gate/error change, so a stable or draining gate never flaps through closed.
 
         DRAINING and STARTING each carry a deadline (see __init__); past it, step() rolls back to
-        the profile recorded in state["rollback"] instead of waiting or requiring root recovery.
+        the profile recorded in state["rollback"]. Without a rollback goal it keeps observing readiness.
         """
         with self._locked():
             state = self._read()
@@ -826,6 +826,8 @@ class Controller:
     def _starting_wait(
         self, state: dict, goal: Goal, unexpected: Process | None
     ) -> dict:
+        if unexpected is not None:
+            self.backend.fence_pending_starts()
         elapsed_ms = self._now_ms() - state["since"]
         if elapsed_ms > self.start_timeout * 1000:
             detail = (
@@ -838,8 +840,6 @@ class Controller:
                 goal,
                 f"start of {goal.profile} timed out after {elapsed_ms // 1000}s ({detail})",
             )
-        if unexpected is not None:
-            self.backend.fence_pending_starts()
         self._export(state, deadline=state["since"] + int(self.start_timeout * 1000))
         return state
 
@@ -877,6 +877,10 @@ class Controller:
         STARTING already stopped it, so bring it back up before declaring the profile stable again;
         if that itself fails there is no safe automatic move left, so it becomes an ERROR (root recovery).
         """
+        if state.get("rollback") is None:
+            # An independently restarted backend has no switch to undo; keep waiting for readiness.
+            self._export(state)
+            return state
         stable = Goal(**state["rollback"])
         if (
             stable.profile in {"workshop", "test"}
