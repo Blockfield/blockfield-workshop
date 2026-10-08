@@ -93,6 +93,174 @@ class MapStore:
 
     # ------------------------------------------------------------------ requests
 
+    def check_create(self, map_id, name, modes, session_id, actor):
+        if (
+            not isinstance(map_id, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_]{0,31}", map_id)
+            or map_id in {"hub", "lobby", "limbo"}
+        ):
+            raise ValueError(
+                "new map ID requires 1–32 lowercase letters, digits or underscores"
+            )
+        if not isinstance(session_id, str) or str(UUID(session_id)) != session_id:
+            raise ValueError("new map requires a canonical session UUID")
+        self.versions._actor(actor)
+        config = map_package.seed_config(map_id, name, modes)
+        existing = self.session(session_id)
+        selection = {map_id: "work-" + session_id}
+        if existing is not None and (
+            existing["maps"] != [map_id] or existing["branches"] != selection
+        ):
+            raise ValueError("creation UUID is bound to another session")
+        recorded = self.versions.archive / "versions" / map_id
+        if recorded.is_symlink():
+            raise ValueError("map ID already exists")
+        if recorded.exists():
+            seeds = [
+                version
+                for version in self.versions.history(map_id)
+                if version["source"] == "created"
+                and version.get("sourceId") == session_id
+            ]
+            if len(seeds) != 1 or seeds[0]["author"] != actor:
+                raise ValueError("map ID already exists")
+            seed = self.versions.read(map_id, seeds[0]["versionDigest"])
+            if self.versions._config(seed["files"]) != config:
+                raise ValueError("creation UUID reused with different map properties")
+            return config, seeds[0]["versionDigest"]
+        if existing is not None:
+            raise ValueError("creation session refers to a missing map")
+        locations = [
+            self.templates / map_id,
+            self.versions.active / map_id,
+            self.versions.archive / "branches" / map_id,
+        ]
+        if (
+            any(path.exists() or path.is_symlink() for path in locations)
+            or map_id in self.map_ids()
+            or any(
+                (directory / f"{map_id}.json").exists()
+                or (directory / f"{map_id}.json").is_symlink()
+                for directory in (
+                    self.published,
+                    self.repo_maps,
+                    self.workshop_data / "blockfield/maps",
+                )
+                if directory is not None
+            )
+        ):
+            raise ValueError("map ID already exists")
+        target = self.versions.active / "drafts" / session_id
+        if (
+            target.is_symlink()
+            or target.exists()
+            and (not target.is_dir() or any(target.iterdir()))
+        ):
+            raise ValueError("creation requires a new isolated session UUID")
+        for directory in (self.versions.archive, self.versions.active):
+            while not directory.exists():
+                directory = directory.parent
+            if shutil.disk_usage(directory).free < SNAPSHOT_MARGIN:
+                raise OSError("not enough free space to create a map")
+        return config, None
+
+    def create_map(self, map_id, name, modes, session_id, actor):
+        config, version = self.check_create(map_id, name, modes, session_id, actor)
+        branch = "work-" + session_id
+        fresh = version is None
+        archive = self._session_path(session_id)
+        copy = self.versions.working_copy(map_id, session_id)
+        refs = self.versions.archive / "branches" / map_id
+        records = self.versions.archive / "versions" / map_id
+        try:
+            if archive.exists():
+                self.versions.branch(map_id, branch)
+                self.versions.validate_working_copy(map_id, session_id)
+            if fresh:
+                files = {
+                    "map.json": self.versions._put_blob(
+                        json.dumps(config, ensure_ascii=False, indent=2).encode()
+                    ),
+                    "world/region/r.0.0.mca": self.versions._put_blob(
+                        map_package.seed_region()
+                    ),
+                }
+                version = self.versions._record(
+                    map_id,
+                    files,
+                    parent=None,
+                    author=actor,
+                    created_at=int(self._now() * 1000),
+                    source="created",
+                    source_id=session_id,
+                    note="Create private map",
+                )
+            branch_path = self.versions._branch_path(map_id, branch)
+            if not branch_path.exists() and not branch_path.is_symlink():
+                self.versions.create_branch(map_id, branch, version, actor)
+            if not copy.exists() and not copy.is_symlink():
+                self.versions.checkout(map_id, version, session_id)
+            self.versions.validate_working_copy(map_id, session_id)
+            session = self.bind_session(session_id, [map_id], {map_id: branch}, actor)
+        except Exception:
+            # Only an unpublished first attempt is rolled back. A durable archive keeps its complete private work.
+            if fresh and not archive.exists():
+                for path in (copy, refs, records):
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path)
+                        _sync_directory(path.parent)
+            raise
+        return {
+            "mapId": map_id,
+            "versionDigest": version,
+            "branch": self.versions.branch(map_id, branch),
+            "session": session,
+        }
+
+    def copy_properties(self, map_id, working_copy_id):
+        config = self._map_json(map_id, working_copy_id)
+        return {"workingCopyId": working_copy_id, "name": config["name"]}
+
+    def _candidate_config(self, meta):
+        if meta.get("native"):
+            manifest = self.versions.read(
+                meta["mapId"], meta.get("mergeVersion") or meta["versionDigest"]
+            )
+            return self.versions._config(manifest["files"])
+        with zipfile.ZipFile(self.archive_path(meta["id"])) as archive:
+            entry = archive.getinfo("map.json")
+            if entry.file_size > 1 << 20:
+                raise ValueError("map config too large")
+            return map_package._json(archive.read(entry))
+
+    def validate_test(self, candidate_id, mode_id=None):
+        meta = next(
+            (
+                item
+                for item in self.list()
+                if item["id"] == candidate_id or item.get("sha256") == candidate_id
+            ),
+            None,
+        )
+        if meta is None:
+            raise ValueError("unknown candidate")
+        config = self._candidate_config(meta)
+        modes = map_package.supported_modes(config.get("supported_modes", []))
+        if mode_id is not None and mode_id not in modes:
+            raise ValueError("candidate does not support the selected mode")
+        map_package.validate_playable(config)
+        return modes
+
+    def rename(self, map_id, name, working_copy_id):
+        name = map_package.map_name(name)
+        self.versions.validate_working_copy(map_id, working_copy_id)
+        config = self._map_json(map_id, working_copy_id)
+        config["name"] = name
+        _atomic_json(
+            self.versions.working_copy(map_id, working_copy_id) / "map.json", config
+        )
+        return {"mapId": map_id, "workingCopyId": working_copy_id, "name": name}
+
     def check(self, map_id, working_copy_id=None) -> Path:
         """The draft of a map that can be snapshotted; raises before the controller stops anything."""
         if (zlib.ZLIB_VERSION, zlib.ZLIB_RUNTIME_VERSION) != ("1.3.2", "1.3.2"):
@@ -144,12 +312,13 @@ class MapStore:
                 expected_head=expected_branch_head,
             )
         world = self.check(map_id, working_copy_id)
-        base_version = self._base_version(map_id)
         if working_copy_id is not None:
             base_version = map_package._json((world / BASE_MARKER).read_bytes())[
                 "versionDigest"
             ]
             self.versions.read(map_id, base_version)
+        else:
+            base_version = self._base_version(map_id)
         self.candidates.mkdir(parents=True, exist_ok=True)
         # Exports run under the controller lock, so any temporary archive here was left by one that was killed.
         for stale in self.candidates.glob(".*.zip.tmp"):
@@ -159,6 +328,8 @@ class MapStore:
         note = str(note)[:200]
         with self.hold_saves():
             config = self._map_json(map_id, working_copy_id)
+            if review:
+                map_package.validate_playable(config)
             files = self.versions.world_files(
                 world, json.dumps(config, ensure_ascii=False, indent=2).encode()
             )
@@ -239,11 +410,12 @@ class MapStore:
         if branch == "main" or ref["versionDigest"] != expected_head:
             raise ValueError("stale review branch head")
         head = self.versions.head(map_id)
-        if head is None or head["versionDigest"] == expected_head:
+        if head is not None and head["versionDigest"] == expected_head:
             raise ValueError("commit changes on the branch before requesting review")
         if not isinstance(note, str) or len(note) > 200:
             raise ValueError("review message too long")
         manifest = self.versions.read(map_id, expected_head)
+        map_package.validate_playable(self.versions._config(manifest["files"]))
         for digest in manifest["files"].values():
             self.versions._verify_blob(digest)
         meta = {
@@ -260,7 +432,7 @@ class MapStore:
             "baseVersion": manifest["parent"],
             "workingCopyId": working_copy_id,
             "sourceBranch": branch,
-            "targetHead": head["versionDigest"],
+            "targetHead": head["versionDigest"] if head else None,
             "base": None,
             "regions": sum(
                 name.startswith("world/region/") for name in manifest["files"]
@@ -281,6 +453,33 @@ class MapStore:
         meta = self._pending(
             candidate_id, allow_accepted=expected_head is not ACCEPT_ONLY
         )
+        if meta.get("sourceBranch") and expected_head is ACCEPT_ONLY:
+            raise ValueError("branch publication requires an explicit expectedHead")
+        if resolutions is not None and not isinstance(resolutions, dict):
+            raise ValueError("merge conflict choices must be an object")
+        map_package.validate_playable(self._candidate_config(meta))
+        if meta.get("sourceBranch") and expected_head is None:
+            if force or resolutions:
+                raise ValueError(
+                    "initial publication does not accept force or conflict choices"
+                )
+            if meta.get("targetHead") is not None:
+                raise ValueError("review target changed; request a fresh review")
+            map_id, version = meta["mapId"], meta["versionDigest"]
+            self.versions.check_head(map_id, None)
+            self.versions.prepare(map_id, version)
+            meta.update(
+                status="accepted",
+                decidedBy=actor,
+                decidedAt=int(self._now() * 1000),
+                forced=False,
+                mergeVersion=version,
+                mergeTarget=None,
+                mergeResolutions={},
+            )
+            self._write_meta(meta)
+            self.activate(map_id, version, actor, None)
+            return meta
         if (
             expected_head is not ACCEPT_ONLY
             and expected_head is not None
@@ -814,6 +1013,9 @@ class MapStore:
             backups[map_id] = backups.get(map_id, 0) + 1
         candidates = self.list()
         for meta in candidates:
+            meta["supportedModes"] = map_package.supported_modes(
+                self._candidate_config(meta).get("supported_modes", [])
+            )
             meta["exportReady"] = bool(
                 meta.get("sha256")
                 and (self.packages / f"{meta['sha256']}.zip").is_file()
@@ -1357,7 +1559,8 @@ class MapVersions:
             "after": after,
             "files": changes,
             "config": self._json_changes(
-                self._config(old), self._config(new) if config is None else config
+                self._config(old) if "map.json" in old else {},
+                self._config(new) if config is None else config,
             ),
         }
 
@@ -1871,6 +2074,9 @@ class MapVersions:
             raise ValueError("map activation requires actor draslId and name")
         self.check_head(map_id, expected_head)
         bundle = self.prepare(map_id, version)
+        map_package.validate_playable(
+            map_package._json((bundle / "map.json").read_bytes())
+        )
         previous = self.head(map_id)
         head = {
             "schema": 1,

@@ -352,14 +352,32 @@ class StandTests(unittest.TestCase):
 
         def extract(candidate, destination):
             destination.mkdir()
-            (destination / "map-id").write_text("fields")
+            (destination / "map-id").write_text("new_arena")
             (destination / "map.json").write_text("{}")
             (destination / "world/region").mkdir(parents=True)
 
         self.backend.maps = mock.Mock()
         self.backend.maps.extract.side_effect = extract
         self.backend.stop(Process(self.goal, True))
-        self.backend.start(Goal("test", "r1", self.goal.session, "a" * 64))
+        selected = Goal("test", "r1", self.goal.session, "a" * 64, "awp")
+        self.backend.start(selected)
+        self.assertEqual(self.backend.selection("test")["modeId"], "awp")
+        self.ready("workshop")
+        observed = next(
+            process
+            for process in self.backend.observe()
+            if process.goal.profile == "test"
+        )
+        self.assertEqual(observed.goal, selected)
+        self.assertTrue(observed.ready)
+        launch = next(
+            call
+            for call in reversed(self.output.call_args_list)
+            if call.args[0][:2] == ["agent-process", "start"]
+        )
+        self.assertEqual(launch.kwargs["env"]["BLOCKFIELD_TEST_MAP_ID"], "new_arena")
+        self.assertNotIn("BF_MAP_ACTIVE_DIR", launch.kwargs["env"])
+        self.assertTrue((self.apps["workshop"] / "test-maps/new_arena/region").is_dir())
         self.assertTrue((self.apps["workshop"] / "test-world/seed-marker").exists())
         self.assertFalse((self.apps["workshop"] / "test-world/draft").exists())
         for app in self.apps:

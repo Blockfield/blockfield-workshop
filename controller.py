@@ -24,6 +24,8 @@ from typing import Callable, Protocol
 import unicodedata
 from uuid import UUID, uuid4
 
+import map_package
+
 
 @dataclass(frozen=True)
 class Goal:
@@ -31,10 +33,15 @@ class Goal:
     release: str
     session: str | None = None
     candidate: str | None = None
+    modeId: str | None = None
 
     def __post_init__(self):
         if self.profile not in {"game", "workshop", "test"}:
             raise ValueError("unknown profile")
+        if self.modeId is not None and (
+            self.profile != "test" or self.modeId not in map_package.SUPPORTED_MODES
+        ):
+            raise ValueError("test mode must be a supported game mode")
         if (
             not isinstance(self.release, str)
             or not self.release
@@ -327,6 +334,7 @@ class Controller:
             goal = Goal(**state["desired"])
         except (ValueError, TypeError, AttributeError) as error:
             raise ValueError("invalid operation intent") from error
+        state["desired"] = asdict(goal)
         if phase in {"game", "workshop", "test"} and phase != goal.profile:
             raise ValueError("stable phase does not match desired profile")
         # Additive fields: absent on a state.json written before this fix, so default rather than reject.
@@ -339,7 +347,7 @@ class Controller:
             raise ValueError("invalid state timing/error fields")
         if state["rollback"] is not None:
             try:
-                Goal(**state["rollback"])
+                state["rollback"] = asdict(Goal(**state["rollback"]))
             except (ValueError, TypeError, AttributeError) as error:
                 raise ValueError("invalid rollback goal") from error
         follow = state.get("releaseFollow")
@@ -1295,11 +1303,19 @@ class Controller:
             self.admin_dir / "candidates.json", self.maps.export(), keep=()
         )
         sessions = self.maps.sessions()
+        catalog = self.maps.catalog()
+        selected = self.session()
+        if selected and getattr(self.maps, "canonical_sessions", False) is True:
+            for entry in catalog:
+                if entry["mapId"] in (selected.get("maps") or []):
+                    entry["draft"] = self.maps.copy_properties(
+                        entry["mapId"], selected["id"]
+                    )
         self._replace_if_changed(
             self.admin_dir / "maps.json",
             {
                 "schema": 1,
-                "maps": self.maps.catalog(),
+                "maps": catalog,
                 "sessions": sessions["sessions"],
                 "sessionsTotal": sessions["total"],
                 "sessionsNext": sessions["next"],
@@ -1547,6 +1563,25 @@ class Controller:
 
     def _merge_preview(self, map_id, source, expected_head, resolutions=None) -> dict:
         self.maps.versions.check_head(map_id, expected_head)
+        if expected_head is None:
+            if resolutions is not None and not isinstance(resolutions, dict):
+                raise ValueError("merge conflict choices must be an object")
+            if resolutions:
+                raise ValueError("initial publication has no merge conflict choices")
+            manifest = self.maps.versions.read(map_id, source)
+            config = self.maps.versions._config(manifest["files"])
+            changes = self.maps.versions._compare_files(
+                map_id, None, source, {}, manifest["files"], config
+            )
+            return {
+                "mapId": map_id,
+                "baseVersion": None,
+                "sourceVersion": source,
+                "targetVersion": None,
+                "conflicts": [],
+                "unresolved": [],
+                "changes": changes,
+            }
         preview = self.maps.versions.merge_preview(
             map_id, source, expected_head, resolutions
         )
@@ -1563,8 +1598,142 @@ class Controller:
             )
         }
 
+    def _map_change(self, request_id, document):
+        if (
+            self.maps is None
+            or getattr(self.maps, "canonical_sessions", False) is not True
+        ):
+            raise ValueError("map authoring requires canonical storage")
+        with self._locked():
+            admitted = self._member_actor(document["actor"])
+            if admitted["role"] not in {"lead", "admin"}:
+                raise ValueError("map creation and properties require a lead or admin")
+            actor = {key: admitted[key] for key in ("draslId", "name")}
+            state, previous = self._read(), self.session()
+            creating = document["kind"] == "map-create"
+            map_id = document.get("mapId")
+            if (
+                creating
+                and state.get("operation") == request_id
+                and (state.get("desired") or {}).get("session")
+                == document.get("sessionId")
+            ):
+                return self.maps.create_map(
+                    map_id,
+                    document.get("name"),
+                    document.get("supportedModes"),
+                    document.get("sessionId"),
+                    actor,
+                )
+            revision = document.get("expectedRevision")
+            if type(revision) is not int or revision != state["revision"]:
+                raise ValueError("stale state revision")
+            if state["phase"] != "workshop" or previous is None:
+                raise ValueError("map authoring requires a stable workshop")
+            if creating:
+                self.maps.check_create(
+                    map_id,
+                    document.get("name"),
+                    document.get("supportedModes"),
+                    document.get("sessionId"),
+                    actor,
+                )
+            else:
+                map_package.map_name(document.get("name"))
+                if (
+                    document.get("workingCopyId") != previous["id"]
+                    or map_id not in previous["maps"]
+                ):
+                    raise ValueError(
+                        "properties require the exact selected working copy"
+                    )
+                self.maps.versions.validate_working_copy(map_id, previous["id"])
+            _, _, current = self._observe()
+            if (
+                current is None
+                or not current.ready
+                or asdict(current.goal) != state["desired"]
+            ):
+                raise RuntimeError(
+                    "map authoring backend does not match controller state"
+                )
+            self.backend.preflight(current.goal)
+            state.update(
+                revision=state["revision"] + 1,
+                phase="ERROR",
+                gate="closed",
+                operation=request_id,
+                error="MapAuthoringInterrupted",
+                errorMessage="map change did not finish; recover before reopening",
+                since=self._now_ms(),
+                rollback=asdict(current.goal),
+                rollbackSession=previous,
+                releaseFollow=None,
+            )
+            self._write(state)
+
+            def fail(error):
+                state.update(
+                    phase="ERROR",
+                    gate="closed",
+                    error=type(error).__name__,
+                    errorMessage=str(error),
+                )
+                self._write(state)
+
+            try:
+                self.backend.save_and_freeze(current)
+                self.backend.stop(current)
+                _, _, managed = self._observe()
+                if managed is not None:
+                    raise RuntimeError("workshop not confirmed stopped")
+            except Exception as error:
+                fail(error)
+                raise
+            goal, payload, copy_error = current.goal, None, None
+            try:
+                if creating:
+                    payload = self.maps.create_map(
+                        map_id,
+                        document.get("name"),
+                        document.get("supportedModes"),
+                        document.get("sessionId"),
+                        actor,
+                    )
+                    self._save_session(payload["session"])
+                    goal = Goal(
+                        "workshop", current.goal.release, payload["session"]["id"]
+                    )
+                else:
+                    payload = self.maps.rename(
+                        map_id, document.get("name"), previous["id"]
+                    )
+            except Exception as error:
+                copy_error = error
+                self._save_session(previous)
+            try:
+                state.update(
+                    desired=asdict(goal),
+                    phase="STARTING",
+                    gate="closed",
+                    error=None,
+                    errorMessage=None,
+                    since=self._now_ms(),
+                )
+                self._write(state)
+                self.backend.start(goal)
+                self.export_maps()
+            except Exception as error:
+                fail(error)
+                raise
+            if copy_error is not None:
+                raise copy_error
+            return payload
+
     def _apply(self, request_id: str, document: dict) -> int | dict | None:
         kind = document.get("kind")
+        if kind in {"map-create", "map-properties"}:
+            return self._map_change(request_id, document)
         if kind == "sessions":
             if self.maps is None:
                 raise ValueError("map publishing is not configured")
@@ -1734,6 +1903,8 @@ class Controller:
             raise ValueError("recover is only allowed toward game")
         if "sessionId" in document and profile != "workshop":
             raise ValueError("archived sessionId is only allowed toward workshop")
+        if "modeId" in document and profile != "test":
+            raise ValueError("modeId is only allowed for a candidate test")
         state, session = self.status(), None
         if state.get("operation") == request_id:
             goal = Goal(**state["desired"])
@@ -1754,11 +1925,15 @@ class Controller:
                     raise ValueError("a test starts only from the running workshop")
                 if self.maps is None:
                     raise ValueError("map publishing is not configured")
+                self.maps.validate_test(
+                    document.get("candidateId"), document.get("modeId")
+                )
                 goal = Goal(
                     "test",
                     release,
                     state["desired"]["session"],
                     self.maps.sha256_of(document.get("candidateId")),
+                    document.get("modeId"),
                 )
             else:
                 goal = Goal("game", release)

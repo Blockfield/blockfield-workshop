@@ -218,7 +218,11 @@ class StandBackend:
         ):
             raise ValueError("invalid stand profile file")
         goal = Goal(
-            data["profile"], data["release"], data.get("session"), data.get("candidate")
+            data["profile"],
+            data["release"],
+            data.get("session"),
+            data.get("candidate"),
+            data.get("modeId"),
         )
         if self.app_of(goal.profile) != app:
             if legacy:
@@ -309,6 +313,7 @@ class StandBackend:
                     selection["release"],
                     selection.get("session"),
                     selection.get("candidate") if profile == "test" else None,
+                    selection.get("modeId"),
                 )
                 expected = {
                     k: selection.get(k)
@@ -492,7 +497,8 @@ class StandBackend:
             mid = (cwd / "test-candidate/map-id").read_text().strip()
             if not re.fullmatch(r"[a-z0-9_]{1,32}", mid):
                 raise ValueError("invalid candidate map ID")
-            shutil.rmtree(cwd / "test-maps" / mid)
+            if (cwd / "test-maps" / mid).exists():
+                shutil.rmtree(cwd / "test-maps" / mid)
             shutil.copytree(cwd / "test-candidate/world", cwd / "test-maps" / mid)
             (cwd / "test-published/maps").mkdir(parents=True)
             shutil.copy2(
@@ -504,7 +510,9 @@ class StandBackend:
                 BLOCKFIELD_PUBLISHED_MAPS_DIR=str(cwd / "test-published/maps"),
                 BLOCKFIELD_SESSION_PURPOSE="test",
                 BLOCKFIELD_STATS_EXPORT_ENABLED="false",
+                BLOCKFIELD_TEST_MAP_ID=mid,
             )
+            env.pop("BF_MAP_ACTIVE_DIR", None)
             level = "test-world"
         elif goal.profile == "workshop":
             for n in ("test-world", "test-maps", "test-published", "test-candidate"):
@@ -529,6 +537,8 @@ class StandBackend:
         }
         if goal.candidate:
             document["candidate"] = goal.candidate
+        if goal.modeId is not None:
+            document["modeId"] = goal.modeId
         atomic_write(
             LOCK / app / "profile.json",
             json.dumps(document, sort_keys=True).encode(),
