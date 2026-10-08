@@ -45,6 +45,9 @@ elif argv[1:3] == ["service", "inspect"]:
         print(json.dumps(services[argv[3]].get("mode", {"Replicated": {"Replicas": services[argv[3]]["replicas"]}})))
     else:
         print(json.dumps(services[argv[3]].get("spec", {})))
+elif argv[1] == "ps" and len(argv) == 9:
+    key = argv[4].split("=", 2)[2] + "/" + argv[6].split("=", 2)[2]
+    print(state.get("compose", {}).get(key, ""))
 elif argv[1] == "ps":
     name = argv[4].split("=", 2)[2]
     cid = services[name]["container"]
@@ -480,6 +483,116 @@ class DockerBackendTests(unittest.TestCase):
         self.java(201, "")
         with self.assertRaises(RuntimeError):
             self.backend.observe()
+
+    def dev_backend(self, project="blockfield-dev-356rnn", service="game"):
+        return DockerBackend(
+            self.backend.apps, self.lock, proc=self.proc, dev_compose=(project, service)
+        )
+
+    def test_configured_dev_compose_java_is_observed_but_never_managed(self):
+        self.running("game")
+        self.ready("game", generation=None, session=None, release="v1")
+        self.load()
+        self.state["compose"] = {"blockfield-dev-356rnn/game": OTHER_CID}
+        self.save()
+        self.java(300, OTHER_CID)
+        backend = self.dev_backend()
+        inventory = backend.inventory()
+        self.assertEqual((inventory["dev"], inventory["unknown"]), (1, 0))
+        self.assertEqual(backend.observe(), [Process(Goal("game", "v1"), True)])
+        query = [
+            "docker",
+            "ps",
+            "--no-trunc",
+            "--filter",
+            "label=com.docker.compose.project=blockfield-dev-356rnn",
+            "--filter",
+            "label=com.docker.compose.service=game",
+            "--format",
+            "{{.ID}}",
+        ]
+        self.assertIn(query, self.calls())
+        self.assertFalse(
+            [c for c in self.calls() if {"scale", "update", "exec"} & set(c)]
+        )
+        self.assertFalse(self.backend.allowed(query))
+        self.assertFalse(backend.allowed(query[:4] + query[6:]))
+        self.assertFalse(
+            backend.allowed(query[:3] + query[5:7] + query[3:5] + query[7:])
+        )
+        for project, service in (
+            ("blockfield-dev-other", "game"),
+            ("blockfield-dev-356rnn", "proxy"),
+        ):
+            with (
+                self.subTest(project=project, service=service),
+                self.assertRaises(RuntimeError),
+            ):
+                self.dev_backend(project, service).observe()
+        with self.assertRaises(RuntimeError):
+            self.backend.observe()
+        self.java(301, "")
+        with self.assertRaises(RuntimeError):
+            backend.observe()
+
+    def test_dev_start_during_java_snapshot_does_not_close_production(self):
+        self.running("game")
+        backend = self.dev_backend()
+        java_pids = backend.java_pids
+
+        def dev_starts():
+            self.load()
+            self.state["compose"] = {"blockfield-dev-356rnn/game": OTHER_CID}
+            self.save()
+            self.java(300, OTHER_CID)
+            return java_pids()
+
+        with mock.patch.object(backend, "java_pids", side_effect=dev_starts):
+            inventory = backend.inventory()
+        self.assertEqual((inventory["dev"], inventory["unknown"]), (1, 0))
+
+    def test_dev_compose_ambiguity_fails_closed(self):
+        self.running("game")
+        self.java(300, OTHER_CID)
+        backend = self.dev_backend()
+        for listed, error in (
+            (OTHER_CID + "\n" + "d" * 64, "several dev"),
+            (OTHER_CID + "\nshort", "invalid container ID"),
+        ):
+            self.load()
+            self.state["compose"] = {"blockfield-dev-356rnn/game": listed}
+            self.save()
+            with self.subTest(listed=listed), self.assertRaisesRegex(Exception, error):
+                backend.observe()
+        self.load()
+        self.state["compose"] = {"blockfield-dev-356rnn/game": OTHER_CID}
+        self.save()
+        self.java(301, OTHER_CID)
+        self.assertEqual(backend.inventory()["unknown"], 2)
+        with self.assertRaisesRegex(RuntimeError, "outside the configured apps"):
+            backend.observe()
+
+    def test_dev_compose_env_must_be_a_valid_pair(self):
+        base = {"BF_GAME_SERVICE": "bf-game", "BF_WORKSHOP_SERVICE": "bf-workshop"}
+        self.assertIsNone(DockerBackend.from_env(base).dev_compose)
+        pair = {
+            "BF_DEV_COMPOSE_PROJECT": "blockfield-dev-356rnn",
+            "BF_DEV_COMPOSE_SERVICE": "game",
+        }
+        self.assertEqual(
+            DockerBackend.from_env(base | pair).dev_compose,
+            ("blockfield-dev-356rnn", "game"),
+        )
+        for bad in (
+            {"BF_DEV_COMPOSE_PROJECT": "blockfield-dev-356rnn"},
+            {"BF_DEV_COMPOSE_SERVICE": "game"},
+            pair | {"BF_DEV_COMPOSE_PROJECT": "Blockfield"},
+            pair | {"BF_DEV_COMPOSE_PROJECT": "dev,label=x"},
+            pair | {"BF_DEV_COMPOSE_SERVICE": "game=x"},
+            pair | {"BF_DEV_COMPOSE_SERVICE": "*"},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                DockerBackend.from_env(base | bad)
 
     def test_game_pending_task_is_observed_independently(self):
         (self.lock / "profile.json").write_text(

@@ -36,6 +36,11 @@ IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 GAME_REPOSITORY = "ghcr.io/blockfield/blockfield-server"
 GAME_DIGEST = re.compile(re.escape(GAME_REPOSITORY) + r"@sha256:[0-9a-f]{64}")
 LABEL = "label=com.docker.swarm.service.name="
+COMPOSE_PROJECT = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+COMPOSE_LABELS = (
+    "label=com.docker.compose.project=",
+    "label=com.docker.compose.service=",
+)
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,7 @@ class DockerBackend:
         proxy_service: str | None = None,
         map_active_readonly_dir: Path | str | None = None,
         admin_readonly_dir: Path | str | None = None,
+        dev_compose: tuple[str, str] | None = None,
     ):
         if set(apps) != {"game", "workshop"} or not all(
             SERVICE.fullmatch(a.service) for a in apps.values()
@@ -115,6 +121,16 @@ class DockerBackend:
         ):
             raise ValueError("separate configured proxy service required")
         self.proxy_service = proxy_service
+        # One task-authorized Compose dev Game that may run beside production: observed, never managed.
+        if dev_compose is not None and (
+            not isinstance(dev_compose, tuple)
+            or len(dev_compose) != 2
+            or not all(isinstance(value, str) for value in dev_compose)
+            or not COMPOSE_PROJECT.fullmatch(dev_compose[0])
+            or not SERVICE.fullmatch(dev_compose[1])
+        ):
+            raise ValueError("valid dev Compose project and service pair required")
+        self.dev_compose = dev_compose
         self.map_active_readonly_dir = (
             Path(map_active_readonly_dir)
             if map_active_readonly_dir is not None
@@ -133,6 +149,8 @@ class DockerBackend:
 
     @classmethod
     def from_env(cls, env=os.environ) -> "DockerBackend":
+        dev_project = env.get("BF_DEV_COMPOSE_PROJECT", "")
+        dev_service = env.get("BF_DEV_COMPOSE_SERVICE", "")
         return cls(
             {
                 "game": App(
@@ -158,6 +176,9 @@ class DockerBackend:
                 if env.get("BF_ADMIN_READONLY_DIR")
                 else None
             ),
+            dev_compose=(dev_project, dev_service)
+            if dev_project or dev_service
+            else None,
         )
 
     # ------------------------------------------------------------------ commands
@@ -221,6 +242,21 @@ class DockerBackend:
             ]:
                 return (
                     label.startswith(LABEL) and label[len(LABEL) :] in observed_services
+                )
+            case [
+                "docker",
+                "ps",
+                "--no-trunc",
+                "--filter",
+                project,
+                "--filter",
+                service,
+                "--format",
+                "{{.ID}}",
+            ]:
+                return self.dev_compose is not None and (project, service) == tuple(
+                    label + value
+                    for label, value in zip(COMPOSE_LABELS, self.dev_compose)
                 )
             case ["docker", "inspect", "--format", "{{.Image}}", container]:
                 return bool(CONTAINER.fullmatch(container))
@@ -370,6 +406,29 @@ class DockerBackend:
             raise ValueError("invalid container ID in backend inventory")
         return containers
 
+    def dev_containers(self) -> set[str]:
+        if self.dev_compose is None:
+            return set()
+        out = self.run(
+            [
+                "docker",
+                "ps",
+                "--no-trunc",
+                "--filter",
+                COMPOSE_LABELS[0] + self.dev_compose[0],
+                "--filter",
+                COMPOSE_LABELS[1] + self.dev_compose[1],
+                "--format",
+                "{{.ID}}",
+            ]
+        )
+        containers = out.split()
+        if any(not CONTAINER.fullmatch(line) for line in containers):
+            raise ValueError("invalid container ID in dev inventory")
+        if len(containers) > 1:
+            raise RuntimeError("several dev Compose containers")
+        return set(containers)
+
     def tasks(self, profile: str) -> int:
         out = self.run(
             [
@@ -411,16 +470,24 @@ class DockerBackend:
             profile: {"tasks": self.tasks(profile) if tasks else None, "java": 0}
             for profile in self.apps
         }
-        result["unknown"] = 0
-        for pid in self.java_pids():
+        pids = self.java_pids()
+        # Snapshot Java first: a dev container starting during inventory must already be visible to Docker.
+        dev = self.dev_containers()
+        result["unknown"] = result["dev"] = 0
+        for pid in pids:
             container = self.container_of(pid)
             if container is None:
                 continue  # exited between pgrep and /proc read
             profile = owners.get(container)
-            if profile is None:
-                result["unknown"] += 1
-            else:
+            if profile is not None:
                 result[profile]["java"] += 1
+            elif container in dev:
+                result["dev"] += 1
+            else:
+                result["unknown"] += 1
+        if result["dev"] > 1:
+            result["unknown"] += result["dev"]
+            result["dev"] = 0
         return result
 
     def selection(self, profile: str = "workshop") -> dict | None:

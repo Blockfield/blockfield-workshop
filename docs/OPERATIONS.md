@@ -97,6 +97,19 @@ The Docker adapter's command allowlist permits only the configured Workshop serv
 Workshop save/export RCON commands, plus read-only service/container/process observations of Game and Workshop.
 Game drain, scale, restart and RCON mutation are outside the controller contract.
 
+A task-authorized Compose dev Game on the same host is otherwise an unknown full-backend Java and closes both gates.
+To tolerate exactly one, set both in `/etc/blockfield/workshop.env` (only one, or an invalid label value, fails startup):
+
+```sh
+BF_DEV_COMPOSE_PROJECT=blockfield-dev-356rnn   # com.docker.compose.project, [a-z0-9][a-z0-9_-]*
+BF_DEV_COMPOSE_SERVICE=game                    # com.docker.compose.service
+```
+
+The adapter then runs one read-only `docker ps --no-trunc` filtered by both labels. A Java counts as dev only when
+its cgroup container is that single returned container ID and it is the only such Java. Several or malformed dev
+containers, a second dev Java, other Compose projects/services and host Java still fail closed. The dev Game is
+never exported, gated, saved, scaled or stopped. Remove both variables when the dev stand is gone.
+
 ## Site admin inbox
 
 `workshopctl step` (the timer) first applies up to 20 inbox requests, oldest `createdAt` first, then reconciles.
