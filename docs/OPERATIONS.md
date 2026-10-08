@@ -35,7 +35,7 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 | File (host path)                                    | Writer                       | Reader                         | Content                                                                                                                                   |
 | --------------------------------------------------- | ---------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `/srv/minecraft/backend-lock/game/profile.json`     | deploy/operator (optional)   | server guard, mod, controller  | Game profile/release/generation selection; absent permits verified legacy adoption                                                        |
-| `/srv/minecraft/backend-lock/workshop/profile.json` | controller `start()`         | server guard, mod              | `{schema:1,profile,generation,session,release,candidate?}`; test uses the Workshop app                                                    |
+| `/srv/minecraft/backend-lock/workshop/profile.json` | controller `start()`         | server guard, mod              | `{schema:1,profile,generation,session,release,candidate?,modeId?}`; test uses the Workshop app                                            |
 | `<data>/.blockfield-ready.json`                     | mod on SERVER_STARTED        | controller                     | `{profile,generation,session,release}`; deleted before every start and during stop                                                        |
 | `/srv/minecraft/workshop/gate/gate.json`            | controller                   | proxy (`BLOCKFIELD_GATE_FILE`) | Schema1 legacy top fields describe Game; `backends.game` and `backends.workshop` each carry `{gate,message,allowed}`                      |
 | `/srv/minecraft/workshop/public/public.json`        | controller                   | public site                    | `{mode,message,since,workshop:{mode,message}}`; top mode reflects actual Game readiness                                                   |
@@ -120,7 +120,7 @@ ref, immutable commit/review, comparison or merge preview. Non-map control envel
   send `session:resume,sessionId:<UUID>` without `maps` or `branches`; missing/corrupt copies are refused before
   switching. Session activation retains the site's moderator/admin policy. The host CLI also loads an archived
   selection when `request workshop --session <UUID>` names an existing session.
-  Toward test: `candidateId`, only from phase `workshop` (see Playtest).
+  Toward test: `candidateId`, optional `modeId`, only from phase `workshop` (see Playtest).
 - `members` `{members:[{draslId,name,role,maps?}]}`: full ACL replacement (the site is the source of truth; `workshopctl members`
   is the owner fallback); a list without an `admin` is refused. `maps` is an optional array of IDs from the runtime map
   catalog, plus `hub` for building in the workshop hub; missing means all maps and the hub, unknown ids are rejected,
@@ -197,6 +197,28 @@ merely because observe() temporarily reports no process during an uncertain star
 
 Controller inbox contract (the same authenticated site/admin envelope and controller lock):
 
+- `map-create {mapId,name,supportedModes,sessionId,expectedRevision}` requires an authenticated `lead` or `admin`,
+  the current revision and a stable ready editor. IDs are 1–32 lowercase ASCII letters/digits/underscores, beginning
+  with a letter or digit; `hub`, `lobby` and `limbo` are reserved. Names are trimmed, 1–100 characters without Cc
+  controls or `§`. Select a distinct nonempty subset of `campaign`, `room`, `tdm`, `snipers`, `awp`, `deathmatch`,
+  `training`. The authenticated site generates a fresh canonical UUID. The controller saves/stops only Workshop,
+  creates a private root commit and `work-<UUID>` branch, binds an isolated session, then starts its editor.
+  The 1.21.1 Anvil seed is a void chunk with a 16×16 stone platform at Y64 and deliberately incomplete mode markup.
+  No template, active head or published overlay is installed. Payload is `{mapId,versionDigest,branch,session}`.
+  Failed creation restarts the previous editor when stopping was proven safe; uncertain saves/stops stay closed.
+  The old session and its dirty copies remain archived. A same-UUID retry preserves existing work; a different
+  selection/name/mode request cannot reuse that UUID. Disk/copy failures cannot archive an incomplete session.
+- `map-properties {mapId,name,workingCopyId,expectedRevision}` uses the same lead/admin and stable-editor policy.
+  It requires the exact selected copy and map, saves/stops only Workshop, atomically updates only that copy's name,
+  then restarts the same editor. Payload is `{mapId,name,workingCopyId}`. Catalog entries expose the selected name
+  separately as `draft:{workingCopyId,name}`; `mapJson` retains the immutable active/history configuration.
+- Editable drafts may remain incomplete. Review, playtest, publication and activation validate every explicitly
+  selected mode against the game readers: both effective team spawns; capture points/zones for campaign/room;
+  at least two unique in-bounds deathmatch spawns; and training spawn, 1–32 unique targets, valid armor/strafe,
+  at most 64 forced chunks and optional in-bounds zones. Optional team lobbies use the game's shared fallback.
+  Private first review freezes `targetHead:null`; its merge preview compares the committed tree with an empty
+  tree (`baseVersion:null,targetVersion:null`). Initial publication requires explicit `expectedHead:null`, refuses
+  force/conflict choices and fails if another head appeared. Activation failures can retry against that same absent head.
 - `sessions {offset, limit?}` reads archived session pages for an authenticated Workshop member. Default page size is
   100; `offset` is a nonnegative integer and `limit` is 1–100. Its payload is `{sessions,total,next}`. DTOs contain
   `{schema:1,id,maps,branches,startedAt,startedBy,selectionDigest}`; the digest binds the immutable ID/maps/branches.
@@ -226,7 +248,8 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   main has nothing to review. Later branch commits do not change reviewed bytes or stop continued editing. An omitted
   branch keeps the legacy snapshot contract.
 - `publish {candidateId, expectedHead, resolutions?, force?}` accepts and activates. `expectedHead` is the current version digest,
-  or explicit `null` if no head exists. Missing `expectedHead` preserves legacy acceptance-only behaviour.
+  or explicit `null` if no head exists. Missing `expectedHead` preserves branchless legacy acceptance-only behaviour;
+  branch-aware reviews require the explicit field.
   Stale heads, stale bases, corrupt blobs and insufficient staging space fail before head mutation.
   Acceptance and activation are distinct: if the final head write fails after acceptance, the accepted candidate
   can be retried with the same explicit expectedHead.
@@ -422,11 +445,17 @@ overwritten by the next game start: change maps through a new `world-seed-vN` or
 ## Playtest (profile test)
 
 A closed test match of one candidate, in the **workshop app** (same data volume, while Game continues running): the site sends
-`mode` `{profile: test, candidateId}` from phase `workshop`; the controller saves and stops the workshop, unpacks the
+`mode` `{profile: test, candidateId,modeId?,expectedRevision}` from phase `workshop`; the site supplies the selected
+mode from the frozen candidate's exported `supportedModes`. An explicit mode must be one of the seven supported
+values and included in that immutable candidate; all selected layouts must be complete. Invalid selections fail
+before stopping the editor. Older requests without modeId preserve legacy test routing. The controller saves and stops the workshop, unpacks the
 candidate into `<workshop data>/test-candidate` and starts the app with `workshop/profile.json` `profile:test`.
 `start-container.sh` then runs the game profile on a fresh copy: level `test-world` from the lobby seed, all templates
 of the image's release plus the candidate's world in `/data/test-maps`, its JSON as the published overlay, `BLOCKFIELD_STATS_EXPORT_ENABLED=false`,
-`BLOCKFIELD_SESSION_PURPOSE=test`. The gate is `testers` (the workshop members, backend workshop). Returning with
+`BLOCKFIELD_SESSION_PURPOSE=test` and `BLOCKFIELD_TEST_MAP_ID=<candidate map>`. Disposable TEST unsets `BF_MAP_ACTIVE_DIR`
+so the canonical active-map reader cannot override the frozen candidate overlay. Selection metadata carries the
+chosen `modeId`; generation/session/release readiness still has exactly four keys. Six room modes route the pinned
+candidate into a test room; training uses its isolated firing range. The gate is `testers` (the workshop members, backend workshop). Returning with
 `mode workshop` (`session: resume`) deletes the copy on start: nothing of a test reaches the drafts or the statistics.
 
 ## Workshop image and releases

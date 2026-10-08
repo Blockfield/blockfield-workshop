@@ -368,6 +368,7 @@ class InboxTests(unittest.TestCase):
                     "release": "v1",
                     "session": self.controller.session()["id"],
                     "candidate": None,
+                    "modeId": None,
                 },
                 "message": DEFAULT_MESSAGE,
                 "game": {"phase": "game", "gate": "public", "release": "v1"},

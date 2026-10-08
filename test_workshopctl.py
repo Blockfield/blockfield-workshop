@@ -117,6 +117,7 @@ class WorkshopctlTests(unittest.TestCase):
                 "release": "v1",
                 "session": session,
                 "candidate": None,
+                "modeId": None,
             },
         )
         self.assertEqual(self.ctl("step")[1]["phase"], "STARTING")

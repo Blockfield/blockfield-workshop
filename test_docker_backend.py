@@ -64,6 +64,35 @@ state_path.write_text(json.dumps(state))
 
 
 class DockerBackendTests(unittest.TestCase):
+    def test_explicit_playtest_mode_survives_selection_and_four_key_readiness(self):
+        session = str(uuid4())
+        sha = "ab" * 32
+        self.running("game")
+        self.ready("game", generation=None, session=None, release="v1")
+        self.backend.maps = mock.Mock(extract=lambda digest, target: "zero_map")
+        goal = Goal("test", "v1", session, sha, "training")
+        self.backend.start(goal)
+        selected = self.backend.selection()
+        self.assertEqual(selected["modeId"], "training")
+        self.backend.maps.validate_test.assert_called_with(sha, "training")
+        self.ready(
+            "workshop", generation=selected["generation"], session=session, release="v1"
+        )
+        ready = self.data["workshop"] / READY_FILE
+        document = json.loads(ready.read_bytes()) | {"profile": "test"}
+        ready.write_text(json.dumps(document))
+        self.assertEqual(set(document), {"profile", "generation", "session", "release"})
+        self.assertEqual(
+            self.backend.observe(),
+            [Process(Goal("game", "v1"), True), Process(goal, True)],
+        )
+        path = self.lock / "workshop/profile.json"
+        path.write_text(json.dumps(selected | {"modeId": "unknown"}))
+        observed = self.backend.observe()
+        self.assertTrue(observed[0].ready)
+        self.assertFalse(observed[1].ready)
+        self.assertEqual(observed[1].goal.release, "unknown")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

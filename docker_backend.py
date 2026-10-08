@@ -19,6 +19,7 @@ import time
 from uuid import UUID, uuid4
 
 from controller import Goal, Process, atomic_write
+import map_package
 
 # itzg runs `java ... -jar ./fabric-server-mc.1.21.1-loader.X-launcher.Y.jar`.
 JAVA_PATTERN = r"fabric-server-mc\..*-launcher\..*\.jar"
@@ -379,6 +380,11 @@ class DockerBackend:
             if legacy:
                 return None
             raise ValueError("profile.json belongs to another backend")
+        if data.get("modeId") is not None and (
+            data["profile"] != "test"
+            or data["modeId"] not in map_package.SUPPORTED_MODES
+        ):
+            raise ValueError("invalid selected test mode")
         return data
 
     def readiness(self, profile: str) -> dict | None:
@@ -419,13 +425,14 @@ class DockerBackend:
         return data
 
     @staticmethod
-    def _goal(profile: str, release, session, candidate=None) -> Goal:
+    def _goal(profile: str, release, session, candidate=None, mode_id=None) -> Goal:
         try:
             return Goal(
                 profile,
                 release,
                 None if profile == "game" else session,
                 candidate if profile == "test" else None,
+                mode_id if profile == "test" else None,
             )
         except (ValueError, TypeError):
             if profile == "test":
@@ -544,6 +551,8 @@ class DockerBackend:
             raise ValueError(f"profile {goal.profile} has no app in this stage")
         if goal.profile == "test" and self.maps is None:
             raise ValueError("test needs the map candidates store")
+        if goal.profile == "test" and hasattr(self.maps, "validate_test"):
+            self.maps.validate_test(goal.candidate, goal.modeId)
         if goal.profile == "test" and not any(
             process.goal.profile == "game"
             and process.ready
@@ -597,6 +606,7 @@ class DockerBackend:
                     selection["release"],
                     selection.get("session"),
                     selection.get("candidate"),
+                    selection.get("modeId"),
                 )
                 expected = {
                     key: selection.get(key)
@@ -760,6 +770,8 @@ class DockerBackend:
         }
         if goal.candidate:
             document["candidate"] = goal.candidate
+        if goal.modeId is not None:
+            document["modeId"] = goal.modeId
         selected_dir = self.lock_dir / self.app_of(goal.profile)
         selected_dir.mkdir(exist_ok=True)
         atomic_write(
