@@ -10,7 +10,13 @@ from pathlib import Path
 from unittest import mock
 from uuid import uuid4
 from controller import Controller, Goal, Process
-from docker_backend import App, DockerBackend, JAVA_PATTERN, READY_FILE
+from docker_backend import (
+    App,
+    DockerBackend,
+    JAVA_PATTERN,
+    READY_FILE,
+    _check_readonly_view,
+)
 
 GAME_CID, WORKSHOP_CID, OTHER_CID = "a" * 64, "b" * 64, "c" * 64
 GAME_IMAGE = "ghcr.io/blockfield/blockfield-server:latest@sha256:" + "d" * 64
@@ -729,6 +735,174 @@ class DockerBackendTests(unittest.TestCase):
         self.assertEqual(
             calls.count(["docker", "service", "scale", "--detach", "bf-workshop=0"]), 2
         )
+
+    def _setup_workshop_fixture(self, active_ro=None, admin_ro=None):
+        from candidates import MapStore
+
+        root = Path(self.temp.name)
+        active, admin = root / "active", root / "admin"
+        active.mkdir(parents=True, exist_ok=True)
+        admin.mkdir(parents=True, exist_ok=True)
+        self.backend.maps = MapStore(
+            self.data["workshop"],
+            root / "templates",
+            root / "published",
+            root / "archive/candidates",
+            root / "archive/backups",
+            archive_root=root / "archive",
+            active_root=active,
+        )
+        self.backend.admin_dir = admin
+        self.backend.map_active_readonly_dir = active_ro
+        self.backend.admin_readonly_dir = admin_ro
+        spec = {
+            "Env": [
+                "BLOCKFIELD_PROFILE=workshop",
+                "BF_MAP_ACTIVE_DIR=/maps-active",
+                "BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts",
+            ],
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Source": str(active_ro or active),
+                    "Target": "/maps-active",
+                    "ReadOnly": False if active_ro else True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(active / "drafts"),
+                    "Target": "/maps-active/drafts",
+                    "ReadOnly": False,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(admin_ro or admin),
+                    "Target": "/workshop-admin",
+                    "ReadOnly": False if admin_ro else True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(self.lock),
+                    "Target": "/backend-lock",
+                    "ReadOnly": False,
+                },
+            ],
+        }
+        self.state["services"]["bf-workshop"]["spec"] = spec
+        self.save()
+        return active, admin
+
+    def test_check_readonly_view_core_validation(self):
+        root = Path(self.temp.name)
+        source = root / "canonical"
+        view = root / "view"
+        source.mkdir(parents=True, exist_ok=True)
+        view.mkdir(parents=True, exist_ok=True)
+        stat_ro = mock.Mock(f_flag=os.ST_RDONLY)
+
+        with (
+            mock.patch("os.path.samefile", return_value=True),
+            mock.patch("os.statvfs", return_value=stat_ro),
+        ):
+            _check_readonly_view(source, view)
+
+        sym_parent = root / "sym_dir"
+        sym_parent.symlink_to(root)
+        (root / "sym_target").symlink_to(source)
+        cases = [
+            ("target symlink", root / "sym_target", view, True, stat_ro),
+            ("ancestor symlink", source, sym_parent / "view", True, stat_ro),
+            ("RW kernel", source, view, True, mock.Mock(f_flag=0)),
+            ("different inode", source, view, False, stat_ro),
+            ("same path", source, source, True, stat_ro),
+            ("relative path", Path("relative/source"), view, True, stat_ro),
+            ("path with ..", root / "foo/../canonical", view, True, stat_ro),
+            ("root directory", Path("/"), view, True, stat_ro),
+        ]
+        for desc, src, vw, same, st in cases:
+            with (
+                self.subTest(case=desc),
+                mock.patch("os.path.samefile", return_value=same),
+                mock.patch("os.statvfs", return_value=st),
+            ):
+                with self.assertRaises(ValueError):
+                    _check_readonly_view(src, vw)
+
+    def test_readonly_views_from_env_defaults(self):
+        base_env = {"BF_GAME_SERVICE": "bf-game", "BF_WORKSHOP_SERVICE": "bf-workshop"}
+        unconf = DockerBackend.from_env(base_env)
+        self.assertIsNone(unconf.map_active_readonly_dir)
+        self.assertIsNone(unconf.admin_readonly_dir)
+
+        conf = DockerBackend.from_env(
+            {
+                **base_env,
+                "BF_MAP_ACTIVE_READONLY_DIR": "/views/maps",
+                "BF_ADMIN_READONLY_DIR": "/views/admin",
+            }
+        )
+        self.assertEqual(conf.map_active_readonly_dir, Path("/views/maps"))
+        self.assertEqual(conf.admin_readonly_dir, Path("/views/admin"))
+
+    def test_workshop_mounts_adapter_wiring(self):
+        root = Path(self.temp.name)
+        v_active, v_admin = root / "views/maps-active", root / "views/admin"
+        v_active.mkdir(parents=True, exist_ok=True)
+        v_admin.mkdir(parents=True, exist_ok=True)
+        goal = Goal("workshop", "v1", str(uuid4()))
+        fake_stat = mock.Mock(
+            f_flag=os.ST_RDONLY,
+            f_bavail=10**8,
+            f_frsize=4096,
+            f_blocks=10**8,
+            f_bfree=10**8,
+            f_bsize=4096,
+        )
+
+        # Positive preflight: Dokploy generated mounts accepted with configured readonly views
+        self._setup_workshop_fixture(active_ro=v_active, admin_ro=v_admin)
+        with (
+            mock.patch("os.path.samefile", return_value=True),
+            mock.patch("os.statvfs", return_value=fake_stat),
+        ):
+            self.backend.preflight(goal)
+
+        spec = self.state["services"]["bf-workshop"]["spec"]
+
+        def run_preflight_expect_err():
+            self.save()
+            with (
+                mock.patch("os.path.samefile", return_value=True),
+                mock.patch("os.statvfs", return_value=fake_stat),
+            ):
+                with self.assertRaisesRegex(ValueError, "mount"):
+                    self.backend.preflight(goal)
+
+        # 1. Unconfigured view rejects ReadOnly: False on active mount
+        self._setup_workshop_fixture()
+        spec = self.state["services"]["bf-workshop"]["spec"]
+        spec["Mounts"][0]["ReadOnly"] = False
+        run_preflight_expect_err()
+
+        # 2. Configured view rejects original source when spec has ReadOnly: False
+        self.backend.map_active_readonly_dir = v_active
+        run_preflight_expect_err()
+
+        # 3. Configured view rejects spec with wrong path
+        spec["Mounts"][0]["Source"] = str(root / "wrong")
+        run_preflight_expect_err()
+
+        # 4. Exact drafts RW: ReadOnly=True rejected
+        self._setup_workshop_fixture(active_ro=v_active, admin_ro=v_admin)
+        spec = self.state["services"]["bf-workshop"]["spec"]
+        spec["Mounts"][1]["ReadOnly"] = True
+        run_preflight_expect_err()
+
+        # 5. Exact lock RW: ReadOnly=True rejected
+        self._setup_workshop_fixture(active_ro=v_active, admin_ro=v_admin)
+        spec = self.state["services"]["bf-workshop"]["spec"]
+        spec["Mounts"][3]["ReadOnly"] = True
+        run_preflight_expect_err()
 
 
 if __name__ == "__main__":

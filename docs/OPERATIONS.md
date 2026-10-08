@@ -313,6 +313,45 @@ The adapter inspects the Swarm service specification read-only and rejects missi
 storage, archive mounts or additional mounts shadowing active bundles. Configured host/container paths may differ from
 these defaults, but they must identify the same physical storage. It never repairs Dokploy settings by itself.
 
+#### Dokploy read-only views
+
+Production Dokploy Swarm Mounts cannot store the `ReadOnly` field (omitted or `false` in generated container specifications). Ordinary bind mounts created by Moby/runc do not add `rw` if the host source filesystem is already mounted read-only, preserving read-only host mount source flags across Dokploy service updates and redeployments.
+
+To ensure Minecraft cannot write to catalog or active maps under Dokploy, the host operator creates durable read-only bind mirror directories pointing to the canonical locations:
+
+```sh
+# Host operator setup: create durable read-only bind mirrors
+mkdir -p /srv/minecraft/views/maps-active /srv/minecraft/views/workshop-admin
+mount --bind -o ro /srv/minecraft/maps-active /srv/minecraft/views/maps-active
+mount --bind -o ro /srv/minecraft/workshop/admin /srv/minecraft/views/workshop-admin
+```
+
+The mirror mounts must use `bind,ro` (**non-recursive** `bind`, never `rbind`) to guarantee no read-write submounts are exposed under the view. The container cannot write catalog or maps.
+
+Configure `/etc/blockfield/workshop.env`:
+
+```sh
+BF_MAP_ACTIVE_READONLY_DIR=/srv/minecraft/views/maps-active
+BF_ADMIN_READONLY_DIR=/srv/minecraft/views/workshop-admin
+```
+
+In Dokploy, configure the workshop service bind mounts:
+
+- `/srv/minecraft/views/maps-active` -> `/maps-active`
+- `/srv/minecraft/maps-active/drafts` -> `/maps-active/drafts` (read-write, exact original source)
+- `/srv/minecraft/views/workshop-admin` -> `/workshop-admin`
+- `/srv/minecraft/backend-lock` -> `/backend-lock` (read-write, exact original source)
+
+The controller adapter verifies:
+
+1. Mount source exactly matches the configured view path;
+2. Paths are absolute, normalized, without `..`, and not `/`;
+3. No symlinks exist in any source or view path or ancestor directory;
+4. The view identifies the identical underlying directory and inode as canonical storage via `os.path.samefile`;
+5. The view filesystem flag `os.statvfs(view).f_flag & os.ST_RDONLY` is non-zero (mounted read-only).
+
+Drafts and lock mounts remain strictly exact original sources and read-write. When the view variables are absent or unconfigured, the adapter enforces the standard exact-source `ReadOnly: true` requirement.
+
 ### Offline initial imports (unreleased)
 
 With both full backend services at zero replicas and no backend Java, import an existing Anvil template and its explicit
