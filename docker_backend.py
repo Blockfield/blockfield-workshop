@@ -41,6 +41,50 @@ class App:
     data: Path
 
 
+def _has_symlink(path: Path) -> bool:
+    curr = path
+    while True:
+        if curr.is_symlink():
+            return True
+        if curr.parent == curr:
+            break
+        curr = curr.parent
+    return False
+
+
+def _check_readonly_view(source: Path, view: Path) -> None:
+    source_str = str(source)
+    view_str = str(view)
+    if source_str == view_str:
+        raise ValueError(
+            "canonical workshop readonly view mount must be a separate path"
+        )
+    for p, s in ((source, source_str), (view, view_str)):
+        if (
+            not p.is_absolute()
+            or s != os.path.normpath(s)
+            or ".." in p.parts
+            or s == "/"
+        ):
+            raise ValueError(
+                "canonical workshop bind mount paths must be explicit and absolute"
+            )
+    if _has_symlink(source) or _has_symlink(view):
+        raise ValueError("canonical workshop bind mounts cannot use symlinks")
+    try:
+        if not os.path.samefile(source, view):
+            raise ValueError(
+                "canonical workshop readonly view mount does not match source"
+            )
+        stat = os.statvfs(view)
+        if not (stat.f_flag & os.ST_RDONLY):
+            raise ValueError("canonical workshop readonly view mount is not read-only")
+    except OSError as err:
+        raise ValueError(
+            "canonical workshop bind mounts are missing or unsafe"
+        ) from err
+
+
 class DockerBackend:
     def __init__(
         self,
@@ -53,6 +97,8 @@ class DockerBackend:
         min_free_bytes: int = 2 << 30,
         admin_dir: Path = Path("/srv/minecraft/workshop/admin"),
         proxy_service: str | None = None,
+        map_active_readonly_dir: Path | str | None = None,
+        admin_readonly_dir: Path | str | None = None,
     ):
         if set(apps) != {"game", "workshop"} or not all(
             SERVICE.fullmatch(a.service) for a in apps.values()
@@ -73,6 +119,14 @@ class DockerBackend:
         ):
             raise ValueError("separate configured proxy service required")
         self.proxy_service = proxy_service
+        self.map_active_readonly_dir = (
+            Path(map_active_readonly_dir)
+            if map_active_readonly_dir is not None
+            else None
+        )
+        self.admin_readonly_dir = (
+            Path(admin_readonly_dir) if admin_readonly_dir is not None else None
+        )
         # candidates.MapStore (workshopctl wires it): extracts a candidate for the test profile.
         self.maps = None
 
@@ -98,6 +152,16 @@ class DockerBackend:
             min_free_bytes=int(env.get("BF_MIN_FREE_BYTES", 2 << 30)),
             admin_dir=Path(env.get("BF_ADMIN_DIR", "/srv/minecraft/workshop/admin")),
             proxy_service=env.get("BF_PROXY_SERVICE") or None,
+            map_active_readonly_dir=(
+                Path(env["BF_MAP_ACTIVE_READONLY_DIR"])
+                if env.get("BF_MAP_ACTIVE_READONLY_DIR")
+                else None
+            ),
+            admin_readonly_dir=(
+                Path(env["BF_ADMIN_READONLY_DIR"])
+                if env.get("BF_ADMIN_READONLY_DIR")
+                else None
+            ),
         )
 
     # ------------------------------------------------------------------ commands
@@ -495,25 +559,42 @@ class DockerBackend:
         if environment.get("BLOCKFIELD_PROFILE") != "workshop":
             raise ValueError("workshop container profile is not configured")
         required = [
-            (self.maps.versions.active, active, True),
-            (self.maps.versions.active / "drafts", drafts, False),
-            (self.admin_dir, str(Path(session).parent), True),
-            (self.lock_dir, lock, False),
+            (
+                self.maps.versions.active,
+                active,
+                True,
+                Path(self.map_active_readonly_dir)
+                if self.map_active_readonly_dir is not None
+                else None,
+            ),
+            (self.maps.versions.active / "drafts", drafts, False, None),
+            (
+                self.admin_dir,
+                str(Path(session).parent),
+                True,
+                Path(self.admin_readonly_dir)
+                if self.admin_readonly_dir is not None
+                else None,
+            ),
+            (self.lock_dir, lock, False, None),
         ]
         mounts = spec.get("Mounts", [])
-        for source, target, readonly in required:
+        for source, target, readonly, view in required:
             matches = [
                 mount
                 for mount in mounts
                 if isinstance(mount, dict) and mount.get("Target") == target
             ]
-            if (
-                len(matches) != 1
-                or matches[0].get("Type") != "bind"
-                or matches[0].get("Source") != str(source)
-                or matches[0].get("ReadOnly", False) is not readonly
-            ):
+            if len(matches) != 1 or matches[0].get("Type") != "bind":
                 raise ValueError("canonical workshop bind mounts are missing or unsafe")
+            mount = matches[0]
+            mount_source = mount.get("Source")
+            if mount_source == str(source) and mount.get("ReadOnly", False) is readonly:
+                continue
+            if readonly and view is not None and mount_source == str(view):
+                _check_readonly_view(Path(source), view)
+                continue
+            raise ValueError("canonical workshop bind mounts are missing or unsafe")
         if Path(session).name != "session.json":
             raise ValueError(
                 "canonical workshop state filenames must match controller exports"
