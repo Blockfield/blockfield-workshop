@@ -1,4 +1,4 @@
-# Workshop: GAME <-> WORKSHOP switch with one Minecraft backend
+# Workshop: independent persistent editor beside Game
 
 Production controller: Linux, Python 3.12.14 / zlib 1.3.2, stdlib only.
 Historical design: netherg-io/blockfield-releases#8 (stage a), draining #6.
@@ -10,39 +10,47 @@ just python map_package.py candidate.zip --sha256 <pinned-archive-sha256>
 
 None of these are live Docker/Minecraft acceptance tests; the process journal below is.
 
-## Architecture (owner decision 2026-09-14)
+## Architecture (owner decision 2026-10-08)
 
-- Two Dokploy apps on the same server image: `blockfield-server` (profile `game`) and `blockfield-workshop`
-  (profile `workshop`, 0 replicas outside the workshop, own data, no stats keys, templates read-only).
-- Both mount `/srv/minecraft/backend-lock` as `/backend-lock`. `distribution/start-container.sh` takes
-  `flock` on `/backend-lock/backend.lock` and starts java only while holding it **and** only if
-  `/backend-lock/profile.json` selects its `BLOCKFIELD_PROFILE`. Java inherits the lock fd. A Swarm restart,
-  start-first rollback, redeploy or host boot can therefore start at most one JVM, and never the unselected profile.
-  Without the mount, `game` starts as before with a loud warning (current prod until reconfigured) and `workshop` refuses.
-- Host controller (`controller.py` + `docker_backend.py`) runs from a systemd timer every 15 s (`workshopctl step`), and at once
-  when the site drops a request into the inbox (`blockfield-workshop.path`); a step during a switch re-checks every 2 s for up
-  to 12 s (`BF_STEP_POLL_S`, `BF_STEP_FOLLOW_S`), so drained/stopped/ready is acted on without waiting for the next tick;
-  the owner issues requests with `workshopctl`. The web admin comes later.
-- The proxy reads `gate.json`, shows the maintenance message (join, lobby, server list MOTD) and admits only allowed
-  accounts. The site/launcher read `public.json`.
-- WorldEdit is not part of stage (a); the workshop profile has only op building.
+- Game and Workshop are independent Dokploy apps on the same compatible server image, each with at most one JVM.
+  Workshop keeps one replica while idle, has its own writable data and drafts, read-only templates, and no statistics keys.
+  Candidate playtests replace only the Workshop editor process; Game and its campaigns continue running.
+- Both apps mount `/srv/minecraft/backend-lock` as `/backend-lock`, with separate `game/backend.lock` and
+  `workshop/backend.lock` files. The server holds its app's `flock` throughout Java's lifetime. Workshop/test requires
+  matching `workshop/profile.json`; Game may adopt legacy readiness without a per-app selection file.
+  Game additionally keeps the legacy `backend.lock` as a compatibility mutex so an old Game rollback cannot overlap
+  the new Game process. Workshop does not take that legacy mutex.
+- The host controller runs from one systemd timer every 15 s and immediately when the site writes its inbox.
+  Transitional steps recheck every 2 s for up to 12 s (`BF_STEP_POLL_S`, `BF_STEP_FOLLOW_S`). It starts, saves, stops,
+  fences and updates only Workshop. Game is observed for actual readiness and compatible release selection.
+- Proxy gates are independent: ready Game stays public while Workshop starts, snapshots, tests or needs recovery.
+  Workshop entry requires the exact selected session/release readiness and authenticated builder/tester ACL.
+  Public status retains the Game mode; the additive Workshop status does not replace it.
+- Before each Workshop start the adapter selects the exact immutable image currently used by Game. A new ready Game
+  release refreshes a stable editor through save/stop/start while preserving its session and drafts; playtests and
+  unresolved operations defer that refresh. A client release must wait for compatible readiness of both backends.
 
 ### Contracts
 
-| File (host path)                                                    | Writer                                                                                                                                                                 | Reader                                            | Content                                                                                                                                                                                                                                                     |
-| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/srv/minecraft/backend-lock/profile.json`                          | controller `start()`                                                                                                                                                   | `start-container.sh`, mod                         | `{schema:1, profile, generation, session, release, candidate?}` (profile `test` runs in the workshop app)                                                                                                                                                   |
-| `<data>/.blockfield-ready.json`                                     | mod on SERVER_STARTED (deleted by container start, SERVER_STARTING/STOPPING and controller before start)                                                               | controller                                        | `{profile, generation, session, release}`                                                                                                                                                                                                                   |
-| `/srv/minecraft/workshop/gate/gate.json`                            | controller after every state write                                                                                                                                     | proxy (`BLOCKFIELD_GATE_FILE`)                    | `{schema:1, revision, gate: public/draining/closed/builders/testers, backend: game/workshop, message, allowed:[{draslId,name,role,maps?}]}`                                                                                                                 |
-| `/srv/minecraft/workshop/public/public.json`                        | controller                                                                                                                                                             | site (`BLOCKFIELD_GATE_FILE`)                     | `{mode: game/draining/workshop/maintenance, message, since}`                                                                                                                                                                                                |
-| `/srv/minecraft/workshop/controller/` (0700)                        | controller                                                                                                                                                             | —                                                 | `state.json`, `members.json`, `message.json`, `controller.lock`, `inbox.lock`                                                                                                                                                                               |
-| `/srv/minecraft/workshop/admin/` (0755, files 0644, `BF_ADMIN_DIR`) | controller                                                                                                                                                             | site admin and workshop server (read-only mounts) | `members.json` (current ACL), `workshop.key` (0640 root:1000, created once: the tablet's grant/revoke → site `/api/workshop/access`), `status.json` `{schema:1, revision, phase, gate, error, errorMessage, since, deadline, desired, message, updatedAt}`, |
-| `session.json` `{schema:1, id, maps: [mapId]                        | null, startedAt, startedBy}`(the mod offers only these maps),`candidates.json`(below),`results/<requestId>.json` `{id, ok, error, revision, doneAt}` (newest 200 kept) |
-| `/srv/minecraft/workshop/inbox/` (root:1000 0770, `BF_INBOX_DIR`)   | site admin (uid 1000, `.<id>.tmp` + rename)                                                                                                                            | controller                                        | `<id>.json` `{schema:1, id, kind: mode/members/message, actor:{draslId,name}, createdAt, ...}`                                                                                                                                                              |
+| File (host path)                                    | Writer                       | Reader                         | Content                                                                                                                                   |
+| --------------------------------------------------- | ---------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `/srv/minecraft/backend-lock/game/profile.json`     | deploy/operator (optional)   | server guard, mod, controller  | Game profile/release/generation selection; absent permits verified legacy adoption                                                        |
+| `/srv/minecraft/backend-lock/workshop/profile.json` | controller `start()`         | server guard, mod              | `{schema:1,profile,generation,session,release,candidate?}`; test uses the Workshop app                                                    |
+| `<data>/.blockfield-ready.json`                     | mod on SERVER_STARTED        | controller                     | `{profile,generation,session,release}`; deleted before every start and during stop                                                        |
+| `/srv/minecraft/workshop/gate/gate.json`            | controller                   | proxy (`BLOCKFIELD_GATE_FILE`) | Schema1 legacy top fields describe Game; `backends.game` and `backends.workshop` each carry `{gate,message,allowed}`                      |
+| `/srv/minecraft/workshop/public/public.json`        | controller                   | public site                    | `{mode,message,since,workshop:{mode,message}}`; top mode reflects actual Game readiness                                                   |
+| `/srv/minecraft/workshop/controller/` (0700)        | controller                   | controller                     | `state.json`, `members.json`, `message.json`, `session.json`, `controller.lock`, `inbox.lock`                                             |
+| `/srv/minecraft/workshop/admin/` (0755, files0644)  | controller                   | site and Workshop, read-only   | `members.json`, `status.json`, `session.json`, `candidates.json`, `maps.json`, `results/<id>.json`; `workshop.key` alone is0640 root:1000 |
+| `/srv/minecraft/workshop/inbox/` (root:1000 0770)   | authenticated site (UID1000) | controller                     | `<id>.json`: `{schema:1,id,kind,actor:{draslId,name},createdAt,...}`; write temp then rename                                              |
+
+Admin status contains `{schema:1,revision,phase,gate,error,errorMessage,since,deadline,desired,message,updatedAt,game:{phase,gate,release}}`.
+Session contains `{schema:1,id,maps,branches?,startedAt,startedBy}`; the mod offers only the selected maps.
+Results contain `{id,ok,error,revision,doneAt,payload?}`; newest200 are kept.
 
 `release` is `build` from the image's `/opt/blockfield-build.json` (the modpack tag, e.g. `v2.27.0`). Readiness counts only
-when all four fields equal `profile.json` and exactly one java of that app runs. Before the first controller start
-(`profile.json` absent) a game readiness with `generation: null` is adopted, so initialising does not restart the game.
+when all four fields equal that app's `profile.json` and exactly one Java of that app runs. Game's optional
+`game/profile.json` belongs to deployment/operator tooling, not the Workshop controller. Without it, Game readiness with
+`generation:null` is adopted; compatible legacy Game metadata is read during migration. Initialisation never restarts Game.
 
 Mount the `gate/` and `public/` **directories** read-only, not the files: the controller replaces files atomically
 and a single-file bind mount would keep showing the old inode.
@@ -51,66 +59,80 @@ and a single-file bind mount would keep showing the old inode.
 
 `request()` durably stores intent with CAS revisions; `step()` reconciles once under a non-blocking lock.
 
-- Stable phases and DRAINING are written only when phase/gate/error change: no gate flapping, exports keep their mtime.
-- `game -> workshop`: gate `draining` (existing game members may still connect), `/bf maintenance drain`, wait for
-  `drained=true`, `save-all flush`, scale game to 0 and wait until no task and no java, write `profile.json`, delete
-  readiness, scale workshop to 1, open `builders` only on matching readiness.
-- `workshop -> game`: `save-all flush`, stop, start game, `public` only on matching game readiness.
-- **DRAINING and STARTING have a deadline** (2026-09-18 incident: DRAINING sat for ~2h on a stuck stats-health flag,
-  then a mid-operation external restart turned an unresolved STARTING into ERROR with no message). Past the deadline,
-  `step()` rolls back if a previous profile was recorded when the switch was requested (`state["rollback"]`):
-  DRAINING never touched the old backend, so rollback just restores "desired"; STARTING already
-  stopped it, so rollback stops the half-started profile and starts the old one again. `errorMessage`/`since`/`deadline`
-  in `status.json` explain why. `BF_DRAIN_TIMEOUT_S` (default 600s, or `BF_DRAIN_TIMEOUT_RANKED_S`/3600s while a
-  Ranked campaign is still reported), `BF_DRAIN_HEALTH_GRACE_S` (default 60s: rooms=ranked=pending=0 but stats
-  unhealthy rolls back fast rather than waiting on a flag that may never clear) and `BF_START_TIMEOUT_S`
-  (default 600s: a cold pack start takes ~2.5 min on homeserver, and a missed deadline costs a second full
-  restart of the game) tune this; sizing "the longest match" beyond the ranked default is a manual env override, not
-  auto-detected from match length.
-- A backend of the _wrong_ profile appearing while STARTING is unresolved (an external restart, as above) is fenced
-  and retried instead of raising; unrecoverable failures still surface as `ERROR` with `error`+`errorMessage`.
-  Any error -> `ERROR`, gate `closed`. The timer never leaves ERROR. `workshopctl request game --recover` fences the
-  unselected app (scale 0, wait), then saves/stops whatever runs and starts game.
-- A game image restart with the same profile follows the observed release and waits `STARTING`/`closed` for matching
-  readiness. Without a previous stable goal in `rollback`, a missed start deadline keeps observing rather than
-  starting/stopping the backend again or entering `ERROR`. When readiness returns, the timer reopens `public`.
-- `workshopctl cancel` (or inbox kind `cancel`, no root) rolls back a stuck DRAINING/STARTING switch immediately
-  instead of waiting for its deadline -- the unprivileged counterpart to `--recover`, which stays root-only and
-  ERROR-only.
-- STARTING without a visible process waits closed and never re-issues start (see REVIEW-2026-09-13.md). Its deadline
-  rolls back a recorded switch; without a rollback goal it keeps observing, including after a controller restart.
-- Missing/invalid `members.json` admits nobody. Any java outside the two apps (pattern `fabric-server-mc.*-launcher.*.jar`)
-  is an error: do not run other Fabric servers on this host while the controller is enabled.
+- A fresh timer step waits for an observed ready Game release, prepares and durably records one Workshop session,
+  and starts its editor. Later steps and controller restarts reuse that session. Existing legacy Game intent migrates
+  to a resumed persistent editor; a legacy DRAINING state never drains or stops Game.
+- Stable phases are `workshop` and `test`. Only Workshop/test is managed: save and flush, stop, prove its Java/tasks
+  have exited, write `workshop/profile.json`, delete its readiness, and start it. The other app stays running.
+  Stable exports keep their inode and timestamp until content changes; the timer restores deleted exports.
+- Builder/tester gates open only for the exact observed selected release/session/generation. Missing or invalid ACL
+  admits nobody. Malformed Workshop selection or controller state closes Workshop and requires explicit recovery;
+  a ready Game remains public. Untrusted Game readiness closes Game entry independently without stopping the editor.
+  Unknown external full-backend processes or duplicate JVMs still fail closed; the controller never kills them.
+- STARTING has a deadline (`BF_START_TIMEOUT_S`, default 600 s). A recorded Workshop/test transition rolls back to its
+  previous goal after timeout or `workshopctl cancel`; its previous session export is restored as well. A failed
+  rollback stays ERROR. Without a previous goal, an unresolved start keeps observing closed, including after restart:
+  no visible process cannot prove an accepted delayed start was cancelled, so the timer never reissues it.
+- An unexpected Workshop/test process during an unresolved start is fenced before recovery. Ordinary ERROR never retries
+  automatically. `workshopctl request game --recover` retains its legacy command spelling but fences only Workshop,
+  saves/stops it when needed and resumes the same editor session. Ordinary `request game` also means resume editor;
+  it never switches off Workshop or starts Game. A missing selected session is an error, not permission to invent one.
+- Once a stable editor and Game are both ready, a changed Game release causes a preflight-checked Workshop-only
+  save/stop/start on that exact image. It retains the editor session and region files. Playtest, STARTING and ERROR
+  defer release following. The controller reports the actual Workshop phase; it never claims `phase:game` to bypass
+  release checks. Game's passive `{phase,gate,release}` export reflects observation, not a requested intent.
+- Automatic release refresh records the exact previous editor goal and a digest of the complete selected session.
+  If the refresh fails or remains STARTING and Game becomes independently ready at that previous release, the
+  controller attempts one Workshop-only restoration. It verifies the unchanged session/copies and old-release
+  preflight before fencing Workshop, then waits for exact readiness. A changed/corrupt session, unrelated error or
+  failed restoration requires manual recovery. Success and explicit session/test requests clear the marker.
+- A snapshot closes only Workshop, flushes/stops it, copies immutable map history, then restores the same editor.
+  An interrupted save/stop/start remains closed and recoverable; a copy failure restarts the saved editor and reports
+  the failed request. Game entry and campaigns continue. Cold SSD bundles are reclaimed only with **both** apps
+  confirmed absent, because a running Game may still have captured an older immutable bundle.
 
-`docker_backend.py` executes only: `docker service scale --detach <app>=0|1`, `docker service ps <app> --filter desired-state=running`,
-`docker ps --no-trunc --filter label=com.docker.swarm.service.name=<app>`, `docker exec <container> rcon-cli`
-with `bf maintenance drain`, `bf maintenance status`, `save-all flush`, and `pgrep -f <java pattern>`; java is mapped
-to its container through `/proc/<pid>/cgroup`.
+The Docker adapter's command allowlist permits only the configured Workshop service's scale/image update and trusted
+Workshop save/export RCON commands, plus read-only service/container/process observations of Game and Workshop.
+Game drain, scale, restart and RCON mutation are outside the controller contract.
 
 ## Site admin inbox
 
 `workshopctl step` (the timer) first applies up to 20 inbox requests, oldest `createdAt` first, then reconciles.
 Every request gets exactly one `admin/results/<id>.json` and its inbox file is removed; an existing result only removes
 the inbox file (idempotent). Rejected with a result: names not `^[0-9a-f-]{36}\.json$` are ignored, symlinks/non-regular
-files, > 65536 bytes, invalid JSON, `schema != 1`, `id` != file name, invalid actor, `createdAt` older than 10 min,
+files, oversized requests, invalid/duplicate-key JSON, `schema != 1`, `id` != file name, invalid actor, `createdAt` older than 10 min,
 unknown kind. A busy `controller.lock` leaves the request for the next step. Each request is logged with the actor name.
+Requests are limited to 64 KiB, except `merge-preview` and `publish`: these allow up to 8 MiB so all 10,000 exact
+conflict choices supported by the core can be submitted. Every other kind retains the smaller limit.
+Map requests additionally resolve the exact Drasl ID and name from the current controller ACL and check map scope.
+Publish, reject, restore and Limbo activation/export require an `admin`; `lead` may edit/review maps but cannot mutate
+protected main. Successful map requests may add `payload` to the existing result envelope, containing the created
+ref, immutable commit/review, comparison or merge preview. Non-map control envelopes retain their existing contract.
 
-- `mode` `{profile: game|workshop|test, expectedRevision, recover?}`: same as `workshopctl request` with the current release;
-  `recover` only toward game and runs the recovery step immediately. Toward workshop: `session: new|resume` (default new)
+- `mode` `{profile:game|workshop|test,expectedRevision,recover?}`: same as `workshopctl request` with the current release;
+  legacy `game` resumes the existing editor. `recover` retains that spelling and runs the Workshop recovery step immediately. Toward workshop: `session: new|resume` (default new)
   and `maps: [mapId]|null` (null = all): a new session gets a fresh id and the chosen maps, resume keeps the previous
-  session's id and maps (unless `maps` is given); stored in `controller/session.json`, exported as `admin/session.json`.
+  session's id and maps; stored in `controller/session.json`, exported as `admin/session.json`.
+  Canonical sessions also freeze `branches:{mapId:branchName}` for every selected map. Omitted branches default to
+  `work-<sessionUUID>` and preserve existing copies. A named branch must exist; selecting another branch requires a
+  new session UUID so a dirty copy is never overwritten or silently rebased.
+  Canonical UUID/map/branch selections are durably bound in HDD `sessions/<UUID>.json`. For an older retained copy,
+  send `session:resume,sessionId:<UUID>` without `maps` or `branches`; missing/corrupt copies are refused before
+  switching. Session activation retains the site's moderator/admin policy. The host CLI also loads an archived
+  selection when `request workshop --session <UUID>` names an existing session.
   Toward test: `candidateId`, only from phase `workshop` (see Playtest).
 - `members` `{members:[{draslId,name,role,maps?}]}`: full ACL replacement (the site is the source of truth; `workshopctl members`
   is the owner fallback); a list without an `admin` is refused. `maps` is an optional array of IDs from the runtime map
   catalog, plus `hub` for building in the workshop hub; missing means all maps and the hub, unknown ids are rejected,
   and `lead`/`admin` always have all maps regardless of `maps`.
 - `message` `{message}`: at most 200 characters, no control characters (Cc) or `§` (same rule as the site), stored in `controller/message.json` and exported to
-  gate/public/status; an empty message returns to `BF_MAINTENANCE_MESSAGE`.
+  the Workshop gate/status; an empty message returns to `BF_MAINTENANCE_MESSAGE`. Game's unavailable message remains the configured default.
 
 ## Map candidates (candidates.py)
 
 Builders send a map for review from the tablet (site `POST /api/workshop/submit`), admins from the site; admins accept
-or reject on the site. Inbox kinds (same envelope and validation as above):
+or reject on the site. Branch-aware Git reviews are described below; these branchless kinds preserve the legacy
+snapshot/release contract (same envelope and validation as above):
 
 - `candidate` `{mapId, workingCopyId?, note?}`: snapshot an isolated working copy or the legacy draft
   `<BF_WORKSHOP_DATA>/world/dimensions/blockfield_workshop/<mapId>/{region,entities,poi}` plus its markup JSON into
@@ -135,12 +157,13 @@ forced?, versionDigest?, baseVersion?, workingCopyId?}], backups, overlays, maps
 The following head/CAS contract is implemented in this source tree but has not been installed or deployed.
 
 `BF_MAP_ARCHIVE_DIR` defaults to `/mnt/media-hdd/blockfield/maps` on the homeserver HDD. It holds immutable
-`blobs/<first-two-hex>/<sha256>`, `versions/<mapId>/<versionDigest>.json`, candidate metadata and derived export cache.
+`blobs/<first-two-hex>/<sha256>`, `versions/<mapId>/<versionDigest>.json`, `branches/<mapId>/<name>.json`, candidate metadata and derived export cache.
 The host unit requires `/mnt/media-hdd` and asserts that it is a mount point; an unmounted directory cannot silently
 put archives on the root SSD. Configure the host mount before enabling the unit. If using another archive mount,
 change both unit paths together with `BF_MAP_ARCHIVE_DIR`, `BF_CANDIDATES_DIR` and `BF_MAP_PACKAGES_DIR`.
 Changed files add blobs; unchanged files reuse hashes. A small full manifest contains `schema:1`, `mapId`,
-`kind`, `parent`, author/time/source, `worldDigest`, `files: {path: sha256}`, `changed` and `deleted`.
+`kind`, `parent`, author/time/source, `worldDigest`, `files: {path: sha256}`, `changed` and `deleted`. New commits may add
+`parents`: one previous commit for ordinary commits/restores, both target and source commits for a merge.
 `versionDigest` is the SHA256 of the exact manifest bytes. Parent refs belong to the same map. There is no
 automatic history/ZIP deletion or binary patch chain. Existing ZIPs/releases/schematics remain intact;
 `BF_LEGACY_CANDIDATES_DIR` reads old candidates without moving them, and current metadata takes precedence.
@@ -169,22 +192,49 @@ UID/GID 1000 files; its world carries the original version and world digest in `
 
 Only active/warm bundles and editable copies are on SSD. Previous bundles stay while a backend may have captured
 them. The controller removes unheaded SSD bundles only after its existing save/stop operation confirms zero full
-backends, before restarting. It never removes a head bundle, a working copy or the HDD history. No cleanup runs
+backends, before restarting. A running Game prevents this reclamation during ordinary Workshop snapshots or restarts. It never removes a head bundle, a working copy or the HDD history. No cleanup runs
 merely because observe() temporarily reports no process during an uncertain start.
 
 Controller inbox contract (the same authenticated site/admin envelope and controller lock):
 
+- `sessions {offset, limit?}` reads archived session pages for an authenticated Workshop member. Default page size is
+  100; `offset` is a nonnegative integer and `limit` is 1–100. Its payload is `{sessions,total,next}`. DTOs contain
+  `{schema:1,id,maps,branches,startedAt,startedBy,selectionDigest}`; the digest binds the immutable ID/maps/branches.
+  Reading/listing never deletes history or recreates a missing working copy.
+- `branch-create {mapId, branch, versionDigest}` creates a named work branch at that immutable commit. Names are
+  canonical bounded identifiers; `main` is protected and derives directly from the existing active head. Ref metadata
+  includes `name`, `versionDigest`, CAS `generation`, `workingCopyId`, `createdBy` and `createdAt`.
+- `commit {mapId, branch, workingCopyId, expectedBranchHead, note}` saves a sequential commit from the exact selected
+  ready editor session and its selected map branch. A nonempty 1–200-character message and explicit expected branch
+  head are required. The controller flushes/stops only Workshop, commits immutable files and advances the branch
+  atomically, then restarts the same editor. Repeated commits retain the copy's original provenance while appending
+  to its branch; another copy advancing that branch makes the old copy stale.
+- `compare {mapId, before, after}` compares two immutable map digests and returns file additions/changes/deletions,
+  Anvil region coordinate bounds and JSON field before/after values. It does not inspect mutable drafts.
+- `merge-preview {mapId, versionDigest, expectedHead, resolutions?}` compares a source commit to exact current main
+  through one verified common ancestor. Non-overlapping files and object fields combine; conflicting binary region
+  files and arrays require explicit choices. `resolutions` maps exact conflict paths to `ours` (target main) or
+  `theirs` (source review), e.g. `world/region/r.0.0.mca` or `map.json#/name` (JSON Pointer escaping `~0`/`~1`). Unknown
+  choices/paths are refused. The payload retains source/target/base digests and unresolved conflict paths.
 - `candidate {mapId, workingCopyId?, note?}` snapshots the legacy draft or the identified SSD working copy,
   producing only CAS blobs, an immutable version manifest and metadata (`native:true`, `sha256:null`, `size:null`).
   `baseVersion` tracks the actual head/template or checkout's
   pinned origin; an accepted-but-inactive candidate never becomes another draft's base.
-- `publish {candidateId, expectedHead, force?}` accepts and activates. `expectedHead` is the current version digest,
+  Adding `branch` and `expectedBranchHead` reviews the **existing committed** branch head: the branch must match
+  the selected ready session/copy, and the immutable candidate freezes `versionDigest`, `sourceBranch` and `targetHead`.
+  It never saves uncommitted edits, advances the branch or stops Workshop. Commit changes first; a branch equal to
+  main has nothing to review. Later branch commits do not change reviewed bytes or stop continued editing. An omitted
+  branch keeps the legacy snapshot contract.
+- `publish {candidateId, expectedHead, resolutions?, force?}` accepts and activates. `expectedHead` is the current version digest,
   or explicit `null` if no head exists. Missing `expectedHead` preserves legacy acceptance-only behaviour.
   Stale heads, stale bases, corrupt blobs and insufficient staging space fail before head mutation.
   Acceptance and activation are distinct: if the final head write fails after acceptance, the accepted candidate
   can be retried with the same explicit expectedHead.
-- `rollback {mapId, versionDigest, expectedHead}` selects that exact archived version. It does not delete newer
-  versions. Missing target/expectedHead, a version from another map or a stale head is refused.
+  Git reviews use a safe three-way merge and require the frozen `targetHead`; a changed target needs a fresh review.
+  They reject `force`, including acceptance-only requests. Only an admin can publish or restore main.
+- `rollback {mapId, versionDigest, expectedHead}` restores that archived tree through a **new** commit parented to
+  current main. It preserves all later history and never rewinds the ref to the old digest. Missing target/expectedHead,
+  a version from another map or a stale head is refused.
 - `checkout {mapId, versionDigest, workingCopyId}` creates an isolated writable bundle; workingCopyId must be a
   canonical UUID. An existing copy is refused rather than overwritten. Resume it through the game adapter.
 - `export {candidateId}` generates a legacy-format ZIP on demand in HDD `exports/<candidateId>.zip` and publishes
@@ -198,8 +248,10 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   request. For the legacy release script, pass the generated `exports/<id>.zip` explicitly rather than assume a
   native candidate has a permanent ZIP beside its metadata.
 
-`admin/maps.json` is `{schema:1, maps:[{mapId,kind,mapJson,head,versions}]}`; history entries omit the full file
-table but retain version/parent/author/time/changed/deleted and fileCount. The catalog derives IDs from available
+`admin/maps.json` is `{schema:1, maps:[{mapId,kind,mapJson,head,versions,branches}],sessions,sessionsTotal,sessionsNext}`;
+the catalog includes the latest 100 sessions and the paginated inbox exposes all older copies. History entries omit the full file
+table but retain version/parent/parents/author/time/changed/deleted and fileCount. Old manifests keep their original
+single-parent bytes. The catalog derives IDs from available
 templates and stored version manifests, including lobby/limbo; the controller validates session/map ACL scopes
 against that catalog. With no map store (standalone controller tests), map_ids.json remains the legacy fallback.
 Runtime adapters read SSD head/bundle manifests; only host history operations read HDD blobs. The site should
@@ -210,7 +262,7 @@ mount `BF_MAP_PACKAGES_DIR` read-only and resolve downloads there rather than co
 In canonical mode (`active_root` configured by `workshopctl`), the host prepares every selected map before accepting
 a workshop switch. A new session UUID is also its `workingCopyId`; each map is copied from its exact current head
 into SSD `drafts/<uuid>/<mapId>`. Missing heads, unsafe storage, corrupt manifests/configuration or insufficient
-space reject the request before drain/stop/profile selection. Resume validates existing copies and preserves their
+space reject the request before save/stop/profile selection. Resume validates existing copies and preserves their
 edited region files and `map.json`; a changed active head does not silently rebase them. Session `maps:null` is frozen
 to an explicit catalog list, so a later imported map does not appear in a running session automatically. An interrupted
 copy may leave a complete prepared draft, never a partially exposed directory; retry preserves it.
@@ -224,12 +276,12 @@ the editor. A Java tablet submit already carries this exact ID; never replace it
 
 Workshop container configuration required before enabling canonical sessions:
 
-| Host source                         | Container target      | Access / environment                                                                         |
-| ----------------------------------- | --------------------- | -------------------------------------------------------------------------------------------- |
-| `/srv/minecraft/maps-active`        | `/maps-active`        | RO; `BF_MAP_ACTIVE_DIR=/maps-active`                                                         |
-| `/srv/minecraft/maps-active/drafts` | `/maps-active/drafts` | RW; `BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts`                                     |
-| `/srv/minecraft/workshop/admin`     | `/workshop-admin`     | RO; `BLOCKFIELD_WORKSHOP_SESSION_FILE=/workshop-admin/session.json`                          |
-| `/srv/minecraft/backend-lock`       | `/backend-lock`       | RW for existing `backend.lock`; `BLOCKFIELD_BACKEND_PROFILE_FILE=/backend-lock/profile.json` |
+| Host source                         | Container target      | Access / environment                                                                                               |
+| ----------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `/srv/minecraft/maps-active`        | `/maps-active`        | RO; `BF_MAP_ACTIVE_DIR=/maps-active`                                                                               |
+| `/srv/minecraft/maps-active/drafts` | `/maps-active/drafts` | RW; `BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts`                                                           |
+| `/srv/minecraft/workshop/admin`     | `/workshop-admin`     | RO; `BLOCKFIELD_WORKSHOP_SESSION_FILE=/workshop-admin/session.json`                                                |
+| `/srv/minecraft/backend-lock`       | `/backend-lock`       | RW for app-specific `workshop/backend.lock`; `BLOCKFIELD_BACKEND_PROFILE_FILE=/backend-lock/workshop/profile.json` |
 
 `BLOCKFIELD_PROFILE=workshop` remains mandatory. `profile.json` is host/root-owned mode 0644 and read-only to Minecraft,
 although the shared lock directory must permit the existing lock operation. Do not bind-mount `profile.json` as a single
@@ -241,7 +293,7 @@ these defaults, but they must identify the same physical storage. It never repai
 ### Offline initial imports (unreleased)
 
 With both full backend services at zero replicas and no backend Java, import an existing Anvil template and its explicit
-runtime metadata. The CLI also takes the shared backend lock; it does not stop services. All source files remain intact.
+runtime metadata. The CLI holds both app-specific backend locks; it does not stop services. All source files remain intact.
 
 ```sh
 just python workshopctl.py import-map --map-id fields --world /srv/minecraft/templates/maps/fields --config /srv/minecraft/lobby/blockfield/maps/fields.json
@@ -369,29 +421,26 @@ overwritten by the next game start: change maps through a new `world-seed-vN` or
 
 ## Playtest (profile test)
 
-A closed test match of one candidate, in the **workshop app** (same data volume, still one backend): the site sends
+A closed test match of one candidate, in the **workshop app** (same data volume, while Game continues running): the site sends
 `mode` `{profile: test, candidateId}` from phase `workshop`; the controller saves and stops the workshop, unpacks the
-candidate into `<workshop data>/test-candidate` and starts the app with `profile.json` `profile: test`.
+candidate into `<workshop data>/test-candidate` and starts the app with `workshop/profile.json` `profile:test`.
 `start-container.sh` then runs the game profile on a fresh copy: level `test-world` from the lobby seed, all templates
 of the image's release plus the candidate's world in `/data/test-maps`, its JSON as the published overlay, `BLOCKFIELD_STATS_EXPORT_ENABLED=false`,
 `BLOCKFIELD_SESSION_PURPOSE=test`. The gate is `testers` (the workshop members, backend workshop). Returning with
 `mode workshop` (`session: resume`) deletes the copy on start: nothing of a test reaches the drafts or the statistics.
 
-## Workshop image
+## Workshop image and releases
 
-Workshop has no image of its own. Its Dokploy service uses the tag `ghcr.io/blockfield/blockfield-server:latest`
-(no digest, like the game service) and the workshop env (`BLOCKFIELD_PROFILE=workshop`, see New installation).
-Swarm pulls a tag-only image for every new task, so each 0→1 scale of the workshop/test profile runs the
-`:latest` the game Deploy published; if the registry is unreachable the worker uses the local image the game
-Deploy pulled. Workshop therefore runs the game's JARs, `/opt/blockfield-build.json` and PackVersionGate,
-and its `release` (taken from the game) matches its readiness: server and client-only releases need no
-workshop rebuild or Deploy. Never pin this service to a digest: it would stop following the game.
+Workshop has no independent image build. Before starting its editor or test the controller reads Game's immutable
+Swarm image reference and updates only the Workshop service to that exact reference. An unavailable or mutable Game
+image fails preflight before the editor is stopped. Readiness binds the actual pack build, generation and session.
+Dokploy may retain the ordinary server image/tag configuration; a Workshop start must still select the exact currently
+running Game image, rather than assume a floating tag has compatible bytes.
 
-## Deploys during the workshop
-
-`deploy.yml` refuses (red job, nothing changed) while `admin/status.json` has any phase other than `game`: the game task
-could not start anyway, and a new pack on the site would lock builders out of the older workshop server. Rerun the
-Deploy with the same tag after returning to the game.
+After a Game release the controller updates a stable editor safely, preserving drafts. A closed playtest or unfinished
+operation defers that update. Deployment checks must inspect real Workshop lifecycle/readiness and Game's passive
+release separately, then wait for both compatible ready releases before publishing the client pair. The Game release
+can proceed beside a stable editor; unresolved Workshop saves/snapshots/recovery must be resolved first.
 
 Defaults: `BF_CANDIDATES_DIR=/mnt/media-hdd/blockfield/maps/candidates`, `BF_MAP_BACKUPS_DIR=/mnt/media-hdd/blockfield/maps/backups` (legacy read-only history),
 `BF_TEMPLATES_DIR=/srv/minecraft/templates/maps`, `BF_PUBLISHED_MAPS_DIR=/srv/minecraft/lobby/blockfield-published/maps`.
@@ -408,7 +457,10 @@ its environment, mounts, controller state and enabled units; this bootstrap is n
    ```sh
    mountpoint -q /mnt/media-hdd       # stop here if the HDD is not mounted
    install -d -m 0755 /mnt/media-hdd/blockfield/maps /srv/minecraft/maps-active
-   install -d -m 0755 /srv/minecraft/backend-lock /srv/minecraft/workshop /srv/minecraft/workshop/gate /srv/minecraft/workshop/public
+   install -d -m 0755 /srv/minecraft/backend-lock/game /srv/minecraft/backend-lock/workshop /srv/minecraft/workshop /srv/minecraft/workshop/gate /srv/minecraft/workshop/public
+   install -o root -g root -m 0644 /dev/null /srv/minecraft/backend-lock/backend.lock
+   install -o root -g root -m 0644 /dev/null /srv/minecraft/backend-lock/game/backend.lock
+   install -o root -g root -m 0644 /dev/null /srv/minecraft/backend-lock/workshop/backend.lock
    install -d -m 0700 /srv/minecraft/workshop/controller
    install -d -m 0755 /srv/minecraft/workshop/admin /srv/minecraft/workshop/admin/results
    install -d -m 0770 -o root -g 1000 /srv/minecraft/workshop/inbox   # site container uid/gid 1000 writes requests
@@ -422,13 +474,19 @@ its environment, mounts, controller state and enabled units; this bootstrap is n
    install -m 0644 systemd/blockfield-workshop.service systemd/blockfield-workshop.timer systemd/blockfield-workshop.path /etc/systemd/system/
    systemctl daemon-reload            # do NOT enable the timer yet
    ```
+   Pre-create these lock files only before the first server start; never replace a live lock inode. The pinned
+   `itzg/minecraft-server` base has no image `User` and the pack adds no `USER`, so `start-container.sh` opens the
+   locks as root before handing off to `/start`. The Java process runs as UID/GID 1000 and inherits the held file
+   descriptors. Keep lock directories `root:root` 0755 and selection files `root:root` 0644; Java needs read access,
+   not permission to rewrite controller metadata. A deployment override of the container user changes this contract
+   and must be checked before starting either app.
 2. Dokploy `blockfield-server` (game): add bind mount `/srv/minecraft/backend-lock` -> `/backend-lock`; env
-   `BLOCKFIELD_PROFILE=game`; set **rollback order stop-first** (update order must also be stop-first).
+   `BLOCKFIELD_PROFILE=game`; per-app Game metadata is optional. Set **rollback order stop-first** (update order must also be stop-first).
    Keep the existing `/srv/minecraft/lobby` and templates mounts (make templates `:ro`).
-3. Dokploy: create `blockfield-workshop` from the game image `ghcr.io/blockfield/blockfield-server:latest`, **replicas 0**,
+3. Dokploy: create `blockfield-workshop` from the game image `ghcr.io/blockfield/blockfield-server:latest`, **initial replicas 0 until its session/profile is prepared; thereafter 1 continuously**,
    restart policy any, update and rollback order stop-first, same network as the proxy. Mounts:
    `/srv/minecraft/workshop/data` -> `/data`, `/srv/minecraft/templates/maps` -> `/data/maps` read-only,
-   `/srv/minecraft/backend-lock` -> `/backend-lock`. Env: `BLOCKFIELD_PROFILE=workshop`,
+   `/srv/minecraft/backend-lock` -> `/backend-lock`. Env: `BLOCKFIELD_PROFILE=workshop`, `BLOCKFIELD_BACKEND_PROFILE_FILE=/backend-lock/workshop/profile.json`,
    `BLOCKFIELD_SESSION_PURPOSE=workshop`, `BLOCKFIELD_STATS_EXPORT_ENABLED=false`, `EULA`, `TYPE`/`VERSION`/memory
    as the game app, own `RCON_PASSWORD`, same `FABRIC_PROXY_SECRET`; **no** `BLOCKFIELD_STATS_INGEST_*` variables.
    Health check as the game app (`mc-health`, interval 30s, **start period 600s**, 6 retries): the itzg image default
@@ -441,7 +499,7 @@ its environment, mounts, controller state and enabled units; this bootstrap is n
    ```sh
    cd /opt/blockfield-workshop && set -a && . /etc/blockfield/workshop.env && set +a
    just python workshopctl.py request game --release v2.27.0   # = build in /opt/blockfield-build.json of the running game
-   just python workshopctl.py step                              # expect phase game, gate public, no restart
+   just python workshopctl.py step                              # editor STARTING, Game public; no Game restart
    systemctl enable --now blockfield-workshop.timer
    ```
 6. **Announced proxy restart window** (all players are disconnected once): announce in Discord/hub, wait for no running
@@ -454,10 +512,10 @@ its environment, mounts, controller state and enabled units; this bootstrap is n
 just python workshopctl.py members e10438e4797b49718cfecec6a8fa171b:Nether:admin <draslId>:<Name>[:builder|lead|admin[:mapId+mapId]]
 just python workshopctl.py members e10438e4797b49718cfecec6a8fa171b:Nether:admin <draslId>:Builder:builder:konstaxa+fields  # restrict to two maps
 just python workshopctl.py request workshop --session "$(python3 -c 'import uuid;print(uuid.uuid4())')"
-just python workshopctl.py status          # the timer does the steps; phase DRAINING can last a whole campaign
-just python workshopctl.py request game    # save, stop workshop, start game, open after readiness
+just python workshopctl.py status          # actual editor/test phase plus passive Game readiness
+just python workshopctl.py request game    # legacy spelling: resume the same persistent editor
 just python workshopctl.py request game --recover   # only from ERROR; read `error` in status first
-just python workshopctl.py cancel                    # abort a stuck DRAINING/STARTING switch now, no root needed
+just python workshopctl.py cancel                    # abort a stuck Workshop STARTING transition now, no root needed
 ```
 
 Drasl profile ids: `curl https://skins.blockfield.pro/account/users/profiles/minecraft/<Name>`. `members` applies online:
@@ -465,27 +523,24 @@ removed accounts are sent to the lobby on the proxy's next tick (3 s). Exit code
 
 ## Process journal acceptance test (owner maintenance window)
 
-Run on the host as root, with the env file loaded, in a second terminal for the whole window:
+Record both app identities, Java counts, separate lock holders and actual per-backend gates throughout acceptance.
+Each app may have at most one Java, and exactly the matching ready app may have an open gate. There may be two total
+JVMs: that is the intended topology. An old single-backend journal checker cannot validate this topology; update its
+schema/checker together before treating its output as acceptance evidence.
 
-```sh
-just python journal.py record --out /root/workshop-journal-$(date +%F).jsonl   # java per app, lock holder, tasks, gate; 200 ms
-just python journal.py check /root/workshop-journal-*.jsonl                  # exit 1 on any violation
-```
+Required scenarios:
 
-Assertions: max java <= 1 at every sample; gate `public`/`draining` only with backend game and no workshop java;
-gate `builders` only with backend workshop and no game java. Docker listing is refreshed once per second; java, lock
-and gate every sample. Scenarios, each ending in a clean `check`:
-
-1. Switch round-trip: `request workshop`, wait `builders`, builder joins, ordinary account sees the message and stays in the
-   lobby; `request game`, wait `public`, ordinary account is returned.
-2. Concurrent requests: two `request workshop` at once (one gets 75 or stale revision), `step` while the timer runs.
-3. `kill -9` of the workshop java during STARTING (by PID from `status`/journal): stays closed, no second java;
-   recover with `request game --recover`.
-4. Dokploy redeploy of `blockfield-server` during WORKSHOP: the game task waits in start-container.sh, no java; gate stays `builders`.
-5. `systemctl restart docker` during WORKSHOP and during GAME: at most one java after restart, gate follows readiness.
-6. Proxy restart during WORKSHOP: after start ordinary accounts see the message, builders enter the workshop.
-
-Record `workshopctl status`, `docker stats --no-stream` (container RSS) and `/bf version` for each scenario in the issue.
+1. With Game campaigns running, start the editor, admit a builder only to Workshop and an ordinary account only to Game.
+   Record unchanged Game process identity throughout Workshop session changes, snapshots and candidate playtests.
+2. Concurrent Workshop requests retain CAS/busy rejection; repeated controller steps do not issue duplicate starts.
+3. An uncertain or failed Workshop start remains builder-closed; explicit recovery retains the session and drafts.
+   Game readiness and player access remain independently observed.
+4. Release Game while the editor is stable: Workshop saves and follows the exact ready Game image before the new
+   client pair is published. A playtest or unfinished operation defers that refresh and publication.
+5. After a host restart, each app regains its own lock/readiness; proxy restarts retain separate builder and Game ACLs.
+6. Record `docker stats --no-stream`, idle and active tick timings, `/bf version` and editor persistence. Compare the
+   continuously running Workshop's idle and building CPU/RSS under the configured limits; startup success alone is
+   not resource acceptance.
 
 ## Candidate layout v1
 

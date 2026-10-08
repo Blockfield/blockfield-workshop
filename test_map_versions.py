@@ -82,7 +82,14 @@ class MapVersionTests(unittest.TestCase):
             b"entities",
         )
         self.assertEqual(self.store.versions.head("fields"), other_head)
-        self.assertEqual(len(self.store.versions.history("konstaxa")), 3)
+        restore = self.store.versions.read("konstaxa", restored["versionDigest"])
+        self.assertNotEqual(restored["versionDigest"], first["versionDigest"])
+        self.assertEqual(restore["parent"], second["versionDigest"])
+        self.assertEqual(
+            restore["files"],
+            self.store.versions.read("konstaxa", first["versionDigest"])["files"],
+        )
+        self.assertEqual(len(self.store.versions.history("konstaxa")), 4)
         with self.assertRaisesRegex(ValueError, "missing"):
             self.store.rollback(
                 "fields",
@@ -329,7 +336,10 @@ class MapVersionTests(unittest.TestCase):
             inbox_dir=inbox,
             maps=self.store,
         )
+        controller.set_members([{**ACTOR, "role": "admin"}])
         controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        controller.step()
+        controller.backend.ready(Goal(**controller.status()["desired"]))
         controller.step()
 
         def send(kind, **data):
@@ -364,8 +374,15 @@ class MapVersionTests(unittest.TestCase):
             expectedHead=first["versionDigest"],
         )
         catalog = json.loads((admin / "maps.json").read_text())["maps"]
-        self.assertEqual(catalog[0]["head"]["versionDigest"], first["baseVersion"])
-        self.assertEqual(len(catalog[0]["versions"]), 2)
+        restored = self.store.versions.read(
+            "konstaxa", catalog[0]["head"]["versionDigest"]
+        )
+        self.assertEqual(restored["parent"], first["versionDigest"])
+        self.assertEqual(
+            restored["files"],
+            self.store.versions.read("konstaxa", first["baseVersion"])["files"],
+        )
+        self.assertEqual(len(catalog[0]["versions"]), 3)
         copy_id = str(uuid4())
         send(
             "checkout",
@@ -374,6 +391,8 @@ class MapVersionTests(unittest.TestCase):
             workingCopyId=copy_id,
         )
         self.clock[0] += 1
+        controller.backend.ready(Goal(**controller.status()["desired"]))
+        controller.step()
         send("candidate", mapId="konstaxa", workingCopyId=copy_id)
         self.assertEqual(self.store.list()[0]["workingCopyId"], copy_id)
 
@@ -426,10 +445,23 @@ class MapVersionTests(unittest.TestCase):
         controller = Controller(self.root / "state", backend, maps=self.store)
         controller.request(str(uuid4()), Goal("game", "v1"), 0)
         controller.step()
+        backend.ready(Goal(**controller.status()["desired"]))
+        controller.step()
         self.assertTrue(warm.exists())
-        backend.is_drained = True
         goal = Goal("workshop", "v1", str(uuid4()))
         controller.request(str(uuid4()), goal, 1)
+        with mock.patch.object(
+            self.store.versions, "reclaim_unheaded_bundles"
+        ) as cleanup:
+            controller.step()
+        cleanup.assert_not_called()
+        self.assertTrue(
+            warm.exists(), "the running Game may still have captured this bundle"
+        )
+        backend.ready(goal)
+        controller.step()
+        backend.processes = [p for p in backend.processes if p.goal.profile != "game"]
+        controller.request(str(uuid4()), Goal("workshop", "v1", str(uuid4())), 2)
         reclaim = self.store.versions.reclaim_unheaded_bundles
 
         def after_stop():
@@ -443,7 +475,7 @@ class MapVersionTests(unittest.TestCase):
         self.assertFalse(warm.exists())
         self.assertTrue(current.exists())
         self.assertTrue(draft.exists())
-        self.assertEqual(len(self.store.versions.history("konstaxa")), 2)
+        self.assertEqual(len(self.store.versions.history("konstaxa")), 3)
 
 
 if __name__ == "__main__":

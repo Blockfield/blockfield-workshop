@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host CLI for the GAME<->WORKSHOP controller (root: needs the Docker socket).
+"""Host CLI for the persistent Workshop controller (root: needs the Docker socket).
 
 workshopctl request workshop --session <uuid> [--release vX.Y.Z]
 workshopctl request game [--release vX.Y.Z] [--recover]
@@ -10,7 +10,7 @@ workshopctl step | status | cancel      # step applies the site admin inbox firs
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import json
 import math
@@ -84,8 +84,12 @@ def _map_store(env, backend):
 @contextmanager
 def _offline(backend):
     if hasattr(backend, "lock_dir"):
-        with (backend.lock_dir / "backend.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with ExitStack() as stack:
+            for profile in ("game", "workshop"):
+                lock = stack.enter_context(
+                    (backend.lock_dir / profile / "backend.lock").open("a")
+                )
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             _require_stopped(backend)
             yield
             _require_stopped(backend)
@@ -202,17 +206,23 @@ def main(argv=None, backend_factory=None) -> int:
         nargs="+",
         help="selected canonical map ids; omitted = all on new, previous selection on resume",
     )
+    workshop.add_argument(
+        "--branches",
+        nargs="+",
+        metavar="MAP=BRANCH",
+        help="freeze named branches for every selected map; changing a branch needs a new session UUID",
+    )
     game = request.add_parser("game")
     game.add_argument("--release")
     game.add_argument(
         "--recover",
         action="store_true",
-        help="leave ERROR toward game: fence, save, stop, start game",
+        help="leave Workshop ERROR: fence, save, stop, resume the editor",
     )
     commands.add_parser("step")
     commands.add_parser("status")
     commands.add_parser(
-        "cancel", help="unprivileged rollback of a stuck DRAINING/STARTING switch"
+        "cancel", help="unprivileged rollback of a stuck Workshop STARTING transition"
     )
     members = commands.add_parser(
         "members", help="replace the workshop ACL; no arguments clears it"
@@ -241,6 +251,35 @@ def main(argv=None, backend_factory=None) -> int:
         help="export an accepted immutable version through the ready workshop's trusted WorldEdit adapter",
     )
     limbo_export.add_argument("--version-digest", required=True)
+    branch_create = commands.add_parser(
+        "branch-create", help="create a named work branch from an immutable map version"
+    )
+    branch_create.add_argument("--map-id", required=True)
+    branch_create.add_argument("--branch", required=True)
+    branch_create.add_argument("--version-digest", required=True)
+    commit = commands.add_parser(
+        "commit", help="save the selected editor copy as a sequential branch commit"
+    )
+    commit.add_argument("--map-id", required=True)
+    commit.add_argument("--branch", required=True)
+    commit.add_argument("--working-copy-id", required=True)
+    commit.add_argument("--expected-head", required=True)
+    commit.add_argument("--message", required=True)
+    compare = commands.add_parser("compare", help="compare two immutable map versions")
+    compare.add_argument("--map-id", required=True)
+    compare.add_argument("--before", required=True)
+    compare.add_argument("--after", required=True)
+    preview = commands.add_parser(
+        "merge-preview", help="preview a source commit against the exact current main"
+    )
+    preview.add_argument("--map-id", required=True)
+    preview.add_argument("--version-digest", required=True)
+    preview.add_argument("--expected-head", required=True)
+    preview.add_argument(
+        "--resolutions",
+        default="{}",
+        help="JSON object of exact conflict paths to ours/theirs",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -260,9 +299,6 @@ def main(argv=None, backend_factory=None) -> int:
             message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE),
             admin_dir=Path(args.admin_dir),
             inbox_dir=Path(args.inbox_dir),
-            drain_timeout=float(env.get("BF_DRAIN_TIMEOUT_S", 600)),
-            drain_timeout_ranked=float(env.get("BF_DRAIN_TIMEOUT_RANKED_S", 3600)),
-            drain_health_grace=float(env.get("BF_DRAIN_HEALTH_GRACE_S", 60)),
             start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
             maps=_map_store(env, backend),
         )
@@ -283,6 +319,39 @@ def main(argv=None, backend_factory=None) -> int:
             result = _import_map(args, controller, backend)
         elif args.command == "export-limbo":
             result = controller.export_limbo(args.version_digest)
+        elif args.command == "commit":
+            result = controller._snapshot(
+                args.map_id,
+                {"draslId": "host", "name": "host"},
+                args.message,
+                working_copy_id=args.working_copy_id,
+                branch=args.branch,
+                expected_branch_head=args.expected_head,
+                commit=True,
+            )
+        elif args.command in {"branch-create", "compare", "merge-preview"}:
+            with controller._locked():
+                if args.command == "branch-create":
+                    result = controller.maps.versions.create_branch(
+                        args.map_id,
+                        args.branch,
+                        args.version_digest,
+                        {"draslId": "host", "name": "host"},
+                    )
+                    controller.export_maps()
+                elif args.command == "compare":
+                    result = controller.maps.versions.compare(
+                        args.map_id, args.before, args.after
+                    )
+                else:
+                    from map_package import _json
+
+                    result = controller._merge_preview(
+                        args.map_id,
+                        args.version_digest,
+                        args.expected_head,
+                        _json(args.resolutions.encode()),
+                    )
         elif args.command == "activate-map":
             expected = None if args.expected_head == "none" else args.expected_head
             with controller._locked():
@@ -311,10 +380,9 @@ def main(argv=None, backend_factory=None) -> int:
                 controller.export_maps()
             except Exception as error:  # the site inbox must never block reconciliation
                 print(f"workshopctl: inbox pass failed: {error!r}", file=sys.stderr)
-            state = controller.status()
-            result = state if state["phase"] == "UNINITIALIZED" else controller.step()
+            result = controller.step()
             # A switch in flight is followed every few seconds inside this run instead of once per 15 s timer tick:
-            # the next phase (drained, stopped, ready) is acted on almost at once. Bounded, so the timer stays the clock.
+            # the next phase (stopped, ready) is acted on almost at once. Bounded, so the timer stays the clock.
             deadline = time.monotonic() + float(env.get("BF_STEP_FOLLOW_S", 12))
             while (
                 result.get("phase") in FOLLOWED_PHASES and time.monotonic() < deadline
@@ -332,12 +400,15 @@ def main(argv=None, backend_factory=None) -> int:
                 else Goal("game", release)
             )
             recover = getattr(args, "recover", False)
-            session = None
+            session, archived = None, None
             if args.profile == "workshop":
                 previous = controller.session()
+                archived = controller.maps.session(goal.session)
                 session = (
                     previous
                     if previous and previous.get("id") == goal.session
+                    else archived
+                    if archived is not None
                     else {
                         "schema": 1,
                         "id": goal.session,
@@ -348,8 +419,29 @@ def main(argv=None, backend_factory=None) -> int:
                 )
                 if args.maps is not None:
                     session = {**session, "maps": args.maps}
+                    if "branches" in session:
+                        session["branches"] = {
+                            map_id: session["branches"].get(
+                                map_id, "work-" + goal.session
+                            )
+                            for map_id in args.maps
+                        }
+                if args.branches is not None:
+                    selections = [entry.split("=", 1) for entry in args.branches]
+                    if any(len(entry) != 2 for entry in selections) or len(
+                        {entry[0] for entry in selections}
+                    ) != len(selections):
+                        raise ValueError(
+                            "branches must be distinct MAP=BRANCH selections"
+                        )
+                    session = {**session, "branches": dict(selections)}
             result = controller.request(
-                str(uuid4()), goal, state["revision"], recover=recover, session=session
+                str(uuid4()),
+                goal,
+                state["revision"],
+                recover=recover,
+                session=session,
+                resume_only=archived is not None,
             )
             if recover:
                 result = controller.step(recover=True)

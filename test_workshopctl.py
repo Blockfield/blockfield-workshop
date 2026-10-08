@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
-from controller import Goal, Process
+from controller import Goal
 from test_controller import FakeBackend
 import workshopctl
 
@@ -22,7 +22,6 @@ class WorkshopctlTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.backend = FakeBackend()
-        self.backend.is_drained = True
         # The fake backend never becomes ready by itself: following a switch would only burn the real-time budget.
         os.environ["BF_STEP_FOLLOW_S"] = "0"
         self.addCleanup(os.environ.pop, "BF_STEP_FOLLOW_S", None)
@@ -87,15 +86,20 @@ class WorkshopctlTests(unittest.TestCase):
             )
         return code, json.loads(out.getvalue()) if out.getvalue() else err.getvalue()
 
+    def ready_editor(self):
+        state = self.ctl("status")[1]["state"]
+        self.backend.ready(Goal(**state["desired"]))
+        return self.ctl("step")
+
     def test_switch_round_trip(self):
         code, state = self.ctl("status")
         self.assertEqual((code, state["state"]["phase"]), (0, "UNINITIALIZED"))
-        self.assertEqual(self.ctl("step")[1]["phase"], "UNINITIALIZED")
         self.assertEqual(self.ctl("request", "game")[0], 1)
         self.assertEqual(
             self.ctl("request", "game", "--release", "v1")[1]["phase"], "REQUESTED"
         )
-        self.assertEqual(self.ctl("step")[1]["gate"], "public")
+        self.assertEqual(self.ctl("step")[1]["gate"], "closed")
+        self.assertEqual(self.ready_editor()[1]["gate"], "builders")
         self.assertEqual(
             oct((self.root / "controller").stat().st_mode & 0o777), "0o700"
         )
@@ -116,15 +120,19 @@ class WorkshopctlTests(unittest.TestCase):
             },
         )
         self.assertEqual(self.ctl("step")[1]["phase"], "STARTING")
-        self.backend.processes = [Process(Goal("workshop", "v1", session), True)]
+        self.backend.ready(Goal("workshop", "v1", session))
         self.assertEqual(self.ctl("step")[1]["gate"], "builders")
         gate = json.loads((self.root / "gate" / "gate.json").read_text())
         self.assertEqual(
-            (gate["backend"], gate["allowed"][0]["name"]), ("workshop", "Nether")
+            (
+                gate["backends"]["workshop"]["gate"],
+                gate["backends"]["workshop"]["allowed"][0]["name"],
+            ),
+            ("builders", "Nether"),
         )
         self.assertEqual(
             json.loads((self.root / "public" / "public.json").read_text())["mode"],
-            "workshop",
+            "game",
         )
 
     def test_members_cli_parses_maps(self):
@@ -145,6 +153,7 @@ class WorkshopctlTests(unittest.TestCase):
     def test_recover_runs_explicit_step(self):
         self.ctl("request", "game", "--release", "v1")
         self.ctl("step")
+        self.ready_editor()
         self.ctl("request", "workshop", "--session", str(uuid4()))
         self.backend.fail_start = True
         code, state = self.ctl("step")
@@ -158,6 +167,7 @@ class WorkshopctlTests(unittest.TestCase):
     def test_step_applies_inbox_before_reconcile(self):
         self.ctl("request", "game", "--release", "v1")
         self.ctl("step")
+        self.ready_editor()
         request_id = str(uuid4())
         (self.root / "inbox").mkdir()
         (self.root / "inbox" / f"{request_id}.json").write_text(
@@ -197,7 +207,159 @@ class WorkshopctlTests(unittest.TestCase):
         workshopctl.Controller.process_inbox = broken
         self.addCleanup(setattr, workshopctl.Controller, "process_inbox", original)
         code, state = self.ctl("step")
-        self.assertEqual((code, state["gate"]), (0, "public"))
+        self.assertEqual((code, state["phase"]), (0, "STARTING"))
+        gate = json.loads((self.root / "gate/gate.json").read_bytes())
+        self.assertEqual(gate["backends"]["game"]["gate"], "public")
+
+    def test_step_bootstraps_the_persistent_editor(self):
+        code, state = self.ctl("step")
+        self.assertEqual((code, state["phase"]), (0, "STARTING"))
+        self.assertEqual(state["desired"]["profile"], "workshop")
+        self.assertEqual(self.backend.events, ["start"])
+        self.assertEqual(self.backend.processes[0].goal.profile, "game")
+
+    def test_named_branch_session_commit_compare_and_preview(self):
+        store = workshopctl._map_store(os.environ, self.backend)
+        before = store.versions.head("konstaxa")["versionDigest"]
+        code, branch = self.ctl(
+            "branch-create",
+            "--map-id",
+            "konstaxa",
+            "--branch",
+            "editing",
+            "--version-digest",
+            before,
+        )
+        self.assertEqual(code, 0, branch)
+        self.assertEqual(branch["name"], "editing")
+        copy_id = str(uuid4())
+        code, state = self.ctl(
+            "request",
+            "workshop",
+            "--release",
+            "v1",
+            "--session",
+            copy_id,
+            "--maps",
+            "konstaxa",
+            "--branches",
+            "konstaxa=editing",
+        )
+        self.assertEqual(code, 0, state)
+        selected = json.loads((self.root / "controller/session.json").read_text())
+        self.assertEqual(selected["branches"], {"konstaxa": "editing"})
+        self.ctl("step")
+        self.ready_editor()
+        region = (
+            store.versions.working_copy("konstaxa", copy_id) / "world/region/r.0.0.mca"
+        )
+        region.write_bytes(b"CLI edit")
+        game = self.backend.processes[0]
+        code, committed = self.ctl(
+            "commit",
+            "--map-id",
+            "konstaxa",
+            "--branch",
+            "editing",
+            "--working-copy-id",
+            copy_id,
+            "--expected-head",
+            before,
+            "--message",
+            "Edit geometry",
+        )
+        self.assertEqual(code, 0, committed)
+        self.assertNotEqual(committed["versionDigest"], before)
+        self.assertIn(game, self.backend.processes)
+        code, diff = self.ctl(
+            "compare",
+            "--map-id",
+            "konstaxa",
+            "--before",
+            before,
+            "--after",
+            committed["versionDigest"],
+        )
+        self.assertEqual(code, 0, diff)
+        self.assertIn(
+            "world/region/r.0.0.mca", [entry["path"] for entry in diff["files"]]
+        )
+        code, preview = self.ctl(
+            "merge-preview",
+            "--map-id",
+            "konstaxa",
+            "--version-digest",
+            committed["versionDigest"],
+            "--expected-head",
+            before,
+        )
+        self.assertEqual(code, 0, preview)
+        self.assertEqual(preview["unresolved"], [])
+        self.assertEqual(preview["targetVersion"], before)
+
+    def test_branch_selection_validation_preserves_existing_editor(self):
+        self.ctl("step")
+        self.ready_editor()
+        previous = (self.root / "controller/session.json").read_bytes()
+        events = list(self.backend.events)
+        for branches in (
+            "konstaxa=main",
+            "konstaxa=../bad",
+            "konstaxa",
+            "konstaxa=missing",
+        ):
+            code, error = self.ctl(
+                "request",
+                "workshop",
+                "--session",
+                str(uuid4()),
+                "--maps",
+                "konstaxa",
+                "--branches",
+                branches,
+            )
+            self.assertEqual(code, 1, error)
+            self.assertEqual(
+                (self.root / "controller/session.json").read_bytes(), previous
+            )
+            self.assertEqual(self.backend.events, events)
+
+    def test_request_old_session_uuid_resumes_its_frozen_selection(self):
+        self.ctl("step")
+        self.ready_editor()
+        original = json.loads((self.root / "controller/session.json").read_text())
+        store = workshopctl._map_store(os.environ, self.backend)
+        old_region = (
+            store.versions.working_copy("konstaxa", original["id"])
+            / "world/region/r.0.0.mca"
+        )
+        old_region.write_bytes(b"old CLI draft")
+        self.ctl("request", "workshop", "--session", str(uuid4()), "--maps", "fields")
+        self.ctl("step")
+        self.ready_editor()
+        game = self.backend.processes[0]
+        code, state = self.ctl("request", "workshop", "--session", original["id"])
+        self.assertEqual(code, 0, state)
+        selected = json.loads((self.root / "controller/session.json").read_text())
+        self.assertEqual(selected["maps"], original["maps"])
+        self.assertEqual(selected["branches"], original["branches"])
+        self.ctl("step")
+        self.ready_editor()
+        self.assertEqual(old_region.read_bytes(), b"old CLI draft")
+        self.assertIn(game, self.backend.processes)
+
+    def test_offline_operations_hold_both_backend_locks(self):
+        self.backend.processes = []
+        self.backend.lock_dir = self.root / "locks"
+        for profile in ("game", "workshop"):
+            (self.backend.lock_dir / profile).mkdir(parents=True)
+        with workshopctl._offline(self.backend):
+            for profile in ("game", "workshop"):
+                with (self.backend.lock_dir / profile / "backend.lock").open(
+                    "a"
+                ) as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_bad_member_and_busy_lock(self):
         self.assertEqual(self.ctl("members", "nope")[0], 1)

@@ -1,8 +1,8 @@
-"""Docker Swarm adapter for Controller: one Dokploy app per profile, one shared /backend-lock.
+"""Docker Swarm adapter for the persistent Workshop beside the independently deployed Game.
 
 Only a fixed command allowlist is ever executed (see allowed()). The containers themselves
-serialize java through flock on <lock_dir>/backend.lock and start only the profile selected in
-<lock_dir>/profile.json; this adapter selects the profile, scales apps and proves readiness.
+serialize each app through its own flock and profile in <lock_dir>/<app>/;
+this adapter mutates only Workshop, follows Game's immutable image and proves readiness.
 """
 
 from __future__ import annotations
@@ -23,8 +23,6 @@ from controller import Goal, Process, atomic_write
 # itzg runs `java ... -jar ./fabric-server-mc.1.21.1-loader.X-launcher.Y.jar`.
 JAVA_PATTERN = r"fabric-server-mc\..*-launcher\..*\.jar"
 RCON_COMMANDS = {
-    ("bf", "maintenance", "drain"),
-    ("bf", "maintenance", "status"),
     ("save-all", "flush"),
     ("save-off",),
     ("save-on",),
@@ -120,7 +118,17 @@ class DockerBackend:
                 return service in services
             case ["docker", "service", "scale", "--detach", target]:
                 service, _, replicas = target.rpartition("=")
-                return service in services and replicas in {"0", "1"}
+                return service == self.apps["workshop"].service and replicas in {
+                    "0",
+                    "1",
+                }
+            case ["docker", "service", "update", "--detach", "--image", image, service]:
+                return service == self.apps["workshop"].service and bool(
+                    re.fullmatch(
+                        r"ghcr\.io/blockfield/blockfield-server(?::[A-Za-z0-9_.-]+)?@sha256:[0-9a-f]{64}",
+                        image,
+                    )
+                )
             case [
                 "docker",
                 "service",
@@ -340,9 +348,18 @@ class DockerBackend:
                 result[profile]["java"] += 1
         return result
 
-    def selection(self) -> dict | None:
+    def selection(self, profile: str = "workshop") -> dict | None:
         """Profile the host selected; None only before the first controller start. Corrupt raises."""
-        path = self.lock_dir / "profile.json"
+        app = self.app_of(profile)
+        path = self.lock_dir / app / "profile.json"
+        legacy = not path.exists()
+        if legacy:
+            ready = self.readiness(app)
+            if app == "game" and ready and ready["generation"] is None:
+                return None
+            path = self.lock_dir / "profile.json"
+        if path.is_symlink():
+            raise ValueError("invalid profile.json")
         try:
             data = json.loads(path.read_bytes()[:16384])
         except FileNotFoundError:
@@ -358,6 +375,10 @@ class DockerBackend:
         UUID(data.get("generation"))
         if data.get("session") is not None:
             UUID(data["session"])
+        if self.app_of(data["profile"]) != app:
+            if legacy:
+                return None
+            raise ValueError("profile.json belongs to another backend")
         return data
 
     def readiness(self, profile: str) -> dict | None:
@@ -367,7 +388,35 @@ class DockerBackend:
             )
         except (OSError, ValueError):
             return None
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict) or set(data) != {
+            "profile",
+            "generation",
+            "session",
+            "release",
+        }:
+            return None
+        try:
+            if (
+                data["profile"] not in {profile, "test"}
+                or profile == "game"
+                and data["profile"] != "game"
+            ):
+                return None
+            if not isinstance(data["release"], str) or not data["release"].strip():
+                return None
+            if (
+                data["generation"] is not None
+                and str(UUID(data["generation"])) != data["generation"]
+            ):
+                return None
+            if profile == "game":
+                if data["session"] is not None:
+                    return None
+            elif str(UUID(data["session"])) != data["session"]:
+                return None
+        except (ValueError, TypeError, AttributeError):
+            return None
+        return data
 
     @staticmethod
     def _goal(profile: str, release, session, candidate=None) -> Goal:
@@ -424,10 +473,8 @@ class DockerBackend:
         session = environment.get(
             "BLOCKFIELD_WORKSHOP_SESSION_FILE", "/workshop-admin/session.json"
         )
-        profile = environment.get(
-            "BLOCKFIELD_BACKEND_PROFILE_FILE", "/backend-lock/profile.json"
-        )
-        for value in (active, drafts, session, profile):
+        lock = environment.get("BACKEND_LOCK_DIR", "/backend-lock")
+        for value in (active, drafts, session, lock):
             path = Path(value)
             if (
                 not path.is_absolute()
@@ -444,7 +491,7 @@ class DockerBackend:
             (self.maps.versions.active, active, True),
             (self.maps.versions.active / "drafts", drafts, False),
             (self.admin_dir, str(Path(session).parent), True),
-            (self.lock_dir, str(Path(profile).parent), False),
+            (self.lock_dir, lock, False),
         ]
         mounts = spec.get("Mounts", [])
         for source, target, readonly in required:
@@ -460,7 +507,7 @@ class DockerBackend:
                 or matches[0].get("ReadOnly", False) is not readonly
             ):
                 raise ValueError("canonical workshop bind mounts are missing or unsafe")
-        if Path(session).name != "session.json" or Path(profile).name != "profile.json":
+        if Path(session).name != "session.json":
             raise ValueError(
                 "canonical workshop state filenames must match controller exports"
             )
@@ -491,17 +538,32 @@ class DockerBackend:
                 )
 
     def preflight(self, goal: Goal) -> None:
+        if goal.profile == "game":
+            raise ValueError("Game lifecycle belongs to the server deployment")
         if self.app_of(goal.profile) not in self.apps:
             raise ValueError(f"profile {goal.profile} has no app in this stage")
         if goal.profile == "test" and self.maps is None:
             raise ValueError("test needs the map candidates store")
+        if goal.profile == "test" and not any(
+            process.goal.profile == "game"
+            and process.ready
+            and process.goal.release == goal.release
+            for process in self.observe()
+        ):
+            raise ValueError(
+                "test release must match the ready Game backend; resume the editor first"
+            )
         if self.lock_dir.is_symlink() or not self.lock_dir.is_dir():
             raise FileNotFoundError("backend lock directory missing")
+        selected_dir = self.lock_dir / self.app_of(goal.profile)
+        if selected_dir.is_symlink():
+            raise ValueError("invalid backend lock directory")
         data = self.apps[self.app_of(goal.profile)].data
         if data.is_symlink() or not data.is_dir():
             raise FileNotFoundError(f"data directory for {goal.profile} missing")
         if shutil.disk_usage(data).free < self.min_free_bytes:
             raise OSError("not enough free space for the backend data")
+        self.game_image()
         if (
             goal.profile == "workshop"
             and getattr(self.maps, "canonical_sessions", False) is True
@@ -512,17 +574,20 @@ class DockerBackend:
         inventory = self.inventory()
         if inventory["unknown"]:
             raise RuntimeError("full backend process outside the configured apps")
-        selection = self.selection()
-        selected = selection["profile"] if selection else "game"
         processes = []
-        for app in self.apps:
+        for app in ("game", "workshop"):
             counts = inventory[app]
             if counts["java"] > 1:
                 raise RuntimeError(f"{app} runs several java processes")
-            # A task of an unselected profile waits in start-container.sh without java.
-            if counts["java"] == 0 and not (
-                counts["tasks"] and app == self.app_of(selected)
-            ):
+            try:
+                selection = self.selection(app)
+            except (ValueError, TypeError, AttributeError, OSError):
+                processes.append(
+                    Process(self._goal(app, "unknown", UNKNOWN_SESSION), False)
+                )
+                continue
+            selected = selection["profile"] if selection else app
+            if counts["java"] == 0 and counts["tasks"] == 0:
                 continue
             ready = self.readiness(app)
             profile = selected if app == self.app_of(selected) else app
@@ -539,6 +604,21 @@ class DockerBackend:
                 }
                 if profile == "game" and ready and ready.get("release"):
                     # Game images are deployed as :latest by release tags, outside the controller: follow the build.
+                    goal = self._goal(
+                        profile, ready["release"], selection.get("session")
+                    )
+                    expected["release"] = ready["release"]
+                elif (
+                    profile == "workshop"
+                    and ready
+                    and any(
+                        process.goal.profile == "game"
+                        and process.ready
+                        and process.goal.release == ready["release"]
+                        for process in processes
+                    )
+                ):
+                    # A Game rollout can finish between preflight and Workshop start; adopt only the compatible release.
                     goal = self._goal(
                         profile, ready["release"], selection.get("session")
                     )
@@ -571,6 +651,8 @@ class DockerBackend:
     def _rcon(self, profile: str, *command: str) -> str | None:
         """None when the profile runs no java (nothing to drain or save)."""
         profile = self.app_of(profile)
+        if profile == "game":
+            raise ValueError("Workshop controller cannot issue Game commands")
         if self.inventory(tasks=False)[profile]["java"] == 0:
             return None
         container = self._container(profile)
@@ -585,36 +667,16 @@ class DockerBackend:
             raise RuntimeError("stop the workshop before taking a consistent snapshot")
         yield
 
-    def request_drain(self) -> None:
-        self._rcon("game", "bf", "maintenance", "drain")
-
-    def drain_progress(self) -> dict | None:
-        out = self._rcon("game", "bf", "maintenance", "status")
-        if out is None:
-            return None
-        match = re.search(
-            r"\bdraining=(true|false)\s+rooms=(\d+)\s+ranked=(\d+)\s+pending=(\d+)\s+"
-            r"healthy=(true|false)\b.*\bdrained=(true|false)\b",
-            out,
-        )
-        if not match:
-            raise RuntimeError("unexpected /bf maintenance status output")
-        draining, rooms, ranked, pending, healthy, drained = match.groups()
-        return {
-            "draining": draining == "true",
-            "rooms": int(rooms),
-            "ranked": int(ranked),
-            "pending": int(pending),
-            "healthy": healthy == "true",
-            "drained": drained == "true",
-        }
-
     def save_and_freeze(self, process: Process) -> None:
+        if process.goal.profile == "game":
+            raise ValueError("Workshop controller cannot save or stop Game")
         result = self._rcon(process.goal.profile, "save-all", "flush")
         if result is not None and "Saved the game" not in result:
             raise RuntimeError(f"save-all did not confirm success: {result}")
 
     def _scale(self, profile: str, replicas: int) -> None:
+        if profile == "game":
+            raise ValueError("Workshop controller cannot scale Game")
         self.run(
             [
                 "docker",
@@ -631,8 +693,8 @@ class DockerBackend:
             inventory = self.inventory()
             if (
                 all(inventory[p]["tasks"] == 0 for p in profiles)
-                and sum(inventory[p]["java"] for p in self.apps) + inventory["unknown"]
-                == 0
+                and all(inventory[p]["java"] == 0 for p in profiles)
+                and inventory["unknown"] == 0
             ):
                 return
             if time.monotonic() >= deadline:
@@ -644,12 +706,7 @@ class DockerBackend:
         self._wait_gone([self.app_of(process.goal.profile)])
 
     def fence_pending_starts(self) -> None:
-        selection = self.selection()
-        others = [
-            p
-            for p in self.apps
-            if p != self.app_of(selection["profile"] if selection else "game")
-        ]
+        others = ["workshop"]
         for profile in others:
             self._scale(profile, 0)
         deadline = time.monotonic() + self.stop_timeout
@@ -663,7 +720,17 @@ class DockerBackend:
                 raise TimeoutError(f"cannot fence {others}")
             time.sleep(self.poll)
 
+    def game_image(self) -> str:
+        image = self.container_spec("game").get("Image")
+        if not isinstance(image, str) or not re.fullmatch(
+            r"ghcr\.io/blockfield/blockfield-server(?::[A-Za-z0-9_.-]+)?@sha256:[0-9a-f]{64}",
+            image,
+        ):
+            raise ValueError("Game image must have an immutable server digest")
+        return image
+
     def start(self, goal: Goal) -> None:
+        self.preflight(goal)
         data = self.apps[self.app_of(goal.profile)].data
         if (
             goal.profile == "workshop"
@@ -693,10 +760,25 @@ class DockerBackend:
         }
         if goal.candidate:
             document["candidate"] = goal.candidate
+        selected_dir = self.lock_dir / self.app_of(goal.profile)
+        selected_dir.mkdir(exist_ok=True)
         atomic_write(
-            self.lock_dir / "profile.json",
+            selected_dir / "profile.json",
             json.dumps(document, sort_keys=True).encode(),
             0o644,
         )
         (data / READY_FILE).unlink(missing_ok=True)
+        image = self.game_image()
+        if self.container_spec("workshop").get("Image") != image:
+            self.run(
+                [
+                    "docker",
+                    "service",
+                    "update",
+                    "--detach",
+                    "--image",
+                    image,
+                    self.apps["workshop"].service,
+                ]
+            )
         self._scale(goal.profile, 1)

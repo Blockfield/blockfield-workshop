@@ -11,7 +11,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 from uuid import uuid4
-from controller import Controller, DEFAULT_MESSAGE, Goal, Process
+from controller import Controller, DEFAULT_MESSAGE, Goal, Process, INBOX_MERGE_MAX_BYTES
 from test_controller import FakeBackend
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
@@ -36,6 +36,8 @@ class InboxTests(unittest.TestCase):
             inbox_dir=self.inbox,
         )
         self.controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        self.controller.step()
+        self.backend.ready(Goal(**self.controller.status()["desired"]))
         self.controller.step()
         self.log = io.StringIO()
 
@@ -102,9 +104,8 @@ class InboxTests(unittest.TestCase):
         self.assertIn(
             f"inbox {request_id} kind='mode' actor=Nether ok", self.log.getvalue()
         )
-        self.backend.is_drained = True
         self.controller.step()
-        self.backend.processes = [Process(Goal(**state["desired"]), True)]
+        self.backend.ready(Goal(**state["desired"]))
         self.assertEqual(self.controller.step()["gate"], "builders")
         back = self.put(
             "mode",
@@ -113,10 +114,8 @@ class InboxTests(unittest.TestCase):
         )
         self.process()
         self.assertTrue(self.result(back)["ok"])
-        self.assertEqual(
-            self.controller.status()["desired"],
-            {"profile": "game", "release": "v1", "session": None, "candidate": None},
-        )
+        self.assertEqual(self.controller.status()["desired"], state["desired"])
+        self.assertEqual(self.backend.processes[0].goal.profile, "game")
 
     def test_stale_revision_and_recover_rules(self):
         stale = self.put("mode", profile="workshop", expectedRevision=0)
@@ -134,7 +133,6 @@ class InboxTests(unittest.TestCase):
     def test_recover_toward_game_steps_explicitly(self):
         self.put("mode", profile="workshop", expectedRevision=1)
         self.process()
-        self.backend.is_drained = True
         self.backend.fail_start = True
         self.assertEqual(self.controller.step()["phase"], "ERROR")
         status = json.loads((self.admin / "status.json").read_text())
@@ -180,8 +178,14 @@ class InboxTests(unittest.TestCase):
         self.put("mode", profile="workshop", expectedRevision=1)
         self.process()
         self.controller.step()
-        self.assertEqual(self.read("gate.json")["message"], "Строим новую карту")
-        self.assertEqual(self.read("public.json")["message"], "Строим новую карту")
+        self.assertEqual(
+            self.read("gate.json")["backends"]["workshop"]["message"],
+            "Строим новую карту",
+        )
+        self.assertEqual(
+            self.read("public.json")["workshop"]["message"], "Строим новую карту"
+        )
+        self.assertEqual(self.read("public.json")["message"], "")
         restarted = Controller(self.dir / "state", self.backend, admin_dir=self.admin)
         self.assertEqual(restarted.message, "Строим новую карту")
         for bad in ("x" * 201, "line\nbreak", 5):
@@ -273,6 +277,44 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(os.listdir(self.inbox), [])
         self.assertEqual(self.controller.message, "first")
 
+    def test_only_merge_requests_accept_large_exact_conflict_choices(self):
+        choices = {f"world/region/r.{index}.0.mca": "ours" for index in range(10000)}
+        for kind in ("merge-preview", "publish"):
+            request_id = self.put(kind, resolutions=choices)
+            path = self.inbox / f"{request_id}.json"
+            self.assertGreater(path.stat().st_size, 65536)
+            document, error = self.controller._load_request(path.name)
+            self.assertIsNone(error)
+            self.assertEqual(document["resolutions"], choices)
+        for kind in (
+            "candidate",
+            "commit",
+            "message",
+            "sessions",
+            "unknown",
+            ["publish"],
+            {"kind": "publish"},
+        ):
+            request_id = self.put(kind, resolutions=choices)
+            document, error = self.controller._load_request(f"{request_id}.json")
+            self.assertIsNone(document)
+            self.assertEqual(error, "request too large")
+        self.assertEqual(self.backend.events, ["start"])
+
+    def test_extended_merge_limit_and_duplicate_json_keys_fail_closed(self):
+        for kind in ("merge-preview", "publish"):
+            request_id = self.put(kind, padding="x" * INBOX_MERGE_MAX_BYTES)
+            document, error = self.controller._load_request(f"{request_id}.json")
+            self.assertIsNone(document)
+            self.assertEqual(error, "request too large")
+        request_id = str(uuid4())
+        (self.inbox / f"{request_id}.json").write_bytes(
+            b'{"schema":1,"kind":"message","kind":"publish"}'
+        )
+        document, error = self.controller._load_request(f"{request_id}.json")
+        self.assertIsNone(document)
+        self.assertEqual(error, "invalid json")
+
     def test_busy_lock_leaves_request(self):
         request_id = self.put("message", message="later")
         with open(self.dir / "state" / "controller.lock", "a") as lock:
@@ -316,18 +358,19 @@ class InboxTests(unittest.TestCase):
             {
                 "schema": 1,
                 "revision": 1,
-                "phase": "game",
-                "gate": "public",
+                "phase": "workshop",
+                "gate": "builders",
                 "error": None,
                 "errorMessage": None,
                 "deadline": None,
                 "desired": {
-                    "profile": "game",
+                    "profile": "workshop",
                     "release": "v1",
-                    "session": None,
+                    "session": self.controller.session()["id"],
                     "candidate": None,
                 },
                 "message": DEFAULT_MESSAGE,
+                "game": {"phase": "game", "gate": "public", "release": "v1"},
             },
         )
         inode = (self.admin / "status.json").stat().st_ino
@@ -346,10 +389,19 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(self.result(request_id)["error"], "invalid json")
         self.assertEqual(os.listdir(self.inbox), [])
 
+    def test_members_write_reports_lost_workshop_readiness_without_closing_game(self):
+        goal = Goal(**self.controller.status()["desired"])
+        self.backend.processes[-1] = Process(goal, False)
+        self.controller.set_members([ADMIN])
+        status = json.loads((self.admin / "status.json").read_bytes())
+        self.assertEqual((status["phase"], status["gate"]), ("workshop", "closed"))
+        self.assertEqual(
+            status["game"], {"phase": "game", "gate": "public", "release": "v1"}
+        )
+
     def test_failed_recovery_reports_error(self):
         self.put("mode", profile="workshop", expectedRevision=1)
         self.process()
-        self.backend.is_drained = True
         self.backend.fail_start = True
         self.controller.step()
         request_id = self.put(
@@ -368,7 +420,6 @@ class InboxTests(unittest.TestCase):
     def test_accepted_request_is_not_expired_after_busy_recovery_step(self):
         self.put("mode", profile="workshop", expectedRevision=1)
         self.process()
-        self.backend.is_drained = True
         self.backend.fail_start = True
         self.controller.step()
         self.backend.fail_start = False
@@ -439,11 +490,8 @@ class SessionAndPlaytestTests(unittest.TestCase):
         )
         self.process()
         self.assertTrue(self.result(request_id)["ok"], self.result(request_id))
-        self.backend.is_drained = True
         self.controller.step()
-        self.backend.processes = [
-            Process(Goal(**self.controller.status()["desired"]), True)
-        ]
+        self.backend.ready(Goal(**self.controller.status()["desired"]))
         self.controller.step()
         return json.loads((self.admin / "session.json").read_text())
 
@@ -460,7 +508,6 @@ class SessionAndPlaytestTests(unittest.TestCase):
         )
         self.process()
         self.assertTrue(self.result(back)["ok"])
-        self.backend.processes = [Process(Goal("game", "v1"), True)]
         self.controller.step()
         resumed = self.enter_workshop(session="resume")
         self.assertEqual(
@@ -468,6 +515,7 @@ class SessionAndPlaytestTests(unittest.TestCase):
         )
 
     def test_session_maps_are_validated(self):
+        previous = (self.admin / "session.json").read_bytes()
         for fields in (
             {"maps": ["atlantis"]},
             {"maps": []},
@@ -479,7 +527,7 @@ class SessionAndPlaytestTests(unittest.TestCase):
             )
             self.process()
             self.assertFalse(self.result(request_id)["ok"], fields)
-        self.assertFalse((self.admin / "session.json").exists())
+        self.assertEqual((self.admin / "session.json").read_bytes(), previous)
 
     def test_playtest_only_from_the_workshop_and_gate_testers(self):
         sha = "ab" * 32
@@ -487,11 +535,15 @@ class SessionAndPlaytestTests(unittest.TestCase):
         self.controller.maps = unittest.mock.Mock(
             sha256_of=lambda candidate: sha, map_ids=lambda: {"konstaxa", "fields"}
         )
+        state = self.controller.status()
+        state.update(phase="STARTING", gate="closed")
+        self.controller._write(state)
         early = self.put(
             "mode", profile="test", expectedRevision=1, candidateId="c" * 32
         )
         self.process()
         self.assertIn("only from the running workshop", self.result(early)["error"])
+        self.controller.step()
         session = self.enter_workshop()
         test = self.put(
             "mode",
@@ -507,13 +559,18 @@ class SessionAndPlaytestTests(unittest.TestCase):
             ("test", session["id"], sha),
         )
         self.controller.step()
-        self.backend.processes = [Process(Goal(**desired), True)]
+        self.backend.ready(Goal(**desired))
         self.assertEqual(self.controller.step()["gate"], "testers")
         gate = json.loads((self.dir / "gate.json").read_text())
         self.assertEqual(
-            (gate["gate"], gate["backend"], [m["name"] for m in gate["allowed"]]),
+            (
+                gate["backends"]["workshop"]["gate"],
+                "workshop",
+                [m["name"] for m in gate["backends"]["workshop"]["allowed"]],
+            ),
             ("testers", "workshop", ["Nether"]),
         )
         self.assertEqual(
-            json.loads((self.dir / "public.json").read_text())["mode"], "workshop"
+            json.loads((self.dir / "public.json").read_text())["workshop"]["mode"],
+            "workshop",
         )

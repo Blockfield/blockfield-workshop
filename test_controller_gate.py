@@ -26,11 +26,20 @@ class GateTests(unittest.TestCase):
         )
         self.goal = Goal("workshop", "v1", str(uuid4()))
 
-    def gate(self):
-        return json.loads((self.dir / "gate.json").read_text())
+    def gate(self, backend="workshop"):
+        document = json.loads((self.dir / "gate.json").read_text())
+        return {
+            "schema": document["schema"],
+            "revision": document["revision"],
+            "backend": backend,
+            **document["backends"][backend],
+        }
 
-    def public(self):
-        return json.loads((self.dir / "public.json").read_text())
+    def public(self, backend="workshop"):
+        document = json.loads((self.dir / "public.json").read_text())
+        if backend == "workshop":
+            return {**document["workshop"], "since": document["since"]}
+        return {k: document[k] for k in ("mode", "message", "since")}
 
     def stamps(self):
         return [
@@ -46,16 +55,15 @@ class GateTests(unittest.TestCase):
         self.controller.request(
             str(uuid4()), self.goal, self.controller.status()["revision"]
         )
-        self.backend.is_drained = True
         self.controller.step()
-        self.backend.processes = [Process(self.goal, True)]
+        self.backend.ready(self.goal)
         return self.controller.step()
 
     def test_game_adoption_exports_public(self):
         self.controller.request(str(uuid4()), Goal("game", "v1"), 0)
-        self.assertEqual(self.controller.step()["gate"], "public")
+        self.assertEqual(self.controller.step()["gate"], "closed")
         self.assertEqual(
-            self.gate(),
+            self.gate("game"),
             {
                 "schema": 1,
                 "revision": 1,
@@ -65,8 +73,13 @@ class GateTests(unittest.TestCase):
                 "allowed": [],
             },
         )
-        self.assertEqual(self.public()["mode"], "game")
-        self.assertEqual(self.public()["message"], "")
+        self.assertEqual(self.public("game")["mode"], "game")
+        self.assertEqual(self.public("game")["message"], "")
+        legacy = json.loads((self.dir / "gate.json").read_bytes())
+        self.assertEqual(
+            (legacy["gate"], legacy["backend"], legacy["allowed"]),
+            ("public", "game", []),
+        )
         self.assertNotIn("drain", self.backend.events)
 
     def test_stable_steps_do_not_rewrite_anything(self):
@@ -77,15 +90,15 @@ class GateTests(unittest.TestCase):
             self.assertEqual(self.controller.step()["gate"], "builders")
         self.assertEqual(self.stamps(), before)
 
-    def test_draining_never_flaps_through_closed(self):
+    def test_workshop_start_never_closes_game_entry(self):
         self.controller.request(str(uuid4()), self.goal, 0)
-        self.assertEqual(self.controller.step()["gate"], "draining")
+        self.assertEqual(self.controller.step()["phase"], "STARTING")
         before = self.stamps()
         for _ in range(5):
             self.controller.step()
-            self.assertEqual(self.gate()["gate"], "draining")
-            self.assertEqual(self.gate()["backend"], "game")
-            self.assertEqual(self.public()["mode"], "draining")
+            self.assertEqual(self.gate("game")["gate"], "public")
+            self.assertEqual(self.gate()["gate"], "closed")
+            self.assertEqual(self.public("game")["mode"], "game")
         self.assertEqual(self.stamps(), before)
 
     def test_workshop_gate_carries_acl_and_message(self):
@@ -99,7 +112,6 @@ class GateTests(unittest.TestCase):
             ]
         )
         self.controller.request(str(uuid4()), self.goal, 0)
-        self.backend.is_drained = True
         self.controller.step()
         closed = self.gate()
         self.assertEqual(
@@ -107,7 +119,7 @@ class GateTests(unittest.TestCase):
             ("closed", "workshop", []),
         )
         self.assertEqual(closed["message"], DEFAULT_MESSAGE)
-        self.backend.processes = [Process(self.goal, True)]
+        self.backend.ready(self.goal)
         self.controller.step()
         self.assertEqual(
             self.gate()["allowed"],
@@ -187,15 +199,13 @@ class GateTests(unittest.TestCase):
         self.controller.request(str(uuid4()), self.goal, 0)
         self.controller.step()
         since = self.public()["since"]
-        self.backend.is_drained = True
-        self.controller.step()
-        self.assertNotEqual(self.public()["mode"], "draining")
         self.controller.step()
         self.assertEqual(self.public()["mode"], "maintenance")
         maintenance_since = self.public()["since"]
         self.assertGreaterEqual(maintenance_since, since)
         self.controller.step()
         self.assertEqual(self.public()["since"], maintenance_since)
+        self.assertEqual(self.public("game")["mode"], "game")
 
     def test_deleted_export_is_restored_by_next_step(self):
         self.to_workshop()
@@ -205,17 +215,30 @@ class GateTests(unittest.TestCase):
 
     def test_error_exports_closed(self):
         self.controller.request(str(uuid4()), self.goal, 0)
-        self.backend.is_drained = True
         self.backend.fail_start = True
         self.assertEqual(self.controller.step()["phase"], "ERROR")
         self.assertEqual(self.gate()["gate"], "closed")
         self.assertEqual(self.public()["mode"], "maintenance")
+        self.assertEqual(self.gate("game")["gate"], "public")
+        self.assertEqual(self.public("game")["mode"], "game")
+
+    def test_workshop_message_never_replaces_game_unavailable_message(self):
+        self.to_workshop()
+        self.controller.set_message("Строим новую карту")
+        self.backend.processes[0] = Process(Goal("game", "v1"), False)
+        self.controller.step()
+        self.assertEqual(self.gate("game")["message"], DEFAULT_MESSAGE)
+        self.assertEqual(self.public("game")["message"], DEFAULT_MESSAGE)
+        self.assertEqual(self.gate()["message"], "Строим новую карту")
+        self.assertEqual(self.gate()["gate"], "builders")
 
     def test_recover_toward_game_only_and_only_explicitly(self):
         self.to_workshop()
         self.backend.fail_save = True
         self.controller.request(
-            str(uuid4()), Goal("game", "v1"), self.controller.status()["revision"]
+            str(uuid4()),
+            Goal("test", "v1", self.goal.session, "a" * 64),
+            self.controller.status()["revision"],
         )
         self.assertEqual(self.controller.step()["phase"], "ERROR")
         revision = self.controller.status()["revision"]
@@ -237,8 +260,8 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.controller.step(recover=True)["phase"], "STARTING")
         new = self.backend.events[len(events) :]
         self.assertEqual(new, ["fence", "save", "stop", "start"])
-        self.backend.processes = [Process(Goal("game", "v2"), True)]
-        self.assertEqual(self.controller.step()["gate"], "public")
+        self.backend.ready(Goal("workshop", "v2", self.goal.session))
+        self.assertEqual(self.controller.step()["gate"], "builders")
 
 
 if __name__ == "__main__":

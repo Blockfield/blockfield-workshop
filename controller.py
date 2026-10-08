@@ -1,6 +1,6 @@
-"""Durable single-backend transition core. The Docker adapter lives in docker_backend.py.
+"""Durable Workshop/test lifecycle beside a passively observed Game backend.
 
-A trusted adapter must fence all other starters and expose actual process readiness,
+A trusted adapter must fence Workshop starters and expose actual process readiness,
 not an optimistic HTTP response. Proxy/web consumers must fail closed on absent state.
 """
 
@@ -76,17 +76,6 @@ class Backend(Protocol):
     def observe(self) -> list[Process]:
         """Return EVERY full backend, including unready/stopping processes."""
 
-    def request_drain(self) -> None:
-        """Reject new campaigns; keep all rounds and valid reconnects of active campaigns."""
-
-    def drain_progress(self) -> dict | None:
-        """None when there is nothing to drain (matches the old drained()==True fast path).
-
-        Otherwise a dict with "drained" (bool) plus whatever `bf maintenance status` reports:
-        "rooms", "ranked", "pending" (int) and "healthy" (bool), used to size the drain deadline
-        and to short-circuit the "nothing left but stats unhealthy" case.
-        """
-
     def save_and_freeze(self, process: Process) -> None:
         """Finish tools, save world+config and stop new writes; raise on uncertainty."""
 
@@ -94,14 +83,14 @@ class Backend(Protocol):
         """Graceful stop; success is rechecked by observe before any new start."""
 
     def fence_pending_starts(self) -> None:
-        """Cancel/settle ALL previously accepted starts before explicit recovery.
+        """Cancel/settle previously accepted Workshop starts before explicit recovery.
 
         Returning must guarantee no delayed old request can later start a backend.
         Raise if that cannot be established. An empty observe() alone is not fencing.
         """
 
     def start(self, goal: Goal) -> None:
-        """Start the single allowed backend with isolated data; no parallel staging."""
+        """Start the selected Workshop/test backend; never mutate Game."""
 
 
 DEFAULT_MESSAGE = (
@@ -116,6 +105,7 @@ SCOPE_IDS = MAP_IDS | {"hub"}
 NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
 INBOX_NAME = re.compile(r"[0-9a-f-]{36}\.json")
 INBOX_MAX_BYTES = 65536
+INBOX_MERGE_MAX_BYTES = 8 << 20
 INBOX_BATCH = 20
 INBOX_TTL_MS = 10 * 60 * 1000
 RESULTS_KEPT = 200
@@ -216,25 +206,14 @@ class Controller:
         message: str = DEFAULT_MESSAGE,
         admin_dir: Path | None = None,
         inbox_dir: Path | None = None,
-        drain_timeout: float = 600.0,
-        drain_timeout_ranked: float = 3600.0,
-        drain_health_grace: float = 60.0,
         start_timeout: float = 600.0,
         now: Callable[[], float] | None = None,
         maps=None,
     ):
-        """drain_timeout/drain_timeout_ranked: DRAINING deadline (seconds) with no/some ranked campaigns
-        left; drain_health_grace: extra short-circuit when rooms=ranked=pending=0 but stats are still
-        unhealthy (the 2026-09-18 incident) -- don't hold players hostage to that flag. start_timeout:
-        STARTING deadline. An exceeded deadline rolls back when a previous stable profile is recorded.
-        """
+        """A missed STARTING deadline restores a previous Workshop/test goal when available."""
         # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
         self.maps = maps
-        self.drain_timeout, self.drain_timeout_ranked = (
-            drain_timeout,
-            drain_timeout_ranked,
-        )
-        self.drain_health_grace, self.start_timeout = drain_health_grace, start_timeout
+        self.start_timeout = start_timeout
         self._now = now or time.time
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -363,6 +342,23 @@ class Controller:
                 Goal(**state["rollback"])
             except (ValueError, TypeError, AttributeError) as error:
                 raise ValueError("invalid rollback goal") from error
+        follow = state.get("releaseFollow")
+        if follow is not None:
+            try:
+                previous = Goal(**follow["previous"])
+                digest = follow["sessionDigest"]
+                if (
+                    set(follow) != {"previous", "sessionDigest"}
+                    or phase not in {"REQUESTED", "SAVING", "STARTING", "ERROR"}
+                    or previous.profile != "workshop"
+                    or replace(previous, release=goal.release) != goal
+                    or previous.release == goal.release
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    raise ValueError("inconsistent release follow")
+            except (ValueError, TypeError, KeyError) as error:
+                raise ValueError("invalid release follow") from error
         return state
 
     def _write(self, state: dict) -> None:
@@ -439,6 +435,20 @@ class Controller:
         choice, previous = document.get("session", "new"), self.session()
         if choice not in {"new", "resume"}:
             raise ValueError("session must be new or resume")
+        if "sessionId" in document:
+            if (
+                choice != "resume"
+                or "maps" in document
+                or "branches" in document
+                or getattr(self.maps, "canonical_sessions", False) is not True
+            ):
+                raise ValueError(
+                    "archived resume requires sessionId without map/branch overrides"
+                )
+            archived = self.maps.session(document["sessionId"])
+            if archived is None:
+                raise ValueError("archived session not found")
+            return archived
         maps = (
             document.get("maps")
             if "maps" in document
@@ -460,15 +470,27 @@ class Controller:
                 raise ValueError(
                     f"unknown map id: {sorted(set(maps) - self._map_ids())}"
                 )
-        if choice == "resume" and previous:
-            return {**previous, "maps": maps}
-        return {
-            "schema": 1,
-            "id": str(uuid4()),
-            "maps": maps,
-            "startedAt": self._now_ms(),
-            "startedBy": actor,
-        }
+        result = (
+            {**previous, "maps": maps}
+            if choice == "resume" and previous
+            else {
+                "schema": 1,
+                "id": str(uuid4()),
+                "maps": maps,
+                "startedAt": self._now_ms(),
+                "startedBy": actor,
+            }
+        )
+        if "branches" in document:
+            if getattr(self.maps, "canonical_sessions", False) is not True:
+                raise ValueError("named branches require canonical sessions")
+            result["branches"] = document["branches"]
+        elif isinstance(maps, list) and "branches" in result:
+            result["branches"] = {
+                map_id: result["branches"].get(map_id, "work-" + result["id"])
+                for map_id in maps
+            }
+        return result
 
     def _save_session(self, session: dict) -> None:
         atomic_write(
@@ -478,9 +500,7 @@ class Controller:
         if self.admin_dir is not None:
             self._replace_if_changed(self.admin_dir / "session.json", session, keep=())
 
-    def _selected_session(
-        self, goal: Goal, session: dict | None = None, *, resume_only=False
-    ) -> dict:
+    def _session_selection(self, goal: Goal, session: dict | None = None) -> dict:
         session = session if session is not None else self.session()
         if (
             not isinstance(session, dict)
@@ -489,9 +509,13 @@ class Controller:
             or session.get("id") != goal.session
         ):
             raise ValueError("workshop session does not match selected profile")
+        previous = self.session()
+        resuming = previous and previous.get("id") == goal.session
         maps = session.get("maps")
         if maps is None:
-            maps = sorted(self._map_ids())
+            maps = previous.get("maps") if resuming else None
+            if maps is None:
+                maps = sorted(self._map_ids())
         if (
             not isinstance(maps, list)
             or not maps
@@ -500,14 +524,80 @@ class Controller:
             or set(maps) - self._map_ids()
         ):
             raise ValueError("invalid selected session maps")
-        selected = {**session, "maps": maps}
-        self.maps.prepare_session(goal.session, maps, resume_only=resume_only)
+        from candidates import MapVersions
+
+        branches = session.get(
+            "branches",
+            previous.get("branches")
+            if resuming and "branches" in previous
+            else {map_id: "work-" + goal.session for map_id in maps},
+        )
+        if not isinstance(branches, dict) or set(branches) != set(maps):
+            raise ValueError("session branches must match selected maps")
+        for name in branches.values():
+            if MapVersions._branch_name(name) == "main":
+                raise ValueError("main is protected; select a work branch")
+        if resuming:
+            prior = previous.get(
+                "branches",
+                {
+                    map_id: "work-" + goal.session
+                    for map_id in previous.get("maps") or maps
+                },
+            )
+            if not isinstance(prior, dict) or any(
+                map_id in prior and prior[map_id] != name
+                for map_id, name in branches.items()
+            ):
+                raise ValueError("switching branches requires a new isolated session")
+        return {**session, "maps": maps, "branches": branches}
+
+    def _selected_session(
+        self, goal: Goal, session: dict | None = None, *, resume_only=False
+    ) -> dict:
+        selected = self._session_selection(goal, session)
+        self.maps.prepare_session(
+            goal.session,
+            selected["maps"],
+            resume_only=resume_only,
+            branches=selected["branches"],
+            actor=selected.get("startedBy") or {"draslId": "host", "name": "host"},
+        )
         return selected
+
+    def _editor_goal(self, release: str, state: dict) -> tuple[Goal, dict]:
+        session = self.session()
+        if session is None:
+            if (state.get("desired") or {}).get("profile") in {"workshop", "test"}:
+                raise ValueError("selected workshop session is missing or invalid")
+            session = {
+                "schema": 1,
+                "id": (state.get("desired") or {}).get("session") or str(uuid4()),
+                "maps": None,
+                "startedAt": self._now_ms(),
+                "startedBy": None,
+            }
+        return Goal("workshop", release, session["id"]), session
+
+    def _session_digest(self) -> str | None:
+        session = self.session()
+        if session is None:
+            return None
+        data = json.dumps(session, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        return hashlib.sha256(data.encode()).hexdigest()
+
+    def _observe(self) -> tuple[list[Process], Process | None, Process | None]:
+        processes = self.backend.observe()
+        game = [p for p in processes if p.goal.profile == "game"]
+        workshop = [p for p in processes if p.goal.profile in {"workshop", "test"}]
+        if len(game) > 1 or len(workshop) > 1:
+            raise RuntimeError("multiple full backends of the same app observed")
+        return processes, game[0] if game else None, workshop[0] if workshop else None
 
     def _export(self, state: dict, *, deadline: int | None = None) -> None:
         """Proxy gate (private ACL) and public site status. Rewritten only when content changes.
 
-        deadline is passed in by the caller for the ticks where it is live (DRAINING/STARTING wait
+        deadline is passed in by the caller for the ticks where it is live (STARTING wait
         loops); it is derived from "since" rather than persisted, so it is never stale on disk.
         """
         gate = (
@@ -515,33 +605,51 @@ class Controller:
             if state["gate"] in {"public", "draining", "builders", "testers"}
             else "closed"
         )
-        profile = (state.get("desired") or {}).get("profile", "game")
-        # The playtest (profile test) runs in the workshop app for the same members.
+        game_status = {"phase": "UNAVAILABLE", "gate": "closed", "release": None}
+        try:
+            _, game, workshop = self._observe()
+            if game is not None:
+                game_status = {
+                    "phase": "game" if game.ready else "STARTING",
+                    "gate": "public" if game.ready else "closed",
+                    "release": game.goal.release,
+                }
+            if (
+                workshop is None
+                or not workshop.ready
+                or asdict(workshop.goal) != state.get("desired")
+            ):
+                gate = "closed"
+        except Exception:
+            gate = "closed"
         members_gate = gate in {"builders", "testers"}
-        backend = (
-            "workshop"
-            if members_gate or (gate == "closed" and profile in {"workshop", "test"})
-            else "game"
-        )
+        workshop_gate = {
+            "gate": gate if members_gate else "closed",
+            "message": self.message,
+            "allowed": self.members() if members_gate else [],
+        }
+        game_gate = {
+            "gate": game_status["gate"],
+            "message": "" if game_status["gate"] == "public" else self.default_message,
+            "allowed": [],
+        }
         gate_doc = {
             "schema": 1,
             "revision": state["revision"],
-            "gate": gate,
-            "backend": backend,
-            "message": "" if gate == "public" else self.message,
-            "allowed": self.members() if members_gate else [],
+            **game_gate,
+            "backend": "game",
+            "backends": {"game": game_gate, "workshop": workshop_gate},
         }
         self._replace_if_changed(self.gate_file, gate_doc, keep=())
-        mode = {
-            "public": "game",
-            "draining": "draining",
-            "builders": "workshop",
-            "testers": "workshop",
-        }.get(gate, "maintenance")
+        mode = "game" if game_status["gate"] == "public" else "maintenance"
         public = {
             "mode": mode,
-            "message": "" if mode == "game" else self.message,
+            "message": "" if mode == "game" else self.default_message,
             "since": int(time.time() * 1000),
+            "workshop": {
+                "mode": "workshop" if members_gate else "maintenance",
+                "message": self.message,
+            },
         }
         self._replace_if_changed(self.public_file, public, keep=("since",))
         if self.admin_dir:
@@ -557,12 +665,13 @@ class Controller:
                 "schema": 1,
                 "revision": state["revision"],
                 "phase": state["phase"],
-                "gate": state["gate"],
+                "gate": workshop_gate["gate"],
                 "error": state.get("error"),
                 "errorMessage": state.get("errorMessage"),
                 "since": state.get("since"),
                 "deadline": deadline,
                 "desired": state.get("desired"),
+                "game": game_status,
                 "message": self.message,
                 "updatedAt": int(time.time() * 1000),
             }
@@ -598,15 +707,19 @@ class Controller:
         *,
         recover: bool = False,
         session: dict | None = None,
+        resume_only: bool = False,
     ) -> dict:
         """Persist intent only. No side effect on a running backend until step is called.
 
-        recover=True accepts an ERROR state, but only toward the game profile; the phase stays
-        ERROR so only an explicit step(recover=True) can act on it.
+        The legacy game action resumes the persistent editor. recover=True keeps ERROR
+        until an explicit step(recover=True) fences and retries Workshop.
         """
         UUID(operation)
         with self._locked():
             state = self._read()
+            returning = goal.profile == "game"
+            if returning:
+                goal, session = self._editor_goal(goal.release, state)
             if state.get("operation") == operation:
                 if state.get("desired") != asdict(goal):
                     raise ValueError("operation ID reused with different intent")
@@ -616,9 +729,7 @@ class Controller:
                 or expected_revision != state["revision"]
             ):
                 raise ValueError("stale state revision")
-            recovering = (
-                recover and state.get("phase") == "ERROR" and goal.profile == "game"
-            )
+            recovering = recover and state.get("phase") == "ERROR" and returning
             if (
                 state.get("phase") not in {"UNINITIALIZED", "game", "workshop", "test"}
                 and not recovering
@@ -626,10 +737,7 @@ class Controller:
                 raise RuntimeError("operation in progress or requires recovery")
             self.backend.preflight(goal)
             previous_session = self.session()
-            if (
-                goal.profile == "workshop"
-                and getattr(self.maps, "canonical_sessions", False) is True
-            ):
+            if goal.profile == "workshop":
                 if session is None:
                     session = (
                         previous_session
@@ -643,14 +751,23 @@ class Controller:
                             "startedBy": None,
                         }
                     )
-                session = self._selected_session(goal, session)
+                if getattr(self.maps, "canonical_sessions", False) is True:
+                    session = self._selected_session(
+                        goal,
+                        session,
+                        resume_only=resume_only
+                        or bool(
+                            previous_session
+                            and previous_session.get("id") == goal.session
+                        ),
+                    )
             revision = state["revision"] + 1
             # The stable phase we're leaving IS the running goal (phase==goal.profile is an invariant of
-            # _read()); remember it now so a later DRAINING/STARTING timeout can roll back to it without
+            # _read()); remember it now so a later STARTING timeout can roll back to it without
             # relying on backend.observe() still agreeing once things go wrong.
             previous_stable = (
                 state.get("desired")
-                if state.get("phase") in {"game", "workshop", "test"}
+                if state.get("phase") in {"workshop", "test"}
                 else None
             )
             state = {
@@ -706,26 +823,35 @@ class Controller:
             return state
 
     def step(self, *, recover: bool = False) -> dict:
-        """One reconciliation under a process lock. Retry STARTING/DRAINING, don't start a worker.
+        """Reconcile Workshop only; Game is observed for readiness and release compatibility.
 
-        ERROR requires explicit recovery. STARTING with no visible process waits closed:
+        ERROR requires explicit recovery, except the one recorded automatic release refresh
+        restored by a ready Game rollback to its exact previous release. STARTING waits closed:
         absence cannot distinguish a failed request from an accepted, delayed start.
         Explicit recovery fences pending starts before considering another start.
         A repeated step never counts as forced interruption. State is written only when
-        phase/gate/error change, so a stable or draining gate never flaps through closed.
+        phase/gate/error change, so a stable gate never flaps through closed.
 
-        DRAINING and STARTING each carry a deadline (see __init__); past it, step() rolls back to
-        the profile recorded in state["rollback"]. Without a rollback goal it keeps observing readiness.
+        STARTING has a deadline and may restore a previous Workshop/test goal. A missing
+        process after a durable start never proves that the accepted start was cancelled.
         """
         with self._locked():
-            state = self._read()
-            if state.get("desired") is None:
-                raise RuntimeError("no requested operation")
-            if state.get("phase") == "ERROR" and not recover:
-                self._export(state)
-                return state
+            try:
+                state = self._read()
+            except (ValueError, OSError) as error:
+                self._export(
+                    {
+                        "revision": 0,
+                        "phase": "ERROR",
+                        "gate": "closed",
+                        "error": type(error).__name__,
+                        "errorMessage": str(error),
+                        "desired": None,
+                    }
+                )
+                raise
             previous_phase = state["phase"]
-            goal = Goal(**state["desired"])
+            goal = Goal(**state["desired"]) if state.get("desired") else None
 
             def commit(
                 phase: str,
@@ -743,12 +869,87 @@ class Controller:
                         state["since"] = self._now_ms()
                         if phase in {"game", "workshop", "test"}:
                             state["rollback"] = None
+                            state["releaseFollow"] = None
                     state.update(
                         phase=phase, gate=gate, error=error, errorMessage=error_message
                     )
                     self._write(state)
 
             try:
+                processes, game, current = self._observe()
+                if (
+                    not recover
+                    and current is not None
+                    and not current.ready
+                    and current.goal.release == "unknown"
+                ):
+                    state["releaseFollow"] = None
+                    raise RuntimeError(
+                        "Workshop selection is missing or invalid; explicit recovery required"
+                    )
+                follow = state.get("releaseFollow")
+                if (
+                    not recover
+                    and follow is not None
+                    and game is not None
+                    and game.ready
+                    and game.goal.release == follow["previous"]["release"]
+                ):
+                    # A rollback is attempted once; corrupt sessions or failed preflight still require manual recovery.
+                    state.update(phase="ERROR", gate="closed", releaseFollow=None)
+                    self._write(state)
+                    if self._session_digest() != follow["sessionDigest"]:
+                        raise ValueError(
+                            "release rollback requires the exact original workshop session"
+                        )
+                    goal = Goal(**follow["previous"])
+                    self.backend.preflight(goal)
+                    if getattr(self.maps, "canonical_sessions", False) is True:
+                        self._selected_session(goal, resume_only=True)
+                    # Consume this exact rollback before any stop/start; a failed restoration is never retried implicitly.
+                    state.update(
+                        revision=state["revision"] + 1,
+                        operation=str(uuid4()),
+                        desired=asdict(goal),
+                        releaseFollow=None,
+                        rollback=None,
+                        since=self._now_ms(),
+                    )
+                    self._write(state)
+                    recover = True
+                    previous_phase = "ERROR"
+                elif previous_phase == "ERROR" and not recover:
+                    self._export(state)
+                    return state
+                if goal is None or goal.profile == "game":
+                    release = goal.release if goal else None
+                    if game is not None and game.ready:
+                        release = game.goal.release
+                    if release is None:
+                        self._export(state)
+                        return state
+                    goal, session = self._editor_goal(release, state)
+                    if getattr(self.maps, "canonical_sessions", False) is True:
+                        session = self._session_selection(goal, session)
+                    self._save_session(session)
+                    state.update(
+                        revision=state["revision"] + 1,
+                        phase="ERROR" if previous_phase == "ERROR" else "REQUESTED",
+                        gate="closed",
+                        operation=state.get("operation") or str(uuid4()),
+                        desired=asdict(goal),
+                        since=self._now_ms(),
+                        rollback=None,
+                    )
+                    self._write(state)
+                    self.backend.preflight(goal)
+                    if getattr(self.maps, "canonical_sessions", False) is True:
+                        self._selected_session(goal, session)
+                    previous_phase = state["phase"]
+                if (state.get("rollback") or {}).get("profile") == "game":
+                    # A legacy global switch must never restart or stop the independently running Game.
+                    state["rollback"] = None
+                    self._write(state)
                 if recover and previous_phase in {"STARTING", "ERROR"}:
                     commit(
                         previous_phase,
@@ -757,20 +958,73 @@ class Controller:
                         state.get("errorMessage"),
                     )
                     self.backend.fence_pending_starts()
-                processes = self.backend.observe()
-                if len(processes) > 1:
-                    raise RuntimeError("multiple full backends observed")
-                current = processes[0] if processes else None
+                    processes, game, current = self._observe()
+                if (
+                    getattr(self.maps, "canonical_sessions", False) is True
+                    and state["phase"] == "workshop"
+                    and current is not None
+                    and current.ready
+                    and current.goal == goal
+                ):
+                    selected = self._selected_session(goal, resume_only=True)
+                    if selected != self.session():
+                        self._save_session(selected)
                 if (
                     current is not None
-                    and goal.profile == current.goal.profile == "game"
-                    and current.goal.release != goal.release
-                    and replace(current.goal, release=goal.release) == goal
+                    and not current.ready
+                    and current.goal.release == "unknown"
                 ):
-                    # A release tag redeployed the game image; follow it instead of draining and restarting.
+                    state["releaseFollow"] = None
+                    raise RuntimeError(
+                        "Workshop selection is missing or invalid; explicit recovery required"
+                    )
+                if (
+                    current is not None
+                    and current.ready
+                    and game is not None
+                    and game.ready
+                    and state["phase"] in {"STARTING", "workshop"}
+                    and goal.profile == current.goal.profile == "workshop"
+                    and current.goal.release == game.goal.release
+                    and replace(current.goal, release=goal.release) == goal
+                    and current.goal.release != goal.release
+                ):
+                    # Game may advance between preflight and start; readiness still binds the exact editor session.
                     goal = current.goal
                     state["desired"] = asdict(goal)
                     self._write(state)
+                if (
+                    current is not None
+                    and game is not None
+                    and game.ready
+                    and state["phase"] == "workshop"
+                    and current.goal == goal
+                    and current.ready
+                    and game.goal.release != goal.release
+                ):
+                    session = self.session()
+                    if session is None or session.get("id") != goal.session:
+                        raise ValueError(
+                            "selected workshop session is missing or invalid"
+                        )
+                    follow = {
+                        "previous": asdict(goal),
+                        "sessionDigest": self._session_digest(),
+                    }
+                    goal = replace(goal, release=game.goal.release)
+                    state.update(
+                        revision=state["revision"] + 1,
+                        phase="REQUESTED",
+                        gate="closed",
+                        operation=str(uuid4()),
+                        desired=asdict(goal),
+                        since=self._now_ms(),
+                        rollback=None,
+                        releaseFollow=follow,
+                    )
+                    self._write(state)
+                    self.backend.preflight(goal)
+                    previous_phase = "REQUESTED"
                 if current is not None and current.goal == goal:
                     if current.ready:
                         commit(goal.profile, OPEN_GATES[goal.profile])
@@ -794,26 +1048,21 @@ class Controller:
                 ):
                     self._selected_session(goal, resume_only=True)
                 if current is not None:
-                    if current.goal.profile == "game":
-                        commit("DRAINING", "draining")
-                        self.backend.request_drain()
-                        progress = self.backend.drain_progress()
-                        if progress is not None and not progress.get("drained", False):
-                            verdict = self._drain_wait(state, progress)
-                            if verdict is not None:
-                                return self._rollback(state, goal, verdict)
-                            return state
                     commit("SAVING", "closed")
                     self.backend.save_and_freeze(current)
                     self.backend.stop(current)
-                    if self.backend.observe():
+                    remaining, _, managed = self._observe()
+                    if managed is not None:
                         raise RuntimeError("old backend not confirmed stopped")
-                    if self.maps is not None:
+                    if self.maps is not None and not remaining:
                         self.maps.versions.reclaim_unheaded_bundles()
                 commit("STARTING", "closed")
                 self.backend.start(goal)
                 return state
             except Exception as error:
+                if state.get("desired") is None:
+                    self._export(state)
+                    raise
                 state.update(
                     phase="ERROR",
                     gate="closed",
@@ -843,37 +1092,9 @@ class Controller:
         self._export(state, deadline=state["since"] + int(self.start_timeout * 1000))
         return state
 
-    def _drain_wait(self, state: dict, progress: dict) -> str | None:
-        """None to keep waiting (also exports the live deadline); else the rollback reason."""
-        now_ms, since = self._now_ms(), state["since"]
-        nothing_left = (
-            not progress.get("rooms")
-            and not progress.get("ranked")
-            and not progress.get("pending")
-        )
-        if nothing_left and progress.get("healthy") is False:
-            if now_ms - since > self.drain_health_grace * 1000:
-                return (
-                    f"drain: nothing left to drain but stats persistence stayed unhealthy for "
-                    f"{(now_ms - since) // 1000}s; rolling back rather than risk losing results ({progress})"
-                )
-            deadline = since + int(self.drain_health_grace * 1000)
-        else:
-            timeout = (
-                self.drain_timeout_ranked
-                if progress.get("ranked")
-                else self.drain_timeout
-            )
-            if now_ms - since > timeout * 1000:
-                return f"drain timed out after {(now_ms - since) // 1000}s: {progress}"
-            deadline = since + int(timeout * 1000)
-        self._export(state, deadline=deadline)
-        return None
-
     def _rollback(self, state: dict, goal: Goal, reason: str) -> dict:
         """Abandon the in-flight switch and reopen the gate of the previously stable profile.
 
-        DRAINING never touched the old backend, so reverting is just switching "desired" back.
         STARTING already stopped it, so bring it back up before declaring the profile stable again;
         if that itself fails there is no safe automatic move left, so it becomes an ERROR (root recovery).
         """
@@ -882,14 +1103,16 @@ class Controller:
             self._export(state)
             return state
         stable = Goal(**state["rollback"])
-        if (
-            stable.profile in {"workshop", "test"}
-            and state.get("rollbackSession") is not None
-        ):
-            self._save_session(state["rollbackSession"])
+        if stable.profile == "game":
+            raise RuntimeError("legacy Game rollback must be migrated before recovery")
         if state["phase"] == "STARTING":
             try:
+                self.backend.preflight(stable)
+                if state.get("rollbackSession") is not None:
+                    self._save_session(state["rollbackSession"])
                 self.backend.stop(Process(goal, False))
+                if self._observe()[2] is not None:
+                    raise RuntimeError("rollback backend not confirmed stopped")
                 self.backend.start(stable)
             except Exception as error:
                 state.update(
@@ -972,7 +1195,7 @@ class Controller:
                 done = 0
                 for _, name, document, error in pending:
                     request_id = name[: -len(".json")]
-                    actor, revision = "?", None
+                    actor, revision, payload = "?", None, None
                     try:
                         if error:
                             raise ValueError(error)
@@ -991,7 +1214,11 @@ class Controller:
                             or now_ms - document["createdAt"] > INBOX_TTL_MS
                         ) and self.status().get("operation") != request_id:
                             raise ValueError("request expired")
-                        revision = self._apply(request_id, document)
+                        applied = self._apply(request_id, document)
+                        if isinstance(applied, dict):
+                            payload = applied
+                        else:
+                            revision = applied
                     except BlockingIOError:
                         break
                     except Exception as failure:
@@ -1005,6 +1232,8 @@ class Controller:
                         "revision": revision,
                         "doneAt": now_ms,
                     }
+                    if payload is not None:
+                        result["payload"] = payload
                     atomic_write(
                         results / name,
                         json.dumps(result, ensure_ascii=False, sort_keys=True).encode(),
@@ -1065,9 +1294,16 @@ class Controller:
         self._replace_if_changed(
             self.admin_dir / "candidates.json", self.maps.export(), keep=()
         )
+        sessions = self.maps.sessions()
         self._replace_if_changed(
             self.admin_dir / "maps.json",
-            {"schema": 1, "maps": self.maps.catalog()},
+            {
+                "schema": 1,
+                "maps": self.maps.catalog(),
+                "sessions": sessions["sessions"],
+                "sessionsTotal": sessions["total"],
+                "sessionsNext": sessions["next"],
+            },
             keep=(),
         )
 
@@ -1089,17 +1325,33 @@ class Controller:
             )
         except OSError:
             return None, "not a regular file"
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             os.close(fd)
             return None, "not a regular file"
+        if info.st_size > INBOX_MERGE_MAX_BYTES:
+            os.close(fd)
+            return None, "request too large"
         with os.fdopen(fd, "rb") as handle:
             data = handle.read(INBOX_MAX_BYTES + 1)
-        if len(data) > INBOX_MAX_BYTES:
+            if len(data) > INBOX_MAX_BYTES:
+                data += handle.read(INBOX_MERGE_MAX_BYTES + 1 - len(data))
+        if len(data) > INBOX_MERGE_MAX_BYTES:
             return None, "request too large"
         try:
-            document = json.loads(data)
+            from map_package import _json
+
+            document = _json(data)
         except Exception:  # includes RecursionError from deeply nested input
-            return None, "invalid json"
+            return None, "request too large" if len(
+                data
+            ) > INBOX_MAX_BYTES else "invalid json"
+        if len(data) > INBOX_MAX_BYTES and (
+            not isinstance(document, dict)
+            or not isinstance(document.get("kind"), str)
+            or document.get("kind") not in {"merge-preview", "publish"}
+        ):
+            return None, "request too large"
         if (
             not isinstance(document, dict)
             or type(document.get("schema")) is not int
@@ -1113,30 +1365,43 @@ class Controller:
             raise ValueError("map publishing is not configured")
         with self._locked():
             state = self.status()
-            processes = self.backend.observe()
+            _, _, current = self._observe()
             if (
                 state["phase"] != "workshop"
-                or len(processes) != 1
-                or processes[0].goal.profile != "workshop"
-                or not processes[0].ready
+                or current is None
+                or current.goal.profile != "workshop"
+                or not current.ready
+                or asdict(current.goal) != state["desired"]
             ):
                 raise ValueError(
-                    "native Limbo export requires the one ready workshop backend"
+                    "native Limbo export requires the selected ready workshop backend"
                 )
             return self.maps.export_limbo(version, self.backend)
 
     def _snapshot(
-        self, map_id: str, actor: dict, note: str, *, working_copy_id=None
+        self,
+        map_id: str,
+        actor: dict,
+        note: str,
+        *,
+        working_copy_id=None,
+        branch=None,
+        expected_branch_head=None,
+        commit=False,
+        authorize=False,
     ) -> dict:
         # A map that is not a draft is refused before entry closes and the workshop stops (stand acceptance 2026-09-24).
         options = (
             {"working_copy_id": working_copy_id} if working_copy_id is not None else {}
         )
-        self.maps.check(map_id, **options)
+        if branch is None or commit:
+            self.maps.check(map_id, **options)
         with self._locked():
+            if authorize:
+                actor = self._map_actor(actor, map_id)
             state = self._read()
-            if state["phase"] not in {"game", "workshop"}:
-                raise ValueError("snapshot requires a stable game or workshop")
+            if state["phase"] != "workshop":
+                raise ValueError("snapshot requires a stable workshop")
             if getattr(self.maps, "canonical_sessions", False) is True:
                 selected = self.session()
                 if (
@@ -1150,16 +1415,42 @@ class Controller:
                         "snapshot requires the exact selected session and map"
                     )
                 self.maps.versions.validate_working_copy(map_id, working_copy_id)
-            processes = self.backend.observe()
+            if branch is not None or commit:
+                if getattr(self.maps, "canonical_sessions", False) is not True:
+                    raise ValueError("branch snapshots require canonical sessions")
+                if (
+                    not isinstance(note, str)
+                    or len(note) > 200
+                    or commit
+                    and not note.strip()
+                ):
+                    raise ValueError("commit message required (1–200 characters)")
+                if branch != selected.get("branches", {}).get(map_id):
+                    raise ValueError("snapshot requires the exact selected branch")
+                if (
+                    self.maps.versions.branch(map_id, branch)["versionDigest"]
+                    != expected_branch_head
+                ):
+                    raise ValueError("stale branch head: refresh before committing")
+                options.update(branch=branch, expected_branch_head=expected_branch_head)
+            _, _, current = self._observe()
             if (
-                len(processes) != 1
-                or not processes[0].ready
-                or asdict(processes[0].goal) != state["desired"]
+                current is None
+                or not current.ready
+                or asdict(current.goal) != state["desired"]
             ):
                 raise RuntimeError("snapshot backend does not match controller state")
-            current = processes[0]
-            if current.goal.profile == "game":
-                return self.maps.create(map_id, actor, note, **options)
+            if branch is not None and not commit:
+                meta = self.maps.review(
+                    map_id,
+                    actor,
+                    note,
+                    working_copy_id=working_copy_id,
+                    branch=branch,
+                    expected_head=expected_branch_head,
+                )
+                self.export_maps()
+                return meta
             # Durable closed state: a controller crash must not reopen a half-finished snapshot.
             state.update(
                 phase="ERROR",
@@ -1182,9 +1473,11 @@ class Controller:
             try:
                 self.backend.save_and_freeze(current)
                 self.backend.stop(current)
-                if self.backend.observe():
+                remaining, _, managed = self._observe()
+                if managed is not None:
                     raise RuntimeError("workshop not confirmed stopped")
-                self.maps.versions.reclaim_unheaded_bundles()
+                if not remaining:
+                    self.maps.versions.reclaim_unheaded_bundles()
             except Exception as error:
                 fail(error)
                 raise
@@ -1192,7 +1485,17 @@ class Controller:
             # comes back either way; only the request reports the error.
             meta, copy_error = None, None
             try:
-                meta = self.maps.create(map_id, actor, note, **options)
+                if commit:
+                    meta = self.maps.commit(
+                        map_id,
+                        actor,
+                        note,
+                        working_copy_id=working_copy_id,
+                        branch=branch,
+                        expected_head=expected_branch_head,
+                    )
+                else:
+                    meta = self.maps.create(map_id, actor, note, **options)
                 self.export_maps()
             except Exception as error:
                 copy_error = error
@@ -1212,8 +1515,64 @@ class Controller:
                 raise copy_error
             return meta
 
-    def _apply(self, request_id: str, document: dict) -> int | None:
+    def _member_actor(self, actor: dict) -> dict:
+        principal = member(
+            {**actor, "role": "builder"}, scopes=self._map_ids() | {"hub"}
+        )
+        admitted = next(
+            (
+                entry
+                for entry in self.members()
+                if (
+                    entry["draslId"] == principal["draslId"]
+                    and entry["name"] == principal["name"]
+                )
+            ),
+            None,
+        )
+        if admitted is None:
+            raise ValueError("map actor is not an authenticated workshop member")
+        return admitted
+
+    def _map_actor(self, actor: dict, map_id: str, *, admin=False) -> dict:
+        admitted = self._member_actor(actor)
+        if admin and admitted["role"] != "admin":
+            raise ValueError("main map operations require an admin")
+        if map_id not in self._map_ids() or (
+            admitted["role"] == "builder"
+            and map_id not in admitted.get("maps", self._map_ids())
+        ):
+            raise ValueError("map is outside the actor's scope")
+        return {key: admitted[key] for key in ("draslId", "name")}
+
+    def _merge_preview(self, map_id, source, expected_head, resolutions=None) -> dict:
+        self.maps.versions.check_head(map_id, expected_head)
+        preview = self.maps.versions.merge_preview(
+            map_id, source, expected_head, resolutions
+        )
+        return {
+            key: preview[key]
+            for key in (
+                "mapId",
+                "baseVersion",
+                "sourceVersion",
+                "targetVersion",
+                "conflicts",
+                "unresolved",
+                "changes",
+            )
+        }
+
+    def _apply(self, request_id: str, document: dict) -> int | dict | None:
         kind = document.get("kind")
+        if kind == "sessions":
+            if self.maps is None:
+                raise ValueError("map publishing is not configured")
+            with self._locked():
+                self._member_actor(document["actor"])
+                return self.maps.sessions(
+                    document.get("offset", 0), document.get("limit", 100)
+                )
         if kind == "members":
             entries = document.get("members")
             if not isinstance(entries, list):
@@ -1229,7 +1588,7 @@ class Controller:
             self.set_message(document.get("message"))
             return None
         if kind == "cancel":
-            # Unprivileged recovery: an admin cancels a stuck DRAINING/STARTING switch without root.
+            # An admin cancels a stuck Workshop transition without root.
             return self.cancel()["revision"]
         if kind in {
             "candidate",
@@ -1239,6 +1598,10 @@ class Controller:
             "checkout",
             "export",
             "limbo-export",
+            "branch-create",
+            "commit",
+            "compare",
+            "merge-preview",
         }:
             force = document.get("force", False)
             if type(force) is not bool:
@@ -1249,49 +1612,111 @@ class Controller:
                 "draslId": document["actor"]["draslId"],
                 "name": document["actor"]["name"],
             }
-            if kind == "candidate":
-                self._snapshot(
+            map_id = document.get("mapId")
+            if kind in {"publish", "reject", "export"}:
+                meta = next(
+                    (
+                        entry
+                        for entry in self.maps.list()
+                        if entry["id"] == document.get("candidateId")
+                    ),
+                    None,
+                )
+                if meta is None:
+                    raise ValueError("unknown candidate")
+                map_id = meta["mapId"]
+            elif kind == "limbo-export":
+                map_id = "limbo"
+            actor = self._map_actor(
+                actor,
+                map_id,
+                admin=kind in {"publish", "reject", "rollback", "limbo-export"},
+            )
+            result = None
+            if kind in {"candidate", "commit"}:
+                result = self._snapshot(
                     document.get("mapId"),
                     actor,
                     document.get("note", ""),
                     working_copy_id=document.get("workingCopyId"),
+                    branch=document.get("branch"),
+                    expected_branch_head=document.get("expectedBranchHead"),
+                    commit=kind == "commit",
+                    authorize=True,
                 )
             elif kind == "limbo-export":
                 self.export_limbo(document.get("versionDigest"))
             else:
                 with self._locked():
+                    actor = self._map_actor(
+                        actor, map_id, admin=kind in {"publish", "reject", "rollback"}
+                    )
                     if kind == "publish":
                         options = (
                             {"expected_head": document["expectedHead"]}
                             if "expectedHead" in document
                             else {}
                         )
-                        self.maps.publish(
-                            document.get("candidateId"), actor, force=force, **options
+                        if meta.get("sourceBranch"):
+                            if force:
+                                raise ValueError(
+                                    "force cannot bypass map merge conflicts"
+                                )
+                            if (
+                                "expectedHead" in document
+                                and meta.get("targetHead") != document["expectedHead"]
+                            ):
+                                raise ValueError(
+                                    "review target changed; submit a new review"
+                                )
+                        result = self.maps.publish(
+                            document.get("candidateId"),
+                            actor,
+                            force=force,
+                            resolutions=document.get("resolutions"),
+                            **options,
                         )
                     elif kind == "reject":
-                        self.maps.reject(document.get("candidateId"), actor)
+                        result = self.maps.reject(document.get("candidateId"), actor)
                     elif kind == "checkout":
-                        self.maps.checkout(
+                        result = self.maps.checkout(
                             document.get("mapId"),
                             document.get("versionDigest"),
                             document.get("workingCopyId"),
                         )
                     elif kind == "export":
                         self.maps.archive_path(document.get("candidateId"))
+                    elif kind == "branch-create":
+                        result = self.maps.versions.create_branch(
+                            map_id,
+                            document.get("branch"),
+                            document.get("versionDigest"),
+                            actor,
+                        )
+                    elif kind == "compare":
+                        result = self.maps.versions.compare(
+                            map_id, document.get("before"), document.get("after")
+                        )
+                    elif kind == "merge-preview":
+                        result = self._merge_preview(
+                            map_id,
+                            document.get("versionDigest"),
+                            document.get("expectedHead"),
+                            document.get("resolutions"),
+                        )
                     else:
                         if "expectedHead" not in document:
                             raise ValueError(
                                 "rollback requires versionDigest and expectedHead"
                             )
-                        self.maps.rollback(
+                        result = self.maps.rollback(
                             document.get("mapId"),
                             actor,
                             version_digest=document.get("versionDigest"),
                             expected_head=document["expectedHead"],
                         )
             self.export_maps()
-            return None
+            return result
         if kind != "mode":
             raise ValueError("unknown kind")
         profile, expected, recover = (
@@ -1307,6 +1732,8 @@ class Controller:
             raise ValueError("invalid mode request")
         if recover and profile != "game":
             raise ValueError("recover is only allowed toward game")
+        if "sessionId" in document and profile != "workshop":
+            raise ValueError("archived sessionId is only allowed toward workshop")
         state, session = self.status(), None
         if state.get("operation") == request_id:
             goal = Goal(**state["desired"])
@@ -1336,7 +1763,12 @@ class Controller:
             else:
                 goal = Goal("game", release)
         state = self.request(
-            request_id, goal, expected, recover=recover, session=session
+            request_id,
+            goal,
+            expected,
+            recover=recover,
+            session=session,
+            resume_only="sessionId" in document,
         )
         if recover:
             state = self.step(recover=True)

@@ -13,6 +13,7 @@ from controller import Controller, Goal, Process
 from docker_backend import App, DockerBackend, JAVA_PATTERN, READY_FILE
 
 GAME_CID, WORKSHOP_CID, OTHER_CID = "a" * 64, "b" * 64, "c" * 64
+GAME_IMAGE = "ghcr.io/blockfield/blockfield-server:latest@sha256:" + "d" * 64
 
 FAKE = r"""
 import json, os, sys
@@ -49,14 +50,13 @@ elif argv[1:3] == ["service", "scale"]:
         for pid in java_of(service["container"]):
             del state["java"][pid]
     if replicas == "1" and state.get("autostart", True) and not java_of(service["container"]):
-        if state["java"]:
-            with log.open("a") as handle:
-                handle.write(json.dumps(["OVERLAP"]) + "\n")
         pid = str(1000 + int(service["container"][0], 16))
         state["java"][pid] = service["container"]
         (proc / pid).mkdir(parents=True, exist_ok=True)
         (proc / pid / "cgroup").write_text("0::/system.slice/docker-" + service["container"] + ".scope\n")
         (proc / pid / "comm").write_text("java\n")
+elif argv[1:3] == ["service", "update"]:
+    services[argv[-1]].setdefault("spec", {})["Image"] = argv[-2]
 elif argv[1] == "exec":
     print(state.get("rcon", {}).get(" ".join(argv[4:]), ""))
 state_path.write_text(json.dumps(state))
@@ -81,8 +81,16 @@ class DockerBackendTests(unittest.TestCase):
         self.state_file, self.log = root / "state.json", root / "calls.log"
         self.state = {
             "services": {
-                "bf-game": {"replicas": 0, "container": GAME_CID},
-                "bf-workshop": {"replicas": 0, "container": WORKSHOP_CID},
+                "bf-game": {
+                    "replicas": 0,
+                    "container": GAME_CID,
+                    "spec": {"Image": GAME_IMAGE},
+                },
+                "bf-workshop": {
+                    "replicas": 0,
+                    "container": WORKSHOP_CID,
+                    "spec": {"Image": GAME_IMAGE},
+                },
             },
             "java": {},
             "rcon": {"save-all flush": "Saved the game"},
@@ -125,7 +133,8 @@ class DockerBackendTests(unittest.TestCase):
         (self.proc / str(pid) / "comm").write_text(comm + "\n")
         self.save()
 
-    def running(self, profile, pid=100):
+    def running(self, profile, pid=None):
+        pid = pid if pid is not None else 100 if profile == "game" else 200
         self.load()
         service = self.state["services"][f"bf-{profile}"]
         service["replicas"] = 1
@@ -154,8 +163,17 @@ class DockerBackendTests(unittest.TestCase):
                 "--format",
                 "{{json .Spec.TaskTemplate.ContainerSpec}}",
             ],
-            ["docker", "service", "scale", "--detach", "bf-game=0"],
-            ["docker", "exec", GAME_CID, "rcon-cli", "bf", "maintenance", "status"],
+            ["docker", "service", "scale", "--detach", "bf-workshop=0"],
+            [
+                "docker",
+                "service",
+                "update",
+                "--detach",
+                "--image",
+                GAME_IMAGE,
+                "bf-workshop",
+            ],
+            ["docker", "exec", WORKSHOP_CID, "rcon-cli", "save-all", "flush"],
             ["pgrep", "-f", JAVA_PATTERN],
         ]
         bad = [
@@ -169,6 +187,25 @@ class DockerBackendTests(unittest.TestCase):
             ],
             ["docker", "rm", "-f", "bf-game"],
             ["docker", "service", "scale", "--detach", "bf-game=2"],
+            ["docker", "service", "scale", "--detach", "bf-game=0"],
+            [
+                "docker",
+                "service",
+                "update",
+                "--detach",
+                "--image",
+                GAME_IMAGE,
+                "bf-game",
+            ],
+            [
+                "docker",
+                "service",
+                "update",
+                "--detach",
+                "--image",
+                "ghcr.io/blockfield/blockfield-server:latest",
+                "bf-workshop",
+            ],
             ["docker", "service", "scale", "--detach", "other=1"],
             ["docker", "exec", GAME_CID, "rcon-cli", "op", "Nether"],
             ["docker", "exec", "bf-game", "rcon-cli", "save-all", "flush"],
@@ -369,7 +406,7 @@ class DockerBackendTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.backend.observe()
 
-    def test_waiting_task_of_unselected_profile_is_not_a_backend(self):
+    def test_game_pending_task_is_observed_independently(self):
         (self.lock / "profile.json").write_text(
             json.dumps(
                 {
@@ -384,25 +421,59 @@ class DockerBackendTests(unittest.TestCase):
         self.load()
         self.state["services"]["bf-game"]["replicas"] = 1
         self.save()
-        self.assertEqual(self.backend.observe(), [])
+        self.assertEqual(
+            self.backend.observe(), [Process(Goal("game", "unknown"), False)]
+        )
 
     def test_corrupt_selection_fails_closed(self):
         (self.lock / "profile.json").write_text('{"schema":1,"profile":"game"}')
         self.running("game")
-        with self.assertRaises(ValueError):
-            self.backend.observe()
+        self.assertTrue(all(not process.ready for process in self.backend.observe()))
+
+    def test_bad_game_selection_leaves_workshop_readiness_intact(self):
+        session = str(uuid4())
+        goal = Goal("workshop", "v1", session)
+        self.backend.start(goal)
+        selected = self.backend.selection()
+        self.ready(
+            "workshop", generation=selected["generation"], session=session, release="v1"
+        )
+        (self.lock / "game").mkdir()
+        (self.lock / "game/profile.json").write_text('{"schema":1,"profile":"game"}')
+        self.running("game")
+        self.assertEqual(
+            self.backend.observe(),
+            [Process(Goal("game", "unknown"), False), Process(goal, True)],
+        )
+
+    def test_malformed_readiness_cannot_adopt_a_game(self):
+        self.running("game")
+        for ready in (
+            {"profile": "game"},
+            {"profile": "game", "generation": None, "session": None, "release": ""},
+            {
+                "profile": "game",
+                "generation": None,
+                "session": str(uuid4()),
+                "release": "v1",
+            },
+        ):
+            (self.data["game"] / READY_FILE).write_text(json.dumps(ready))
+            self.assertEqual(
+                self.backend.observe(), [Process(Goal("game", "unknown"), False)]
+            )
 
     def test_start_selects_profile_and_readiness_needs_generation(self):
         session = str(uuid4())
         self.ready("workshop", generation=None, session=session, release="v1")
         self.backend.start(Goal("workshop", "v1", session))
-        selection = json.loads((self.lock / "profile.json").read_text())
+        selection = json.loads((self.lock / "workshop/profile.json").read_text())
         self.assertEqual(
             (selection["profile"], selection["session"], selection["release"]),
             ("workshop", session, "v1"),
         )
         self.assertEqual(
-            oct((self.lock / "profile.json").stat().st_mode & 0o777), "0o644"
+            oct((self.lock / "workshop/profile.json").stat().st_mode & 0o777), "0o644"
         )
         self.assertFalse((self.data["workshop"] / READY_FILE).exists())
         self.assertIn(
@@ -428,88 +499,79 @@ class DockerBackendTests(unittest.TestCase):
         self.assertEqual(self.backend.observe(), [Process(goal, True)])
 
     def test_game_follows_release_deployed_outside_controller(self):
-        self.backend.start(Goal("game", "v1"))
-        selection = json.loads(
-            (self.lock / "profile.json").read_text()
-        )  # fake scale=1 already started java
-        self.ready(
-            "game", generation=selection["generation"], session=None, release="v2"
+        self.running("game")
+        generation = str(uuid4())
+        (self.lock / "game").mkdir()
+        (self.lock / "game/profile.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "profile": "game",
+                    "generation": generation,
+                    "session": None,
+                    "release": "v1",
+                }
+            )
         )
+        self.ready("game", generation=generation, session=None, release="v2")
         self.assertEqual(self.backend.observe(), [Process(Goal("game", "v2"), True)])
         self.ready("game", generation=str(uuid4()), session=None, release="v2")
         self.assertEqual(self.backend.observe(), [Process(Goal("game", "v2"), False)])
 
-    def test_drain_status_parsing(self):
-        self.running("game")
-        status = "bf maintenance status"
-        for line, expected in (
-            (
-                "draining=true rooms=0 ranked=0 pending=0 healthy=true drained=true",
-                {
-                    "draining": True,
-                    "rooms": 0,
-                    "ranked": 0,
-                    "pending": 0,
-                    "healthy": True,
-                    "drained": True,
-                },
-            ),
-            (
-                "draining=true rooms=1 ranked=1 pending=0 healthy=true drained=false",
-                {
-                    "draining": True,
-                    "rooms": 1,
-                    "ranked": 1,
-                    "pending": 0,
-                    "healthy": True,
-                    "drained": False,
-                },
-            ),
-            (
-                "draining=false rooms=0 ranked=0 pending=0 healthy=true drained=false",
-                {
-                    "draining": False,
-                    "rooms": 0,
-                    "ranked": 0,
-                    "pending": 0,
-                    "healthy": True,
-                    "drained": False,
-                },
-            ),
-        ):
-            self.load()
-            self.state["rcon"][status] = line
-            self.save()
-            self.assertEqual(self.backend.drain_progress(), expected)
-        self.load()
-        self.state["rcon"][status] = "Unknown or incomplete command"
+    def test_game_lifecycle_is_not_owned_by_workshop(self):
+        goal = Goal("game", "v1")
+        for action in (self.backend.start, self.backend.preflight):
+            with self.assertRaises(ValueError):
+                action(goal)
+        for action in (self.backend.stop, self.backend.save_and_freeze):
+            with self.assertRaises(ValueError):
+                action(Process(goal, True))
+        self.assertEqual(self.calls(), [])
+
+    def test_workshop_follows_only_an_immutable_game_image(self):
+        self.state["services"]["bf-workshop"]["spec"]["Image"] = "old"
         self.save()
-        with self.assertRaises(RuntimeError):
-            self.backend.drain_progress()
-        self.backend.request_drain()
+        self.backend.start(Goal("workshop", "v1", str(uuid4())))
         self.assertIn(
-            ["docker", "exec", GAME_CID, "rcon-cli", "bf", "maintenance", "drain"],
+            [
+                "docker",
+                "service",
+                "update",
+                "--detach",
+                "--image",
+                GAME_IMAGE,
+                "bf-workshop",
+            ],
             self.calls(),
         )
-
-    def test_nothing_to_drain_or_save_without_java(self):
         self.load()
-        self.state["services"]["bf-game"]["replicas"] = 1
+        self.state["services"]["bf-game"]["spec"]["Image"] = (
+            "ghcr.io/blockfield/blockfield-server:latest"
+        )
         self.save()
-        self.assertIsNone(self.backend.drain_progress())
-        self.backend.save_and_freeze(Process(Goal("game", "v1"), False))
-        self.assertFalse([c for c in self.calls() if c[:2] == ["docker", "exec"]])
+        with self.assertRaises(ValueError):
+            self.backend.preflight(Goal("workshop", "v1", str(uuid4())))
+
+    def test_save_without_workshop_java_has_no_side_effect(self):
+        self.running("game")
+        self.backend.save_and_freeze(
+            Process(Goal("workshop", "v1", str(uuid4())), False)
+        )
+        self.assertFalse(any(call[1] == "exec" for call in self.calls()))
 
     def test_stop_waits_for_java_exit(self):
         self.running("game")
-        self.backend.stop(Process(Goal("game", "v1"), True))
-        self.assertEqual(self.backend.inventory()["game"], {"tasks": 0, "java": 0})
-        self.running("game")
+        self.running("workshop")
+        process = Process(Goal("workshop", "v1", str(uuid4())), True)
+        self.backend.stop(process)
+        self.assertEqual(self.backend.inventory()["workshop"], {"tasks": 0, "java": 0})
+        self.assertEqual(self.backend.inventory()["game"], {"tasks": 1, "java": 1})
+        self.running("workshop")
         self.load()
         self.state["stop_leaves_java"] = True
         self.save()
         with self.assertRaises(TimeoutError):
-            self.backend.stop(Process(Goal("game", "v1"), True))
+            self.backend.stop(process)
 
     def test_save_requires_success_and_snapshot_requires_no_workshop_java(self):
         self.running("workshop")
@@ -555,66 +617,49 @@ class DockerBackendTests(unittest.TestCase):
             self.backend.preflight(Goal("test", "v1", str(uuid4()), "a" * 64))
         self.lock.rmdir()
         with self.assertRaises(FileNotFoundError):
-            self.backend.preflight(Goal("game", "v1"))
+            self.backend.preflight(Goal("workshop", "v1", str(uuid4())))
 
-    def test_controller_round_trip_keeps_one_java(self):
+    def test_workshop_restart_keeps_game_running_and_its_generation(self):
         self.running("game")
         self.ready("game", generation=None, session=None, release="v1")
-        controller = Controller(Path(self.temp.name) / "controller", self.backend)
-        controller.request(str(uuid4()), Goal("game", "v1"), 0)
-        self.assertEqual(controller.step()["gate"], "public")
-
         session = str(uuid4())
-        workshop = Goal("workshop", "v1", session)
-        controller.request(str(uuid4()), workshop, 1)
-        status = "bf maintenance status"
-        self.load()
-        self.state["rcon"][status] = (
-            "draining=true rooms=1 ranked=1 pending=0 healthy=true drained=false"
+        goal = Goal("workshop", "v1", session)
+        self.backend.start(goal)
+        selected = self.backend.selection()
+        self.ready(
+            "workshop", generation=selected["generation"], session=session, release="v1"
         )
-        self.save()
-        self.assertEqual(controller.step()["gate"], "draining")
-        self.load()
-        self.state["rcon"][status] = (
-            "draining=true rooms=0 ranked=0 pending=0 healthy=true drained=true"
+        self.assertEqual(
+            self.backend.observe(),
+            [Process(Goal("game", "v1"), True), Process(goal, True)],
         )
-        self.save()
-        self.assertEqual(controller.step()["phase"], "STARTING")
-        self.assertEqual(controller.step()["gate"], "closed")
-        generation = json.loads((self.lock / "profile.json").read_text())["generation"]
-        self.ready("workshop", generation=generation, session=session, release="v1")
-        self.assertEqual(controller.step()["gate"], "builders")
-
-        controller.request(str(uuid4()), Goal("game", "v1"), 2)
-        self.assertEqual(controller.step()["phase"], "STARTING")
-        self.assertFalse((self.data["game"] / READY_FILE).exists())
-        generation = json.loads((self.lock / "profile.json").read_text())["generation"]
-        self.ready("game", generation=generation, session=None, release="v1")
-        self.assertEqual(controller.step()["gate"], "public")
-
-        calls = self.calls()
-        self.assertNotIn(["OVERLAP"], calls)
-        self.assertIn(
-            ["docker", "exec", WORKSHOP_CID, "rcon-cli", "save-all", "flush"], calls
+        self.backend.stop(Process(goal, True))
+        self.backend.start(goal)
+        self.assertNotEqual(
+            selected["generation"], self.backend.selection()["generation"]
         )
-        self.assertLess(
-            calls.index(["docker", "service", "scale", "--detach", "bf-game=0"]),
-            calls.index(["docker", "service", "scale", "--detach", "bf-workshop=1"]),
-        )
-        self.assertLess(
-            calls.index(["docker", "service", "scale", "--detach", "bf-workshop=0"]),
-            calls.index(["docker", "service", "scale", "--detach", "bf-game=1"]),
+        self.assertEqual(self.backend.inventory()["game"], {"tasks": 1, "java": 1})
+        self.assertEqual(self.backend.observe()[0], Process(Goal("game", "v1"), True))
+        self.assertFalse(
+            any(
+                call[1:3] == ["service", "scale"] and call[-1].startswith("bf-game=")
+                for call in self.calls()
+            )
         )
 
     def test_playtest_runs_in_the_workshop_app_and_returns(self):
         session, sha = str(uuid4()), "ab" * 32
+        self.running("game")
+        self.ready("game", generation=None, session=None, release="v1")
         extracted = []
         self.backend.maps = mock.Mock(
             extract=lambda digest, target: extracted.append((digest, target)) or "dust2"
         )
         self.running("workshop")
         self.backend.start(Goal("workshop", "v1", session))
-        generation = json.loads((self.lock / "profile.json").read_text())["generation"]
+        generation = json.loads((self.lock / "workshop/profile.json").read_text())[
+            "generation"
+        ]
         self.ready("workshop", generation=generation, session=session, release="v1")
         controller = Controller(Path(self.temp.name) / "controller", self.backend)
         controller.request(str(uuid4()), Goal("workshop", "v1", session), 0)
@@ -623,10 +668,13 @@ class DockerBackendTests(unittest.TestCase):
         test = Goal("test", "v1", session, sha)
         controller.request(str(uuid4()), test, 1)
         self.assertEqual(controller.step()["phase"], "STARTING")
-        selection = json.loads((self.lock / "profile.json").read_text())
+        selection = json.loads((self.lock / "workshop/profile.json").read_text())
         self.assertEqual((selection["profile"], selection["candidate"]), ("test", sha))
         self.assertEqual(extracted, [(sha, self.data["workshop"] / "test-candidate")])
-        self.assertEqual(self.backend.observe(), [Process(test, False)])
+        self.assertEqual(
+            self.backend.observe(),
+            [Process(Goal("game", "v1"), True), Process(test, False)],
+        )
         (self.data["workshop"] / READY_FILE).write_text(
             json.dumps(
                 {
@@ -641,7 +689,9 @@ class DockerBackendTests(unittest.TestCase):
 
         controller.request(str(uuid4()), Goal("workshop", "v1", session), 2)
         self.assertEqual(controller.step()["phase"], "STARTING")
-        generation = json.loads((self.lock / "profile.json").read_text())["generation"]
+        generation = json.loads((self.lock / "workshop/profile.json").read_text())[
+            "generation"
+        ]
         self.ready("workshop", generation=generation, session=session, release="v1")
         self.assertEqual(controller.step()["gate"], "builders")
         calls = self.calls()
