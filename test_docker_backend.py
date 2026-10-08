@@ -10,7 +10,13 @@ from pathlib import Path
 from unittest import mock
 from uuid import uuid4
 from controller import Controller, Goal, Process
-from docker_backend import App, DockerBackend, JAVA_PATTERN, READY_FILE
+from docker_backend import (
+    App,
+    DockerBackend,
+    JAVA_PATTERN,
+    READY_FILE,
+    _check_readonly_view,
+)
 
 GAME_CID, WORKSHOP_CID, OTHER_CID = "a" * 64, "b" * 64, "c" * 64
 GAME_IMAGE = "ghcr.io/blockfield/blockfield-server:latest@sha256:" + "d" * 64
@@ -730,19 +736,13 @@ class DockerBackendTests(unittest.TestCase):
             calls.count(["docker", "service", "scale", "--detach", "bf-workshop=0"]), 2
         )
 
-    def test_configured_readonly_views_accept_dokploy_generated_mounts(self):
+    def _setup_workshop_fixture(self, active_ro=None, admin_ro=None):
         from candidates import MapStore
 
         root = Path(self.temp.name)
-        active_dir = root / "active"
-        admin_dir = root / "admin"
-        view_active = root / "views/maps-active"
-        view_admin = root / "views/workshop-admin"
-        active_dir.mkdir(parents=True, exist_ok=True)
-        admin_dir.mkdir(parents=True, exist_ok=True)
-        view_active.mkdir(parents=True, exist_ok=True)
-        view_admin.mkdir(parents=True, exist_ok=True)
-
+        active, admin = root / "active", root / "admin"
+        active.mkdir(parents=True, exist_ok=True)
+        admin.mkdir(parents=True, exist_ok=True)
         self.backend.maps = MapStore(
             self.data["workshop"],
             root / "templates",
@@ -750,27 +750,11 @@ class DockerBackendTests(unittest.TestCase):
             root / "archive/candidates",
             root / "archive/backups",
             archive_root=root / "archive",
-            active_root=active_dir,
+            active_root=active,
         )
-        self.backend.admin_dir = admin_dir
-        self.backend.map_active_readonly_dir = view_active
-        self.backend.admin_readonly_dir = view_admin
-
-        valid_env = {
-            "BF_GAME_SERVICE": "bf-game",
-            "BF_WORKSHOP_SERVICE": "bf-workshop",
-            "BF_MAP_ACTIVE_READONLY_DIR": str(view_active),
-            "BF_ADMIN_READONLY_DIR": str(view_admin),
-        }
-        backend_from_env = DockerBackend.from_env(valid_env)
-        self.assertEqual(backend_from_env.map_active_readonly_dir, view_active)
-        self.assertEqual(backend_from_env.admin_readonly_dir, view_admin)
-        backend_unconfigured = DockerBackend.from_env(
-            {"BF_GAME_SERVICE": "bf-game", "BF_WORKSHOP_SERVICE": "bf-workshop"}
-        )
-        self.assertIsNone(backend_unconfigured.map_active_readonly_dir)
-        self.assertIsNone(backend_unconfigured.admin_readonly_dir)
-
+        self.backend.admin_dir = admin
+        self.backend.map_active_readonly_dir = active_ro
+        self.backend.admin_readonly_dir = admin_ro
         spec = {
             "Env": [
                 "BLOCKFIELD_PROFILE=workshop",
@@ -780,21 +764,21 @@ class DockerBackendTests(unittest.TestCase):
             "Mounts": [
                 {
                     "Type": "bind",
-                    "Source": str(view_active),
+                    "Source": str(active_ro or active),
                     "Target": "/maps-active",
-                    "ReadOnly": False,
+                    "ReadOnly": False if active_ro else True,
                 },
                 {
                     "Type": "bind",
-                    "Source": str(active_dir / "drafts"),
+                    "Source": str(active / "drafts"),
                     "Target": "/maps-active/drafts",
                     "ReadOnly": False,
                 },
                 {
                     "Type": "bind",
-                    "Source": str(view_admin),
+                    "Source": str(admin_ro or admin),
                     "Target": "/workshop-admin",
-                    "ReadOnly": False,
+                    "ReadOnly": False if admin_ro else True,
                 },
                 {
                     "Type": "bind",
@@ -806,499 +790,86 @@ class DockerBackendTests(unittest.TestCase):
         }
         self.state["services"]["bf-workshop"]["spec"] = spec
         self.save()
-        goal = Goal("workshop", "v1", str(uuid4()))
+        return active, admin
 
-        real_samefile = os.path.samefile
-
-        def fake_samefile(p1, p2):
-            pair = {Path(p1), Path(p2)}
-            if pair == {active_dir, view_active} or pair == {admin_dir, view_admin}:
-                return True
-            return real_samefile(p1, p2)
-
-        fake_stat = mock.Mock(
-            f_flag=os.ST_RDONLY,
-            f_bavail=10**8,
-            f_frsize=4096,
-            f_blocks=10**8,
-            f_bfree=10**8,
-            f_bsize=4096,
-        )
-        with (
-            mock.patch("os.path.samefile", side_effect=fake_samefile),
-            mock.patch("os.statvfs", return_value=fake_stat),
-        ):
-            self.backend.preflight(goal)
-
-    def test_readonly_view_original_strict_still_refuses_rw_and_wrong_source(self):
-        from candidates import MapStore
-
+    def test_check_readonly_view_core_validation(self):
         root = Path(self.temp.name)
-        active_dir = root / "active"
-        admin_dir = root / "admin"
-        active_dir.mkdir(parents=True, exist_ok=True)
-        admin_dir.mkdir(parents=True, exist_ok=True)
+        source = root / "canonical"
+        view = root / "view"
+        source.mkdir(parents=True, exist_ok=True)
+        view.mkdir(parents=True, exist_ok=True)
+        stat_ro = mock.Mock(f_flag=os.ST_RDONLY)
 
-        self.backend.maps = MapStore(
-            self.data["workshop"],
-            root / "templates",
-            root / "published",
-            root / "archive/candidates",
-            root / "archive/backups",
-            archive_root=root / "archive",
-            active_root=active_dir,
-        )
-        self.backend.admin_dir = admin_dir
-        goal = Goal("workshop", "v1", str(uuid4()))
-
-        base_mounts = [
-            {
-                "Type": "bind",
-                "Source": str(active_dir),
-                "Target": "/maps-active",
-                "ReadOnly": True,
-            },
-            {
-                "Type": "bind",
-                "Source": str(active_dir / "drafts"),
-                "Target": "/maps-active/drafts",
-                "ReadOnly": False,
-            },
-            {
-                "Type": "bind",
-                "Source": str(admin_dir),
-                "Target": "/workshop-admin",
-                "ReadOnly": True,
-            },
-            {
-                "Type": "bind",
-                "Source": str(self.lock),
-                "Target": "/backend-lock",
-                "ReadOnly": False,
-            },
-        ]
-        self.state["services"]["bf-workshop"]["spec"] = {
-            "Env": [
-                "BLOCKFIELD_PROFILE=workshop",
-                "BF_MAP_ACTIVE_DIR=/maps-active",
-                "BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts",
-            ],
-            "Mounts": [dict(m) for m in base_mounts],
-        }
-        self.save()
-
-        # 1. Unconfigured: active source RW rejected
-        self.state["services"]["bf-workshop"]["spec"]["Mounts"][0]["ReadOnly"] = False
-        self.save()
-        with self.assertRaisesRegex(ValueError, "mount"):
-            self.backend.preflight(goal)
-
-        # 2. Configured view: active source RW STILL rejected
-        view_active = root / "views/maps-active"
-        view_active.mkdir(parents=True, exist_ok=True)
-        self.backend.map_active_readonly_dir = view_active
-        with self.assertRaisesRegex(ValueError, "mount"):
-            self.backend.preflight(goal)
-
-        # 3. Wrong source on active mount rejected
-        self.state["services"]["bf-workshop"]["spec"]["Mounts"][0] = {
-            "Type": "bind",
-            "Source": str(root / "wrong"),
-            "Target": "/maps-active",
-            "ReadOnly": True,
-        }
-        self.save()
-        with self.assertRaisesRegex(ValueError, "mount"):
-            self.backend.preflight(goal)
-
-        # 4. Drafts mount cannot be ReadOnly: True
-        self.state["services"]["bf-workshop"]["spec"]["Mounts"] = [
-            dict(m) for m in base_mounts
-        ]
-        self.state["services"]["bf-workshop"]["spec"]["Mounts"][1]["ReadOnly"] = True
-        self.save()
-        with self.assertRaisesRegex(ValueError, "mount"):
-            self.backend.preflight(goal)
-
-        # 5. Lock mount cannot be ReadOnly: True
-        self.state["services"]["bf-workshop"]["spec"]["Mounts"] = [
-            dict(m) for m in base_mounts
-        ]
-        self.state["services"]["bf-workshop"]["spec"]["Mounts"][3]["ReadOnly"] = True
-        self.save()
-        with self.assertRaisesRegex(ValueError, "mount"):
-            self.backend.preflight(goal)
-
-    def test_readonly_view_fails_when_unmounted_rw(self):
-        from candidates import MapStore
-
-        root = Path(self.temp.name)
-        active_dir = root / "active"
-        admin_dir = root / "admin"
-        view_active = root / "views/maps-active"
-        active_dir.mkdir(parents=True, exist_ok=True)
-        admin_dir.mkdir(parents=True, exist_ok=True)
-        view_active.mkdir(parents=True, exist_ok=True)
-
-        self.backend.maps = MapStore(
-            self.data["workshop"],
-            root / "templates",
-            root / "published",
-            root / "archive/candidates",
-            root / "archive/backups",
-            archive_root=root / "archive",
-            active_root=active_dir,
-        )
-        self.backend.admin_dir = admin_dir
-        self.backend.map_active_readonly_dir = view_active
-
-        self.state["services"]["bf-workshop"]["spec"] = {
-            "Env": [
-                "BLOCKFIELD_PROFILE=workshop",
-                "BF_MAP_ACTIVE_DIR=/maps-active",
-                "BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts",
-            ],
-            "Mounts": [
-                {
-                    "Type": "bind",
-                    "Source": str(view_active),
-                    "Target": "/maps-active",
-                    "ReadOnly": False,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(active_dir / "drafts"),
-                    "Target": "/maps-active/drafts",
-                    "ReadOnly": False,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(admin_dir),
-                    "Target": "/workshop-admin",
-                    "ReadOnly": True,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(self.lock),
-                    "Target": "/backend-lock",
-                    "ReadOnly": False,
-                },
-            ],
-        }
-        self.save()
-        goal = Goal("workshop", "v1", str(uuid4()))
-
-        fake_stat = mock.Mock(
-            f_flag=0,
-            f_bavail=10**8,
-            f_frsize=4096,
-            f_blocks=10**8,
-            f_bfree=10**8,
-            f_bsize=4096,
-        )
         with (
             mock.patch("os.path.samefile", return_value=True),
-            mock.patch("os.statvfs", return_value=fake_stat),
+            mock.patch("os.statvfs", return_value=stat_ro),
         ):
-            with self.assertRaisesRegex(ValueError, "mount"):
-                self.backend.preflight(goal)
+            _check_readonly_view(source, view)
 
-    def test_readonly_view_fails_when_different_tree(self):
-        from candidates import MapStore
-
-        root = Path(self.temp.name)
-        active_dir = root / "active"
-        admin_dir = root / "admin"
-        view_active = root / "views/maps-active"
-        active_dir.mkdir(parents=True, exist_ok=True)
-        admin_dir.mkdir(parents=True, exist_ok=True)
-        view_active.mkdir(parents=True, exist_ok=True)
-
-        self.backend.maps = MapStore(
-            self.data["workshop"],
-            root / "templates",
-            root / "published",
-            root / "archive/candidates",
-            root / "archive/backups",
-            archive_root=root / "archive",
-            active_root=active_dir,
-        )
-        self.backend.admin_dir = admin_dir
-        self.backend.map_active_readonly_dir = view_active
-
-        self.state["services"]["bf-workshop"]["spec"] = {
-            "Env": [
-                "BLOCKFIELD_PROFILE=workshop",
-                "BF_MAP_ACTIVE_DIR=/maps-active",
-                "BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts",
-            ],
-            "Mounts": [
-                {
-                    "Type": "bind",
-                    "Source": str(view_active),
-                    "Target": "/maps-active",
-                    "ReadOnly": False,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(active_dir / "drafts"),
-                    "Target": "/maps-active/drafts",
-                    "ReadOnly": False,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(admin_dir),
-                    "Target": "/workshop-admin",
-                    "ReadOnly": True,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(self.lock),
-                    "Target": "/backend-lock",
-                    "ReadOnly": False,
-                },
-            ],
-        }
-        self.save()
-        goal = Goal("workshop", "v1", str(uuid4()))
-
-        fake_stat = mock.Mock(
-            f_flag=os.ST_RDONLY,
-            f_bavail=10**8,
-            f_frsize=4096,
-            f_blocks=10**8,
-            f_bfree=10**8,
-            f_bsize=4096,
-        )
-        with (
-            mock.patch("os.path.samefile", return_value=False),
-            mock.patch("os.statvfs", return_value=fake_stat),
-        ):
-            with self.assertRaisesRegex(ValueError, "mount"):
-                self.backend.preflight(goal)
-
-    def test_readonly_view_fails_with_ancestor_symlink(self):
-        from candidates import MapStore
-
-        root = Path(self.temp.name)
-        active_dir = root / "active"
-        admin_dir = root / "admin"
-        real_views = root / "real_views"
-        real_views.mkdir(parents=True, exist_ok=True)
-        sym_views = root / "sym_views"
-        sym_views.symlink_to(real_views)
-        view_active = sym_views / "maps-active"
-        view_active.mkdir(parents=True, exist_ok=True)
-        active_dir.mkdir(parents=True, exist_ok=True)
-        admin_dir.mkdir(parents=True, exist_ok=True)
-
-        self.backend.maps = MapStore(
-            self.data["workshop"],
-            root / "templates",
-            root / "published",
-            root / "archive/candidates",
-            root / "archive/backups",
-            archive_root=root / "archive",
-            active_root=active_dir,
-        )
-        self.backend.admin_dir = admin_dir
-        self.backend.map_active_readonly_dir = view_active
-
-        self.state["services"]["bf-workshop"]["spec"] = {
-            "Env": [
-                "BLOCKFIELD_PROFILE=workshop",
-                "BF_MAP_ACTIVE_DIR=/maps-active",
-                "BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts",
-            ],
-            "Mounts": [
-                {
-                    "Type": "bind",
-                    "Source": str(view_active),
-                    "Target": "/maps-active",
-                    "ReadOnly": False,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(active_dir / "drafts"),
-                    "Target": "/maps-active/drafts",
-                    "ReadOnly": False,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(admin_dir),
-                    "Target": "/workshop-admin",
-                    "ReadOnly": True,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(self.lock),
-                    "Target": "/backend-lock",
-                    "ReadOnly": False,
-                },
-            ],
-        }
-        self.save()
-        goal = Goal("workshop", "v1", str(uuid4()))
-
-        fake_stat = mock.Mock(
-            f_flag=os.ST_RDONLY,
-            f_bavail=10**8,
-            f_frsize=4096,
-            f_blocks=10**8,
-            f_bfree=10**8,
-            f_bsize=4096,
-        )
-        with (
-            mock.patch("os.path.samefile", return_value=True),
-            mock.patch("os.statvfs", return_value=fake_stat),
-        ):
-            with self.assertRaisesRegex(ValueError, "symlink"):
-                self.backend.preflight(goal)
-
-    def test_readonly_view_fails_when_spec_has_wrong_path(self):
-        from candidates import MapStore
-
-        root = Path(self.temp.name)
-        active_dir = root / "active"
-        admin_dir = root / "admin"
-        view_active = root / "views/maps-active"
-        active_dir.mkdir(parents=True, exist_ok=True)
-        admin_dir.mkdir(parents=True, exist_ok=True)
-        view_active.mkdir(parents=True, exist_ok=True)
-
-        self.backend.maps = MapStore(
-            self.data["workshop"],
-            root / "templates",
-            root / "published",
-            root / "archive/candidates",
-            root / "archive/backups",
-            archive_root=root / "archive",
-            active_root=active_dir,
-        )
-        self.backend.admin_dir = admin_dir
-        self.backend.map_active_readonly_dir = view_active
-
-        self.state["services"]["bf-workshop"]["spec"] = {
-            "Env": [
-                "BLOCKFIELD_PROFILE=workshop",
-                "BF_MAP_ACTIVE_DIR=/maps-active",
-                "BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts",
-            ],
-            "Mounts": [
-                {
-                    "Type": "bind",
-                    "Source": str(root / "views/other-active"),
-                    "Target": "/maps-active",
-                    "ReadOnly": False,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(active_dir / "drafts"),
-                    "Target": "/maps-active/drafts",
-                    "ReadOnly": False,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(admin_dir),
-                    "Target": "/workshop-admin",
-                    "ReadOnly": True,
-                },
-                {
-                    "Type": "bind",
-                    "Source": str(self.lock),
-                    "Target": "/backend-lock",
-                    "ReadOnly": False,
-                },
-            ],
-        }
-        self.save()
-        goal = Goal("workshop", "v1", str(uuid4()))
-
-        fake_stat = mock.Mock(
-            f_flag=os.ST_RDONLY,
-            f_bavail=10**8,
-            f_frsize=4096,
-            f_blocks=10**8,
-            f_bfree=10**8,
-            f_bsize=4096,
-        )
-        with (
-            mock.patch("os.path.samefile", return_value=True),
-            mock.patch("os.statvfs", return_value=fake_stat),
-        ):
-            with self.assertRaisesRegex(ValueError, "mount"):
-                self.backend.preflight(goal)
-
-    def test_readonly_view_fails_with_invalid_paths(self):
-        from candidates import MapStore
-
-        root = Path(self.temp.name)
-        active_dir = root / "active"
-        admin_dir = root / "admin"
-        active_dir.mkdir(parents=True, exist_ok=True)
-        admin_dir.mkdir(parents=True, exist_ok=True)
-
-        self.backend.maps = MapStore(
-            self.data["workshop"],
-            root / "templates",
-            root / "published",
-            root / "archive/candidates",
-            root / "archive/backups",
-            archive_root=root / "archive",
-            active_root=active_dir,
-        )
-        self.backend.admin_dir = admin_dir
-        goal = Goal("workshop", "v1", str(uuid4()))
-
-        invalid_cases = [
-            root / "views/../views/maps-active",
-            Path("relative/views/maps-active"),
-            Path("/"),
-            active_dir,
+        sym_parent = root / "sym_dir"
+        sym_parent.symlink_to(root)
+        (root / "sym_target").symlink_to(source)
+        cases = [
+            ("target symlink", root / "sym_target", view, True, stat_ro),
+            ("ancestor symlink", source, sym_parent / "view", True, stat_ro),
+            ("RW kernel", source, view, True, mock.Mock(f_flag=0)),
+            ("different inode", source, view, False, stat_ro),
+            ("same path", source, source, True, stat_ro),
+            ("relative path", Path("relative/source"), view, True, stat_ro),
+            ("path with ..", root / "foo/../canonical", view, True, stat_ro),
+            ("root directory", Path("/"), view, True, stat_ro),
         ]
-        fake_stat = mock.Mock(
-            f_flag=os.ST_RDONLY,
-            f_bavail=10**8,
-            f_frsize=4096,
-            f_blocks=10**8,
-            f_bfree=10**8,
-            f_bsize=4096,
-        )
-        for invalid_view in invalid_cases:
-            self.backend.map_active_readonly_dir = invalid_view
-            self.state["services"]["bf-workshop"]["spec"] = {
-                "Env": [
-                    "BLOCKFIELD_PROFILE=workshop",
-                    "BF_MAP_ACTIVE_DIR=/maps-active",
-                    "BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts",
-                ],
-                "Mounts": [
-                    {
-                        "Type": "bind",
-                        "Source": str(invalid_view),
-                        "Target": "/maps-active",
-                        "ReadOnly": False,
-                    },
-                    {
-                        "Type": "bind",
-                        "Source": str(active_dir / "drafts"),
-                        "Target": "/maps-active/drafts",
-                        "ReadOnly": False,
-                    },
-                    {
-                        "Type": "bind",
-                        "Source": str(admin_dir),
-                        "Target": "/workshop-admin",
-                        "ReadOnly": True,
-                    },
-                    {
-                        "Type": "bind",
-                        "Source": str(self.lock),
-                        "Target": "/backend-lock",
-                        "ReadOnly": False,
-                    },
-                ],
+        for desc, src, vw, same, st in cases:
+            with (
+                self.subTest(case=desc),
+                mock.patch("os.path.samefile", return_value=same),
+                mock.patch("os.statvfs", return_value=st),
+            ):
+                with self.assertRaises(ValueError):
+                    _check_readonly_view(src, vw)
+
+    def test_readonly_views_from_env_defaults(self):
+        base_env = {"BF_GAME_SERVICE": "bf-game", "BF_WORKSHOP_SERVICE": "bf-workshop"}
+        unconf = DockerBackend.from_env(base_env)
+        self.assertIsNone(unconf.map_active_readonly_dir)
+        self.assertIsNone(unconf.admin_readonly_dir)
+
+        conf = DockerBackend.from_env(
+            {
+                **base_env,
+                "BF_MAP_ACTIVE_READONLY_DIR": "/views/maps",
+                "BF_ADMIN_READONLY_DIR": "/views/admin",
             }
+        )
+        self.assertEqual(conf.map_active_readonly_dir, Path("/views/maps"))
+        self.assertEqual(conf.admin_readonly_dir, Path("/views/admin"))
+
+    def test_workshop_mounts_adapter_wiring(self):
+        root = Path(self.temp.name)
+        v_active, v_admin = root / "views/maps-active", root / "views/admin"
+        v_active.mkdir(parents=True, exist_ok=True)
+        v_admin.mkdir(parents=True, exist_ok=True)
+        goal = Goal("workshop", "v1", str(uuid4()))
+        fake_stat = mock.Mock(
+            f_flag=os.ST_RDONLY,
+            f_bavail=10**8,
+            f_frsize=4096,
+            f_blocks=10**8,
+            f_bfree=10**8,
+            f_bsize=4096,
+        )
+
+        # Positive preflight: Dokploy generated mounts accepted with configured readonly views
+        self._setup_workshop_fixture(active_ro=v_active, admin_ro=v_admin)
+        with (
+            mock.patch("os.path.samefile", return_value=True),
+            mock.patch("os.statvfs", return_value=fake_stat),
+        ):
+            self.backend.preflight(goal)
+
+        spec = self.state["services"]["bf-workshop"]["spec"]
+
+        def run_preflight_expect_err():
             self.save()
             with (
                 mock.patch("os.path.samefile", return_value=True),
@@ -1306,6 +877,32 @@ class DockerBackendTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "mount"):
                     self.backend.preflight(goal)
+
+        # 1. Unconfigured view rejects ReadOnly: False on active mount
+        self._setup_workshop_fixture()
+        spec = self.state["services"]["bf-workshop"]["spec"]
+        spec["Mounts"][0]["ReadOnly"] = False
+        run_preflight_expect_err()
+
+        # 2. Configured view rejects original source when spec has ReadOnly: False
+        self.backend.map_active_readonly_dir = v_active
+        run_preflight_expect_err()
+
+        # 3. Configured view rejects spec with wrong path
+        spec["Mounts"][0]["Source"] = str(root / "wrong")
+        run_preflight_expect_err()
+
+        # 4. Exact drafts RW: ReadOnly=True rejected
+        self._setup_workshop_fixture(active_ro=v_active, admin_ro=v_admin)
+        spec = self.state["services"]["bf-workshop"]["spec"]
+        spec["Mounts"][1]["ReadOnly"] = True
+        run_preflight_expect_err()
+
+        # 5. Exact lock RW: ReadOnly=True rejected
+        self._setup_workshop_fixture(active_ro=v_active, admin_ro=v_admin)
+        spec = self.state["services"]["bf-workshop"]["spec"]
+        spec["Mounts"][3]["ReadOnly"] = True
+        run_preflight_expect_err()
 
 
 if __name__ == "__main__":

@@ -42,14 +42,7 @@ class App:
 
 
 def _has_symlink(path: Path) -> bool:
-    curr = path
-    while True:
-        if curr.is_symlink():
-            return True
-        if curr.parent == curr:
-            break
-        curr = curr.parent
-    return False
+    return any(p.is_symlink() for p in (path, *path.parents))
 
 
 def _check_readonly_view(source: Path, view: Path) -> None:
