@@ -257,7 +257,9 @@ class MapStore:
         config = self._map_json(map_id, working_copy_id)
         config["name"] = name
         _atomic_json(
-            self.versions.working_copy(map_id, working_copy_id) / "map.json", config
+            self.versions.working_copy(map_id, working_copy_id) / "map.json",
+            config,
+            mode=0o664,
         )
         return {"mapId": map_id, "workingCopyId": working_copy_id, "name": name}
 
@@ -2034,7 +2036,7 @@ class MapVersions:
             else:
                 (temporary / "manifest.json").chmod(0o444)
             for directory, _, _ in os.walk(temporary, topdown=False):
-                Path(directory).chmod(0o755)
+                Path(directory).chmod(0o775 if writable else 0o755)
                 _sync_directory(Path(directory))
             os.replace(temporary, target)
             _sync_directory(target.parent)
@@ -2275,7 +2277,8 @@ def _chown(path: Path) -> None:
 def _chown_tree(root: Path) -> None:
     for directory, _, files in os.walk(root):
         _chown(Path(directory))
-        os.chmod(directory, 0o755)
+        os.chmod(directory, 0o775)
         for name in files:
             _chown(Path(directory) / name)
-            os.chmod(Path(directory) / name, 0o644)
+            # Editable copies keep inherited operator ACLs effective after copying immutable blobs.
+            os.chmod(Path(directory) / name, 0o664)

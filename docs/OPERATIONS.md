@@ -29,6 +29,8 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 - Before each Workshop start the adapter selects the exact immutable image currently used by Game. A new ready Game
   release refreshes a stable editor through save/stop/start while preserving its session and drafts; playtests and
   unresolved operations defer that refresh. A client release must wait for compatible readiness of both backends.
+  Dokploy may retain a mutable tag in its service specification; the adapter resolves the sole running Game
+  container's image ID to exactly one server repository digest and refuses missing or ambiguous observations.
 
 ### Contracts
 
@@ -289,6 +291,10 @@ space reject the request before save/stop/profile selection. Resume validates ex
 edited region files and `map.json`; a changed active head does not silently rebase them. Session `maps:null` is frozen
 to an explicit catalog list, so a later imported map does not appear in a running session automatically. An interrupted
 copy may leave a complete prepared draft, never a partially exposed directory; retry preserves it.
+
+Editable copies use directories 0775 and files 0664 so inherited operator write ACLs remain effective after
+checkout and map renaming. A named operator ACL and default directory ACL must be applied only to editable
+draft storage; immutable history, active bundles and controller metadata retain their protected permissions.
 
 The existing site mode API remains `mode {profile:"workshop",expectedRevision,session:"new"|"resume",maps?:[id...]}`.
 The controller exports `admin/session.json {schema:1,id,maps,...}`. For native submit/create requests the site must

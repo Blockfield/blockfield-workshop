@@ -19,7 +19,9 @@ from docker_backend import (
 )
 
 GAME_CID, WORKSHOP_CID, OTHER_CID = "a" * 64, "b" * 64, "c" * 64
-GAME_IMAGE = "ghcr.io/blockfield/blockfield-server:latest@sha256:" + "d" * 64
+GAME_IMAGE = "ghcr.io/blockfield/blockfield-server@sha256:" + "d" * 64
+GAME_IMAGE_ID = "sha256:" + "e" * 64
+FOREIGN_DIGEST = "ghcr.io/other/server@sha256:" + "f" * 64
 
 FAKE = r"""
 import json, os, sys
@@ -63,6 +65,10 @@ elif argv[1:3] == ["service", "scale"]:
         (proc / pid / "comm").write_text("java\n")
 elif argv[1:3] == ["service", "update"]:
     services[argv[-1]].setdefault("spec", {})["Image"] = argv[-2]
+elif argv[1] == "inspect":
+    print(state["container_images"].get(argv[-1], ""))
+elif argv[1:3] == ["image", "inspect"]:
+    print(json.dumps(state["repo_digests"].get(argv[-1])))
 elif argv[1] == "exec":
     print(state.get("rcon", {}).get(" ".join(argv[4:]), ""))
 state_path.write_text(json.dumps(state))
@@ -119,7 +125,8 @@ class DockerBackendTests(unittest.TestCase):
                 "bf-game": {
                     "replicas": 0,
                     "container": GAME_CID,
-                    "spec": {"Image": GAME_IMAGE},
+                    # Dokploy's spec tracks :latest; only the running container knows the digest.
+                    "spec": {"Image": "ghcr.io/blockfield/blockfield-server:latest"},
                 },
                 "bf-workshop": {
                     "replicas": 0,
@@ -129,6 +136,8 @@ class DockerBackendTests(unittest.TestCase):
             },
             "java": {},
             "rcon": {"save-all flush": "Saved the game"},
+            "container_images": {GAME_CID: GAME_IMAGE_ID},
+            "repo_digests": {GAME_IMAGE_ID: [GAME_IMAGE]},
         }
         self.save()
         env = {
@@ -210,8 +219,37 @@ class DockerBackendTests(unittest.TestCase):
             ],
             ["docker", "exec", WORKSHOP_CID, "rcon-cli", "save-all", "flush"],
             ["pgrep", "-f", JAVA_PATTERN],
+            ["docker", "inspect", "--format", "{{.Image}}", GAME_CID],
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RepoDigests}}",
+                GAME_IMAGE_ID,
+            ],
         ]
         bad = [
+            ["docker", "inspect", GAME_CID],
+            ["docker", "inspect", "--format", "{{json .Config.Env}}", GAME_CID],
+            ["docker", "inspect", "--format", "{{.Image}}", "bf-game"],
+            ["docker", "image", "inspect", GAME_IMAGE_ID],
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{json .Config}}",
+                GAME_IMAGE_ID,
+            ],
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RepoDigests}}",
+                GAME_IMAGE,
+            ],
             [
                 "docker",
                 "service",
@@ -259,6 +297,8 @@ class DockerBackendTests(unittest.TestCase):
     def test_canonical_workshop_mounts_and_session_must_agree_before_start(self):
         from candidates import MapStore
 
+        # Before the spec is built: running() reloads state and would detach the spec dict mutated below.
+        self.running("game")
         root = Path(self.temp.name)
         self.backend.maps = MapStore(
             self.data["workshop"],
@@ -468,6 +508,7 @@ class DockerBackendTests(unittest.TestCase):
     def test_bad_game_selection_leaves_workshop_readiness_intact(self):
         session = str(uuid4())
         goal = Goal("workshop", "v1", session)
+        self.running("game")
         self.backend.start(goal)
         selected = self.backend.selection()
         self.ready(
@@ -500,6 +541,7 @@ class DockerBackendTests(unittest.TestCase):
 
     def test_start_selects_profile_and_readiness_needs_generation(self):
         session = str(uuid4())
+        self.running("game")
         self.ready("workshop", generation=None, session=session, release="v1")
         self.backend.start(Goal("workshop", "v1", session))
         selection = json.loads((self.lock / "workshop/profile.json").read_text())
@@ -515,23 +557,24 @@ class DockerBackendTests(unittest.TestCase):
             ["docker", "service", "scale", "--detach", "bf-workshop=1"], self.calls()
         )
         goal = Goal("workshop", "v1", session)
-        self.assertEqual(self.backend.observe(), [Process(goal, False)])
+        game = Process(Goal("game", "unknown"), False)
+        self.assertEqual(self.backend.observe(), [game, Process(goal, False)])
         self.ready("workshop", generation=str(uuid4()), session=session, release="v1")
-        self.assertEqual(self.backend.observe(), [Process(goal, False)])
+        self.assertEqual(self.backend.observe(), [game, Process(goal, False)])
         self.ready(
             "workshop",
             generation=selection["generation"],
             session=session,
             release="v2",
         )
-        self.assertEqual(self.backend.observe(), [Process(goal, False)])
+        self.assertEqual(self.backend.observe(), [game, Process(goal, False)])
         self.ready(
             "workshop",
             generation=selection["generation"],
             session=session,
             release="v1",
         )
-        self.assertEqual(self.backend.observe(), [Process(goal, True)])
+        self.assertEqual(self.backend.observe(), [game, Process(goal, True)])
 
     def test_game_follows_release_deployed_outside_controller(self):
         self.running("game")
@@ -563,9 +606,12 @@ class DockerBackendTests(unittest.TestCase):
                 action(Process(goal, True))
         self.assertEqual(self.calls(), [])
 
-    def test_workshop_follows_only_an_immutable_game_image(self):
+    def test_workshop_follows_the_running_game_digest(self):
+        self.running("game")
         self.state["services"]["bf-workshop"]["spec"]["Image"] = "old"
+        self.state["repo_digests"][GAME_IMAGE_ID] = [FOREIGN_DIGEST, GAME_IMAGE]
         self.save()
+        self.assertEqual(self.backend.game_image(), GAME_IMAGE)
         self.backend.start(Goal("workshop", "v1", str(uuid4())))
         self.assertIn(
             [
@@ -579,13 +625,49 @@ class DockerBackendTests(unittest.TestCase):
             ],
             self.calls(),
         )
-        self.load()
-        self.state["services"]["bf-game"]["spec"]["Image"] = (
-            "ghcr.io/blockfield/blockfield-server:latest"
-        )
-        self.save()
-        with self.assertRaises(ValueError):
+
+    def test_game_image_fails_closed_on_ambiguous_runtime(self):
+        self.running("game")
+        second_digest = "ghcr.io/blockfield/blockfield-server@sha256:" + "a" * 64
+        digest_cases = {
+            "tag without digest": ["ghcr.io/blockfield/blockfield-server:latest"],
+            "foreign repository only": [FOREIGN_DIGEST],
+            "two server digests": [GAME_IMAGE, second_digest],
+            "null repo digests": None,
+            "non-list repo digests": "x",
+        }
+        for name, digests in digest_cases.items():
+            with self.subTest(name):
+                self.load()
+                self.state["repo_digests"][GAME_IMAGE_ID] = digests
+                self.save()
+                with self.assertRaises(ValueError):
+                    self.backend.game_image()
+        id_cases = {"short id": "sha256:abc", "container name": "bf-game"}
+        for name, image_id in id_cases.items():
+            with self.subTest(name):
+                self.load()
+                self.state["container_images"][GAME_CID] = image_id
+                self.save()
+                with self.assertRaisesRegex(ValueError, "image ID"):
+                    self.backend.game_image()
+
+    def test_game_image_requires_exactly_one_running_game_container(self):
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            self.backend.game_image()
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
             self.backend.preflight(Goal("workshop", "v1", str(uuid4())))
+        self.running("game")
+        with mock.patch.object(
+            self.backend, "containers", return_value=[GAME_CID, OTHER_CID]
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                self.backend.game_image()
+
+    def test_inventory_never_ignores_a_malformed_container_id(self):
+        with mock.patch.object(self.backend, "run", return_value=GAME_CID + "\nshort"):
+            with self.assertRaisesRegex(ValueError, "invalid container ID"):
+                self.backend.containers("game")
 
     def test_save_without_workshop_java_has_no_side_effect(self):
         self.running("game")
@@ -861,6 +943,7 @@ class DockerBackendTests(unittest.TestCase):
 
         # Positive preflight: Dokploy generated mounts accepted with configured readonly views
         self._setup_workshop_fixture(active_ro=v_active, admin_ro=v_admin)
+        self.running("game")
         with (
             mock.patch("os.path.samefile", return_value=True),
             mock.patch("os.statvfs", return_value=fake_stat),

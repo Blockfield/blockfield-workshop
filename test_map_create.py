@@ -3,6 +3,8 @@
 import copy
 import io
 import json
+import os
+import stat
 import struct
 import unittest
 import zlib
@@ -528,6 +530,8 @@ class ZeroMapTests(unittest.TestCase):
         self.assertEqual(
             json.loads(config_path.read_bytes()), before | {"name": "Renamed"}
         )
+        if os.name != "nt":
+            self.assertTrue(config_path.stat().st_mode & stat.S_IWGRP)
         self.assertEqual(self.store.versions.head("arena"), head)
         catalog = json.loads((self.root / "admin/maps.json").read_bytes())
         entry = next(item for item in catalog["maps"] if item["mapId"] == "arena")

@@ -1,7 +1,9 @@
 """Map history, coherent SSD activation and isolated editable copies; no live backend."""
 
 import json
+import os
 import shutil
+import stat
 import time
 import unittest
 from pathlib import Path
@@ -107,6 +109,10 @@ class MapVersionTests(unittest.TestCase):
         copy_id = str(uuid4())
         copy = self.store.checkout("konstaxa", first["versionDigest"], copy_id)
         writable = Path(copy["bundle"]) / "world/region/r.0.0.mca"
+        if os.name != "nt":
+            self.assertTrue(writable.stat().st_mode & stat.S_IWGRP)
+            self.assertTrue(writable.parent.stat().st_mode & stat.S_IWGRP)
+            self.assertFalse(blob.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP))
         self.assertNotEqual(
             (blob.stat().st_dev, blob.stat().st_ino),
             (writable.stat().st_dev, writable.stat().st_ino),
