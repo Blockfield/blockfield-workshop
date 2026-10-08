@@ -73,7 +73,7 @@ def seed_config(map_id, name, modes):
         "id": map_id,
         "name": map_name(name),
         "kind": "arena",
-        "bounds": {"minX": 0, "maxX": 127, "minZ": 0, "maxZ": 127},
+        "bounds": {"minX": 0, "maxX": 15, "minZ": 0, "maxZ": 15},
         "supported_modes": modes,
         "mode_data": data,
     }
@@ -254,6 +254,18 @@ def validate_playable(config):
                         raise ValueError(
                             "capture zone requires integer box coordinates"
                         )
+                # Inclusive block cells have a far face at max+1, and runtime normalizes inverted endpoints.
+                if boxes and not any(
+                    all(
+                        min(box["min" + axis], box["max" + axis])
+                        <= bounds["max" + axis] + 1
+                        and max(box["min" + axis], box["max" + axis]) + 1
+                        > bounds["min" + axis]
+                        for axis in ("X", "Z")
+                    )
+                    for box in boxes
+                ):
+                    raise ValueError("capture zone does not overlap the battlefield")
                 if not boxes:
                     if "radius" in capture and type(capture["radius"]) is not int:
                         raise ValueError("invalid capture radius")

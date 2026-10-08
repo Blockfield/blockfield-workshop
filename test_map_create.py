@@ -174,6 +174,17 @@ class ZeroMapTests(unittest.TestCase):
                 for offset in range(0, 64, 4)
             ]
             self.assertEqual(indices, [1] * 256 + [0] * 3840)
+            for mode in map_package.SUPPORTED_MODES:
+                bounds = map_package.seed_config("new_" + mode, "New map", [mode])[
+                    "bounds"
+                ]
+                x = int((bounds["minX"] + bounds["maxX"]) / 2)
+                z = int((bounds["minZ"] + bounds["maxZ"]) / 2)
+                with self.subTest(mode=mode):
+                    self.assertTrue(0 <= x < 16 and 0 <= z < 16)
+                    self.assertEqual(
+                        state["palette"][indices[z * 16 + x]]["Name"], "minecraft:stone"
+                    )
         self.assertEqual(stream.read(), b"")
 
     def test_collision_invalid_properties_and_uuid_rebinding_make_no_history(self):
@@ -551,6 +562,56 @@ class ZeroMapTests(unittest.TestCase):
 
 
 class ModeCompletenessTests(unittest.TestCase):
+    def test_capture_zone_union_must_overlap_runtime_battlefield_coordinates(self):
+        config = playable(modes=["campaign"])
+        config["bounds"].update(maxX=127, maxZ=127)
+        capture = config["mode_data"]["campaign"]["points"][0]
+        outside = {
+            "minX": 129,
+            "maxX": 200,
+            "minY": 60,
+            "maxY": 70,
+            "minZ": 0,
+            "maxZ": 10,
+        }
+        for boxes in (
+            [outside],
+            [outside, outside | {"minX": -10, "maxX": -1}],
+            [outside | {"minX": 200, "maxX": 129}],
+            [outside | {"minX": 0, "maxX": 10, "minZ": 129, "maxZ": 200}],
+        ):
+            capture["zone"] = boxes
+            with (
+                self.subTest(boxes=boxes),
+                self.assertRaisesRegex(ValueError, "does not overlap"),
+            ):
+                map_package.validate_playable(config)
+        capture["zone"] = []
+        capture["aabb"] = outside
+        with self.assertRaisesRegex(ValueError, "does not overlap"):
+            map_package.validate_playable(config)
+
+    def test_capture_zones_allow_edge_overlap_inverted_cells_and_mixed_unions(self):
+        config = playable(modes=["room"])
+        config["bounds"].update(maxX=127, maxZ=127)
+        capture = config["mode_data"]["campaign"]["points"][0]
+        box = {"minX": -10, "maxX": 0, "minY": 70, "maxY": 60, "minZ": -10, "maxZ": 0}
+        for boxes in (
+            [box],
+            [box | {"minX": 5, "maxX": -10, "minZ": 5, "maxZ": -10}],
+            [box | {"minX": 127, "maxX": 127, "minZ": 127, "maxZ": 127}],
+            [box | {"minX": 128, "maxX": 128, "minZ": 128, "maxZ": 128}],
+            [box | {"minX": 500, "maxX": 501}, box],
+        ):
+            capture["zone"] = boxes
+            with self.subTest(boxes=boxes):
+                map_package.validate_playable(config)
+        config["bounds"]["minX"] = 0.5
+        config["bounds"]["minZ"] = 0.5
+        capture["zone"] = []
+        capture["aabb"] = box
+        map_package.validate_playable(config)
+
     def test_mode_failures_follow_actual_spawn_target_and_zone_rules(self):
         config = playable()
         map_package.validate_playable(config)
