@@ -81,17 +81,17 @@ class CandidateTests(unittest.TestCase):
     def test_running_snapshot_stops_before_copy_and_waits_for_readiness(self):
         backend = FakeBackend()
         goal = Goal("workshop", "v1", str(uuid4()))
-        from controller import Process
-
-        backend.processes = [Process(goal, True)]
+        backend.ready(goal)
         control = Controller(self.root / "controller", backend, maps=self.store)
         control.request(str(uuid4()), goal, 0)
         control.step()
         create = self.store.create
 
         def snapshot(*args):
-            self.assertEqual(backend.processes, [])
+            self.assertEqual([p.goal.profile for p in backend.processes], ["game"])
             self.assertEqual(control.status()["gate"], "closed")
+            gate = json.loads(control.gate_file.read_bytes())
+            self.assertEqual(gate["backends"]["game"]["gate"], "public")
             return create(*args)
 
         with mock.patch.object(self.store, "create", side_effect=snapshot):
@@ -99,7 +99,7 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(backend.events, ["save", "stop", "start"])
         self.assertEqual(control.status()["phase"], "STARTING")
         self.assertEqual(control.step()["gate"], "closed")
-        backend.processes = [Process(goal, True)]
+        backend.ready(goal)
         self.assertEqual(control.step()["gate"], "builders")
 
         for failure in ("save", "stop", "copy", "start"):
@@ -120,9 +120,10 @@ class CandidateTests(unittest.TestCase):
             else:
                 self.assertEqual(control.status()["phase"], "ERROR")
             self.assertEqual(control.step()["gate"], "closed")
-            self.assertLessEqual(len(backend.processes), 1)
+            self.assertLessEqual(len(backend.processes), 2)
+            self.assertEqual(backend.processes[0].goal.profile, "game")
             # Restore a ready workshop fixture for the next independent fault.
-            backend.processes = [Process(goal, True)]
+            backend.ready(goal)
             state = control.status()
             state.update(
                 phase="workshop", gate="builders", error=None, errorMessage=None
@@ -132,9 +133,7 @@ class CandidateTests(unittest.TestCase):
     def test_snapshot_of_a_map_without_draft_does_not_stop_the_workshop(self):
         backend = FakeBackend()
         goal = Goal("workshop", "v1", str(uuid4()))
-        from controller import Process
-
-        backend.processes = [Process(goal, True)]
+        backend.ready(goal)
         control = Controller(self.root / "controller", backend, maps=self.store)
         control.request(str(uuid4()), goal, 0)
         self.assertEqual(control.step()["gate"], "builders")
@@ -235,7 +234,10 @@ class CandidateTests(unittest.TestCase):
             inbox_dir=inbox,
             maps=self.store,
         )
+        controller.set_members([{**ACTOR, "role": "admin"}])
         controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        controller.step()
+        controller.backend.ready(Goal(**controller.status()["desired"]))
         controller.step()
         request_id = str(uuid4())
         document = {

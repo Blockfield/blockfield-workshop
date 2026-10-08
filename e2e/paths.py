@@ -26,10 +26,29 @@ STAND = Path(
 
 
 def owner() -> str:
-    value = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("BF_RIG_OWNER")
+    value = next(
+        (
+            os.environ[key]
+            for key in (
+                "AI_AGENT_SESSION_ID",
+                "CODEX_THREAD_ID",
+                "CODEX_SESSION_ID",
+                "CLAUDE_SESSION_ID",
+                "GEMINI_SESSION_ID",
+                "OPENCODE_SESSION_ID",
+                "CLAUDE_CODE_SESSION_ID",
+            )
+            if os.environ.get(key)
+        ),
+        None,
+    )
+    requested = os.environ.get("BF_RIG_OWNER")
+    if value and requested and requested != value:
+        raise SystemExit("BF_RIG_OWNER does not match the current agent session")
+    value = value or requested
     if not value:
         raise SystemExit(
-            "set CLAUDE_CODE_SESSION_ID or BF_RIG_OWNER before running the stand (agent-process needs an owner)"
+            "set a native agent session ID or BF_RIG_OWNER before running the stand"
         )
     return value
 

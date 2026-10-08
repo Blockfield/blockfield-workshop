@@ -84,9 +84,20 @@ class LimboTests(unittest.TestCase):
         rolled = self.store.rollback(
             "limbo", ACTOR, version_digest=version, expected_head=second
         )
-        self.assertEqual(rolled["versionDigest"], version)
+        restored = rolled["versionDigest"]
+        self.assertNotEqual(restored, version)
+        manifest = self.store.versions.read("limbo", restored)
+        self.assertEqual(manifest["parents"], [second])
+        self.assertEqual(
+            manifest["files"], self.store.versions.read("limbo", version)["files"]
+        )
         self.assertGreater(rolled["generation"], head["generation"])
-        self.assertEqual(json.loads(target.read_bytes()), selection)
+        restored_selection = json.loads(target.read_bytes())
+        self.assertEqual(restored_selection["versionDigest"], restored)
+        self.assertEqual(
+            restored_selection["schematicSha256"], selection["schematicSha256"]
+        )
+        self.assertEqual(adapter.ready(self.store.versions, version), selection)
 
     def test_missing_corrupt_stale_or_running_proxy_never_changes_head(self):
         version = self.version()
@@ -256,6 +267,7 @@ class LimboTests(unittest.TestCase):
 
         export.side_effect = produce
         backend.export_limbo = export
+        control.set_members([ACTOR | {"role": "admin"}])
         request_id = str(uuid4())
         control.inbox_dir.mkdir()
         (control.inbox_dir / f"{request_id}.json").write_text(

@@ -166,6 +166,27 @@ class LimboArtifacts:
             or result.get("size") != len(data)
         ):
             raise ValueError("native Limbo export checksum/size mismatch")
+        return self._install(expected, data)
+
+    def reuse(self, versions, source, target):
+        original, restored = (
+            versions.read("limbo", source),
+            versions.read("limbo", target),
+        )
+        if original["files"] != restored["files"]:
+            raise ValueError(
+                "Limbo derivative reuse requires exactly the same map tree"
+            )
+        for digest in restored["files"].values():
+            versions._verify_blob(digest)
+        selection = self.ready(versions, source)
+        data = bounded(self.artifacts / selection["artifact"], MAX_SCHEMATIC)
+        return self._install(self._expected(versions, target), data)
+
+    def _install(self, expected, data):
+        if self.root.is_symlink() or self.artifacts.is_symlink():
+            raise ValueError("unsafe Limbo derived storage")
+        version, checksum = expected["versionDigest"], hashlib.sha256(data).hexdigest()
         selection = {
             **expected,
             "schematicSha256": checksum,

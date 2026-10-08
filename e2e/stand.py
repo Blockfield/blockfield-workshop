@@ -11,28 +11,40 @@ config, maps, server.properties) -- see README.md "Bootstrap" for the one-time s
 
 import json
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import fcntl
 from contextlib import contextmanager
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from paths import STAND, RIG, WORKSHOP, owner, java
+from paths import STAND, RIG, WORKSHOP, WORKSPACE, owner, java
 
-sys.path[:0] = [str(WORKSHOP), str(RIG)]
+sys.path[:0] = [str(WORKSPACE / "scripts/dev"), str(WORKSHOP), str(RIG)]
 from controller import Goal, Process, atomic_write  # noqa: E402
 import workshopctl  # noqa: E402
 
 OWNER = owner()
 JAVA = java()
-APPS = {"game": STAND / "game", "workshop": STAND / "workshop"}
+APPS = {"game": (STAND / "game").resolve(), "workshop": (STAND / "workshop").resolve()}
 LOCK = STAND / "lock"
 RELEASE = LOCK / "build.json"
 XMX = os.environ.get(
     "STAND_XMX", "1536m"
 )  # keep modest: this dev box runs other agents' JVMs too
+
+
+@contextmanager
+def app_lock(app):
+    directory = LOCK / app
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "start.lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
 
 
 def faults():
@@ -55,10 +67,32 @@ def fault(name):
     return value
 
 
-def rcon(command, timeout=60):
+def properties(app):
+    return {
+        key.strip(): value.strip()
+        for line in (APPS[app] / "server.properties").read_text().splitlines()
+        if not line.lstrip().startswith(("#", "!")) and "=" in line
+        for key, value in [line.split("=", 1)]
+    }
+
+
+def rcon(app, command, timeout=60):
     from rcon import Rcon
 
-    r = Rcon()
+    process = registered(app)
+    if not process or not process[1]["live"]:
+        raise RuntimeError("RCON requires a verified owned backend")
+    props = properties(app)
+    if props.get("enable-rcon") != "true" or not props.get("rcon.password"):
+        raise ValueError("stand RCON is not configured")
+    listeners = subprocess.check_output(
+        ["ss", "-ltnp", f"sport = :{int(props['rcon.port'])}"], text=True, timeout=10
+    )
+    if set(map(int, re.findall(r"pid=(\d+)", listeners))) != {process[1]["pid"]}:
+        raise RuntimeError("RCON listener does not belong to the verified backend")
+    r = Rcon(
+        "127.0.0.1", int(props["rcon.port"]), props["rcon.password"], timeout=timeout
+    )
     r.s.settimeout(timeout)
     try:
         return r.cmd(command)
@@ -67,15 +101,15 @@ def rcon(command, timeout=60):
 
 
 def stand_java():
-    """[(pid, app)] for every java running fabric-server-launch.jar with cwd in a stand app dir."""
+    """[(pid, app)] for every Java process in exactly a managed app directory."""
     found = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            if (entry / "comm").read_text().strip() != "java":
-                continue
-            if b"fabric-server-launch.jar" not in (entry / "cmdline").read_bytes():
+            if (entry / "comm").read_text().strip() != "java" and Path(
+                os.readlink(entry / "exe")
+            ).name != "java":
                 continue
             cwd = Path(os.readlink(entry / "cwd"))
         except OSError:
@@ -86,15 +120,75 @@ def stand_java():
     return found
 
 
-def registered():
-    out = subprocess.run(
-        ["agent-process", "list"], capture_output=True, text=True
-    ).stdout
+def native_identity(pid):
+    from linux_process import identity
+
+    return identity(pid)
+
+
+def native_command(pid):
     return [
-        line.split()[0]
-        for line in out.splitlines()[1:]
-        if "bf-stand-" in line and " yes " in f" {line} "
+        os.fsdecode(argument)
+        for argument in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if argument
     ]
+
+
+def registered(app):
+    """Only a matching app/session/native identity authorizes access or a stop."""
+    path = APPS[app] / "rig-process.json"
+    legacy = STAND / "rig-process.json"
+    source = path if path.exists() else legacy
+    if not source.exists():
+        return None
+    if source.is_symlink():
+        raise ValueError("invalid stand process record")
+    record = json.loads(source.read_text())
+    goal = Goal(**record["goal"])
+    if StandBackend.app_of(goal.profile) != app:
+        if source == legacy:
+            return None
+        raise ValueError("stand process record belongs to another backend")
+    process_id = record["id"]
+    if not isinstance(process_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9-]+", process_id
+    ):
+        raise ValueError("invalid stand process ID")
+    status = json.loads(
+        subprocess.check_output(
+            ["agent-process", "status", process_id], text=True, timeout=10
+        )
+    )
+    command = status.get("command", [])
+    if (
+        status.get("id") != process_id
+        or status.get("owner") != OWNER
+        or Path(status.get("cwd", "")).resolve() != APPS[app]
+        or not isinstance(command, list)
+        or "-jar" not in command
+        or command[command.index("-jar") + 1 :]
+        not in (
+            ["fabric-server-launch.jar", "nogui"],
+            ["missing-launcher.jar", "nogui"] if status.get("live") is False else [],
+        )
+        or type(status.get("live")) is not bool
+    ):
+        raise RuntimeError("stand process identity/owner does not match this backend")
+    if status["live"]:
+        current = native_identity(status["pid"])
+        if (
+            not current
+            or str(current["start_ticks"]) != str(status.get("start_ticks"))
+            or Path(current["cwd"]).resolve() != APPS[app]
+            or Path(current["exe"]).resolve() != Path(command[0]).resolve()
+            or native_command(status["pid"]) != command
+            or (status["pid"], app) not in stand_java()
+        ):
+            raise RuntimeError("stand native process identity changed")
+    if source == legacy:
+        atomic_write(path, json.dumps(record).encode(), 0o600)
+        legacy.unlink()
+    return record, status
 
 
 class StandBackend:
@@ -105,11 +199,34 @@ class StandBackend:
     def app_of(profile):
         return "workshop" if profile == "test" else profile
 
-    def selection(self):
+    def selection(self, profile="workshop"):
+        app = self.app_of(profile)
+        path = LOCK / app / "profile.json"
+        legacy = not path.exists()
+        if legacy:
+            path = LOCK / "profile.json"
+        if path.is_symlink():
+            raise ValueError("invalid stand profile file")
         try:
-            return json.loads((LOCK / "profile.json").read_text())
+            data = json.loads(path.read_text())
         except FileNotFoundError:
             return None
+        if (
+            not isinstance(data, dict)
+            or type(data.get("schema")) is not int
+            or data["schema"] != 1
+        ):
+            raise ValueError("invalid stand profile file")
+        goal = Goal(
+            data["profile"], data["release"], data.get("session"), data.get("candidate")
+        )
+        if self.app_of(goal.profile) != app:
+            if legacy:
+                return None
+            raise ValueError("stand profile belongs to another backend")
+        if str(UUID(data["generation"])) != data["generation"]:
+            raise ValueError("invalid stand profile generation")
+        return data
 
     def readiness(self, app):
         try:
@@ -119,8 +236,22 @@ class StandBackend:
         return data if isinstance(data, dict) else None
 
     def preflight(self, goal):
+        if goal.profile == "game":
+            raise ValueError("Game lifecycle requires explicit stand bootstrap")
         if fault("preflight"):
             raise OSError("injected preflight fault")
+        if goal.profile == "test":
+            if self.maps is None:
+                raise ValueError("test needs the candidate store")
+            if not any(
+                p.goal.profile == "game" and p.ready and p.goal.release == goal.release
+                for p in self.observe()
+            ):
+                raise ValueError("test release must match the ready Game backend")
+            self.test_seed()
+        self.check_data(goal)
+
+    def check_data(self, goal):
         data = APPS[self.app_of(goal.profile)]
         if not data.is_dir() or not LOCK.is_dir():
             raise FileNotFoundError(
@@ -131,10 +262,20 @@ class StandBackend:
         if shutil.disk_usage(probe).free < minimum:
             raise OSError("not enough free space for the backend data")
 
+    def test_seed(self):
+        seed = Path(os.environ.get("STAND_TEST_SEED", STAND / "seed/world")).resolve()
+        if not seed.is_dir() or any(p.is_symlink() for p in seed.rglob("*")):
+            raise ValueError(
+                "immutable stand lobby seed is missing or contains symlinks"
+            )
+        for app in APPS.values():
+            world = (app / "world").resolve()
+            if seed == world or world in seed.parents:
+                raise ValueError("playtest seed must not be a live backend world")
+        return seed
+
     def observe(self):
         java_procs = stand_java()
-        selection = self.selection()
-        selected = selection["profile"] if selection else "game"
         processes = []
         for app in APPS:
             count = sum(1 for _, a in java_procs if a == app)
@@ -142,6 +283,24 @@ class StandBackend:
                 raise RuntimeError(f"{app} runs several java processes")
             if count == 0:
                 continue
+            try:
+                selection = self.selection(app)
+                process = registered(app)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                processes.append(
+                    Process(
+                        Goal(
+                            app,
+                            "unknown",
+                            None
+                            if app == "game"
+                            else "00000000-0000-0000-0000-000000000000",
+                        ),
+                        False,
+                    )
+                )
+                continue
+            selected = selection["profile"] if selection else app
             profile = selected if app == self.app_of(selected) else app
             ready = self.readiness(app)
             if selection and selection["profile"] == profile:
@@ -164,49 +323,70 @@ class StandBackend:
                     else "00000000-0000-0000-0000-000000000000",
                 )
                 expected = None
-            processes.append(Process(goal, expected is not None and ready == expected))
+            owned = (
+                process is not None
+                and process[1]["live"]
+                and (process[1]["pid"], app) in java_procs
+            )
+            processes.append(
+                Process(goal, owned and expected is not None and ready == expected)
+            )
         return processes
 
-    def request_drain(self):
-        if stand_java():
-            rcon("bf maintenance drain")
-
-    def drain_progress(self):
-        if not stand_java():
-            return None
-        out = rcon("bf maintenance status")
-        parts = dict(x.split("=", 1) for x in out.split() if "=" in x)
-        return {
-            k: (v == "true" if v in ("true", "false") else int(v) if v.isdigit() else v)
-            for k, v in parts.items()
-        }
-
     def save_and_freeze(self, process):
+        if process.goal.profile == "game":
+            raise ValueError("Workshop controller cannot save or stop Game")
         if fault("save"):
             raise RuntimeError("injected: save-all did not confirm success")
-        out = rcon("save-all flush", timeout=120)
+        out = rcon("workshop", "save-all flush", timeout=120)
         if "Saved the game" not in out:
             raise RuntimeError(f"save-all did not confirm success: {out}")
 
     def stop(self, process):
-        if not stand_java():
+        if process.goal.profile == "game":
+            raise ValueError("Workshop controller cannot save or stop Game")
+        with app_lock("workshop"):
+            self.stop_workshop()
+
+    def stop_workshop(self):
+        if not any(app == "workshop" for _, app in stand_java()):
             return
+        process = registered("workshop")
+        if not process or not process[1]["live"]:
+            raise RuntimeError("cannot stop an unregistered Workshop process")
         if fault("stop"):
             raise TimeoutError("injected: backend did not stop")
-        try:
-            rcon("stop")
-        except Exception:
-            pass
+        subprocess.run(
+            [
+                "agent-process",
+                "stop",
+                "--owner",
+                OWNER,
+                "--grace-seconds",
+                "120",
+                "--no-escalate",
+                process[0]["id"],
+            ],
+            check=True,
+            timeout=130,
+        )
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
-            if not stand_java():
+            current = native_identity(process[1]["pid"])
+            if current is None or str(current["start_ticks"]) != str(
+                process[1]["start_ticks"]
+            ):
+                if any(app == "workshop" for _, app in stand_java()):
+                    raise RuntimeError(
+                        "another Workshop process remains after the owned stop"
+                    )
                 return
             time.sleep(0.5)
-        raise TimeoutError("stand JVM did not stop within 120 s")
+        raise TimeoutError("Workshop JVM did not stop within 120 s")
 
     def fence_pending_starts(self):
-        # agent-process start is synchronous here: no scheduler can start a backend later.
-        return None
+        with app_lock("workshop"):
+            self.stop_workshop()
 
     @contextmanager
     def workshop_saves_held(self):
@@ -215,10 +395,47 @@ class StandBackend:
         yield
 
     def start(self, goal):
-        if stand_java():
-            raise RuntimeError("refusing to start: a stand java still runs")
+        self.preflight(goal)
+        with app_lock("workshop"):
+            self._start_app(goal)
+
+    def bootstrap_game(self, release):
+        """Stand setup only; the Workshop controller never calls this API."""
+        with app_lock("game"):
+            self._start_app(Goal("game", release))
+
+    def _start_app(self, goal):
         app = self.app_of(goal.profile)
+        self.check_data(goal)
+        if any(current == app for _, current in stand_java()):
+            raise RuntimeError(f"refusing to start: {app} Java already runs")
+        process = registered(app)
+        if process and process[1]["live"]:
+            raise RuntimeError("refusing to replace a live registered backend")
         cwd = APPS[app]
+        props = properties(app)
+        ports = (int(props["server-port"]), int(props["rcon.port"]))
+        if len(set(ports)) != 2 or any(not 1 <= port <= 65535 for port in ports):
+            raise ValueError("stand TCP and RCON ports must be distinct and valid")
+        other = "workshop" if app == "game" else "game"
+        if (APPS[other] / "server.properties").is_file():
+            other_props = properties(other)
+            if set(ports) & {
+                int(other_props["server-port"]),
+                int(other_props["rcon.port"]),
+            }:
+                raise ValueError("Game and Workshop must use separate TCP/RCON ports")
+        for port in ports:
+            listeners = subprocess.check_output(
+                ["ss", "-ltnp", f"sport = :{port}"], text=True, timeout=10
+            )
+            with socket.socket() as probe:
+                probe.settimeout(0.25)
+                answering = probe.connect_ex(("127.0.0.1", port)) == 0
+            if len(listeners.splitlines()) > 1 or answering:
+                raise RuntimeError(
+                    f"refusing to start: configured stand port {port} is occupied"
+                )
         env = {
             k: v
             for k, v in os.environ.items()
@@ -232,18 +449,49 @@ class StandBackend:
         )
         env.update(
             BLOCKFIELD_PROFILE=goal.profile,
-            BLOCKFIELD_BACKEND_PROFILE_FILE=str(LOCK / "profile.json"),
-            BLOCKFIELD_BUILD_FILE=str(RELEASE),
+            BLOCKFIELD_BACKEND_PROFILE_FILE=str(LOCK / app / "profile.json"),
+            BLOCKFIELD_BUILD_FILE=str(
+                cwd / "build.json" if (cwd / "build.json").is_file() else RELEASE
+            ),
+            BLOCKFIELD_MAP_ACTIVE_DIR=str(STAND / "maps-active"),
         )
+        if app == "workshop":
+            env.update(
+                BLOCKFIELD_STATS_EXPORT_ENABLED="false",
+                BLOCKFIELD_WORKSHOP_DRAFTS_DIR=str(STAND / "maps-active/drafts"),
+                BLOCKFIELD_WORKSHOP_SESSION_FILE=str(
+                    STAND / "workshop-admin/session.json"
+                ),
+                BLOCKFIELD_MEMBERS_FILE=str(STAND / "workshop-admin/members.json"),
+                BLOCKFIELD_WORKSHOP_CANDIDATES_FILE=str(
+                    STAND / "workshop-admin/candidates.json"
+                ),
+            )
+        if (
+            goal.profile == "workshop"
+            and getattr(self.maps, "canonical_sessions", False) is True
+        ):
+            session = json.loads((STAND / "workshop-admin/session.json").read_text())
+            if (
+                type(session.get("schema")) is not int
+                or session["schema"] != 1
+                or session.get("id") != goal.session
+            ):
+                raise ValueError("Workshop session/profile mismatch before start")
+            self.maps.prepare_session(
+                goal.session, session.get("maps"), resume_only=True
+            )
         props = cwd / "server.properties"
         level = "world"
         if goal.profile == "test":
             self.maps.extract(goal.candidate, cwd / "test-candidate")
             for n in ("test-world", "test-maps", "test-published"):
                 shutil.rmtree(cwd / n, ignore_errors=True)
-            shutil.copytree(APPS["game"] / "world", cwd / "test-world")
+            shutil.copytree(self.test_seed(), cwd / "test-world")
             shutil.copytree(cwd / "maps", cwd / "test-maps", symlinks=False)
             mid = (cwd / "test-candidate/map-id").read_text().strip()
+            if not re.fullmatch(r"[a-z0-9_]{1,32}", mid):
+                raise ValueError("invalid candidate map ID")
             shutil.rmtree(cwd / "test-maps" / mid)
             shutil.copytree(cwd / "test-candidate/world", cwd / "test-maps" / mid)
             (cwd / "test-published/maps").mkdir(parents=True)
@@ -261,6 +509,9 @@ class StandBackend:
         elif goal.profile == "workshop":
             for n in ("test-world", "test-maps", "test-published", "test-candidate"):
                 shutil.rmtree(cwd / n, ignore_errors=True)
+        if "level-name" not in properties(app):
+            with props.open("a") as handle:
+                handle.write("\nlevel-name=world\n")
         props.write_text(
             "".join(
                 f"level-name={level}\n"
@@ -279,7 +530,9 @@ class StandBackend:
         if goal.candidate:
             document["candidate"] = goal.candidate
         atomic_write(
-            LOCK / "profile.json", json.dumps(document, sort_keys=True).encode(), 0o644
+            LOCK / app / "profile.json",
+            json.dumps(document, sort_keys=True).encode(),
+            0o644,
         )
         (cwd / ".blockfield-ready.json").unlink(missing_ok=True)
         if fault("start"):
@@ -308,9 +561,13 @@ class StandBackend:
         if fault("start_crash"):
             # A real start error: the JVM cannot read its launcher jar and exits.
             command[command.index("fabric-server-launch.jar")] = "missing-launcher.jar"
-        started = json.loads(subprocess.check_output(command, env=env, text=True))
-        (STAND / "rig-process.json").write_text(
-            json.dumps({"id": started["id"], "goal": goal.__dict__})
+        started = json.loads(
+            subprocess.check_output(command, env=env, text=True, timeout=30)
+        )
+        atomic_write(
+            cwd / "rig-process.json",
+            json.dumps({"id": started["id"], "goal": goal.__dict__}).encode(),
+            0o600,
         )
 
 
@@ -331,6 +588,10 @@ def env():
         "BF_PUBLISHED_MAPS_DIR": str(STAND / "published"),
         "BF_CANDIDATES_DIR": str(STAND / "candidates"),
         "BF_MAP_BACKUPS_DIR": str(STAND / "map-backups"),
+        "BF_MAP_ARCHIVE_DIR": str(STAND / "archive"),
+        "BF_MAP_ACTIVE_DIR": str(STAND / "maps-active"),
+        "BF_MAP_PACKAGES_DIR": str(STAND / "archive/packages"),
+        "BF_LEGACY_CANDIDATES_DIR": str(STAND / "candidates"),
         "BF_GAME_MAPS_DIR": str(APPS["game"] / "blockfield/maps"),
         "BF_STEP_FOLLOW_S": os.environ.get("BF_STEP_FOLLOW_S", "12"),
         "BF_STEP_POLL_S": "2",
@@ -352,4 +613,7 @@ if __name__ == "__main__":
         "evidence",
     ):
         (STAND / d).mkdir(parents=True, exist_ok=True)
+    if len(sys.argv) == 3 and sys.argv[1] == "bootstrap-game":
+        StandBackend().bootstrap_game(sys.argv[2])
+        sys.exit(0)
     sys.exit(workshopctl.main(sys.argv[1:], backend_factory=StandBackend))

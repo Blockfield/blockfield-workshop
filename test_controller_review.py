@@ -15,7 +15,6 @@ class ReviewTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         self.backend = FakeBackend()
-        self.backend.is_drained = True
         self.controller = Controller(self.directory, self.backend)
         self.goal = Goal("workshop", "v1", str(uuid4()))
         self.operation = str(uuid4())

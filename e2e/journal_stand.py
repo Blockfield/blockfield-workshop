@@ -12,7 +12,12 @@ import time
 from pathlib import Path
 
 from paths import STAND, WORKSHOP
-from stand import stand_java, JAVA  # e2e dir is on sys.path[0] by default  # noqa: E402
+from stand import (
+    stand_java,
+    registered,
+    StandBackend,
+    JAVA,
+)  # e2e dir is on sys.path[0] by default  # noqa: E402
 
 sys.path.append(str(WORKSHOP))
 import journal  # noqa: E402
@@ -61,24 +66,38 @@ def heap(pid):
         return None
 
 
-def record(out):
+def record(out, duration=600):
+    if duration <= 0:
+        raise ValueError("record duration must be positive")
     last_heap = 0
+    deadline = time.monotonic() + duration
+    backend = StandBackend()
     with open(out, "a", buffering=1) as f:
-        while True:
+        while time.monotonic() < deadline:
             started = time.monotonic()
             java_procs = stand_java()
+            registered_pids = {}
+            for app in {app for _, app in java_procs}:
+                try:
+                    process = registered(app)
+                    if process and process[1]["live"]:
+                        registered_pids[app] = process[1]["pid"]
+                except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                    pass
             r = {
                 "t": round(time.time(), 3),
                 "game_java": sum(a == "game" for _, a in java_procs),
                 "workshop_java": sum(a == "workshop" for _, a in java_procs),
-                "unknown_java": 0,
+                "unknown_java": sum(
+                    registered_pids.get(app) != pid for pid, app in java_procs
+                ),
                 "host_fabric_java": other_fabric(),
             }
             try:
-                g = json.loads((STAND / "controller/gate.json").read_text())
-                r["gate"], r["backend"] = g.get("gate"), g.get("backend")
-            except (OSError, ValueError):
-                r["gate"], r["backend"] = "missing", None
+                journal.record_readiness(r, backend.observe())
+            except Exception as error:
+                r["error"] = f"{type(error).__name__}: {error}"
+            journal.record_gate(r, STAND / "controller/gate.json")
             try:
                 r["phase"] = json.loads((STAND / "controller/state.json").read_text())[
                     "phase"
@@ -86,10 +105,18 @@ def record(out):
             except (OSError, ValueError, KeyError):
                 r["phase"] = None
             if java_procs:
-                r["pid"] = java_procs[0][0]
-                r["rss_mb"] = (rss_kb(java_procs[0][0]) or 0) // 1024
+                r["apps"] = {
+                    app: {"pid": pid, "rss_mb": (rss_kb(pid) or 0) // 1024}
+                    for pid, app in java_procs
+                }
+                r["rss_mb"] = sum(app["rss_mb"] for app in r["apps"].values())
                 if started - last_heap > 5:
-                    r["heap"] = heap(java_procs[0][0])
+                    for name, app in r["apps"].items():
+                        app["heap"] = (
+                            heap(app["pid"])
+                            if registered_pids.get(name) == app["pid"]
+                            else None
+                        )
                     last_heap = started
             f.write(json.dumps(r) + "\n")
             time.sleep(max(0.0, 0.2 - (time.monotonic() - started)))
@@ -127,6 +154,6 @@ def check(path):
 
 if __name__ == "__main__":
     if sys.argv[1] == "record":
-        record(sys.argv[2])
+        record(sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else 600)
     else:
         sys.exit(check(sys.argv[2]))
