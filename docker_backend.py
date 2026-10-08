@@ -32,6 +32,9 @@ READY_FILE = ".blockfield-ready.json"
 UNKNOWN_SESSION = "00000000-0000-0000-0000-000000000000"
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 CONTAINER = re.compile(r"[0-9a-f]{64}")
+IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+GAME_REPOSITORY = "ghcr.io/blockfield/blockfield-server"
+GAME_DIGEST = re.compile(re.escape(GAME_REPOSITORY) + r"@sha256:[0-9a-f]{64}")
 LABEL = "label=com.docker.swarm.service.name="
 
 
@@ -219,6 +222,17 @@ class DockerBackend:
                 return (
                     label.startswith(LABEL) and label[len(LABEL) :] in observed_services
                 )
+            case ["docker", "inspect", "--format", "{{.Image}}", container]:
+                return bool(CONTAINER.fullmatch(container))
+            case [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RepoDigests}}",
+                image,
+            ]:
+                return bool(IMAGE_ID.fullmatch(image))
             case ["docker", "exec", container, "rcon-cli", *command]:
                 return bool(CONTAINER.fullmatch(container)) and (
                     tuple(command) in RCON_COMMANDS
@@ -351,7 +365,10 @@ class DockerBackend:
                 "{{.ID}}",
             ]
         )
-        return [line for line in out.split() if CONTAINER.fullmatch(line)]
+        containers = out.split()
+        if any(not CONTAINER.fullmatch(line) for line in containers):
+            raise ValueError("invalid container ID in backend inventory")
+        return containers
 
     def tasks(self, profile: str) -> int:
         out = self.run(
@@ -805,13 +822,38 @@ class DockerBackend:
             time.sleep(self.poll)
 
     def game_image(self) -> str:
-        image = self.container_spec("game").get("Image")
-        if not isinstance(image, str) or not re.fullmatch(
-            r"ghcr\.io/blockfield/blockfield-server(?::[A-Za-z0-9_.-]+)?@sha256:[0-9a-f]{64}",
-            image,
-        ):
-            raise ValueError("Game image must have an immutable server digest")
-        return image
+        # Game rolls out as :latest outside the controller, so the running container is the only proof of its build.
+        containers = self.containers("game")
+        if len(containers) != 1:
+            raise RuntimeError("Workshop needs exactly one running Game container")
+        image_id = self.run(
+            ["docker", "inspect", "--format", "{{.Image}}", containers[0]]
+        ).strip()
+        if not IMAGE_ID.fullmatch(image_id):
+            raise ValueError("invalid Game image ID")
+        digests = json.loads(
+            self.run(
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{json .RepoDigests}}",
+                    image_id,
+                ]
+            )
+        )
+        if not isinstance(digests, list):
+            raise ValueError("Game image has no repository digests")
+        # Foreign repositories are ignored; anything but one server digest is ambiguous.
+        images = [
+            digest
+            for digest in digests
+            if isinstance(digest, str) and GAME_DIGEST.fullmatch(digest)
+        ]
+        if len(images) != 1:
+            raise ValueError("Game must run exactly one immutable server digest")
+        return images[0]
 
     def start(self, goal: Goal) -> None:
         self.preflight(goal)
