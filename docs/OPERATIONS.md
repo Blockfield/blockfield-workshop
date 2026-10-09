@@ -407,16 +407,25 @@ exclusive advisory lock. Writes force the file and parent directory around an at
 paid HTTP begins. Missing initialized usage, corruption, conflicting ownership or uncertain disk writes
 close further reservations. **Never delete or reset the ledger or its lock marker to restore an allowance.**
 
-The fixed generation job reserves `111053` microUSD ($0.111053), covering conservative full-context input,
-the bounded generation output and two guard calls. Only complete, confirmed upstream usage can settle
+Before the input guard, generation reserves the whole job according to
+`effectiveCells = min(config.maxBlocks, selection volume)`: at most 4096 cells selects `max_tokens: 4096`
+and `111053` microUSD ($0.111053); 4097–16384 cells selects `8192` and `111872` microUSD ($0.111872);
+larger values select the hard output cap `16384` and `113511` microUSD ($0.113511).
+These conservative bounds cover full-context generation input, output including `minimal` reasoning,
+and two guard calls at unchanged tariffs. The `maxBlocks` hard limit remains 32768, with selection axes
+at most 128; a full 128³ selection cannot cause unbounded output growth. An allowance below the whole
+reservation denies the job before a paid request, including for owners. These reservations are not
+actual spend. Old unknown `111053` microUSD liabilities remain held without repricing or reset.
+Only complete, confirmed upstream usage can settle
 actual cost, rounded up to microUSD, and return the unused difference. An unknown HTTP outcome, error,
 timeout or cancellation with uncertain billing retains the full reservation across restarts. Reconcile
 upstream billing first; a site administrator may then raise the existing allowance instead of resetting
-usage. Voice transcription uses `openai/whisper-1`: its
+usage. Voice transcription defaults to `openai/whisper-1`; `elevenlabs/scribe-v2` is also supported
+with the same observed $0.0001/second reserve ceiling and no automatic fallback. Whisper’s
 [2026-10-08 rate](https://openrouter.ai/openai/whisper-1/pricing) is $0.006/minute, billed to the nearest second.
 The server reserves from validated PCM bytes, rounded up to whole seconds, against the same monetary ledger
 before HTTP: the fixed 8-second recording cap gives at most `800` microUSD ($0.0008). It then checks the free
-public `/api/v1/models/openai/whisper-1/endpoints` catalog and refuses non-OpenAI endpoints, a rate above
+public `/api/v1/models/openai/whisper-1/endpoints` catalog (or the configured Scribe catalog) and refuses mismatched provider tags, a rate above
 $0.0001/second or any other nonzero price before the single paid call. Confirmed `usage.cost` settles; missing
 cost retains the reservation. A confirmed positive overrun atomically records at least the full reservation
 and the known cumulative cost, together with `blocked: true` in the schema 1 ledger. The optional flag is a
@@ -428,13 +437,21 @@ provider price ceiling**: STT accepts no `max_price`, so a tariff change between
 billed upstream beyond the reservation. Use a dedicated
 normal OpenRouter credits key with a spend cap, never a client/CI key or BYOK credentials.
 
-Pending acceptance: verify the Workshop RO settings mount and persistent ledger ownership, both quota
-scopes with simultaneous builders, rejection of owner bypass and non-admin increases, live limit lowering,
-restart/resume persistence and ambiguous HTTP cancellation. The fixed model context/price contract and live
-guard/usage responses also require verification before enablement. On the isolated acceptance stand, one
-voice request returned an editable transcript and the generation pipeline stopped before preview; combined
-confirmed cost was $0.0003189 (319 microUSD in the ledger). Voice recognition quality, accepted generation,
-progressive application and Undo remain pending. The feature stays off by default.
+The isolated native acceptance stand passed small generation and a 20-floor highrise in a 16×80×16
+selection using the middle output tier (`max_tokens: 8192`): 100 cuboids and 8720 unique cells.
+Preview left the world empty; an intermediate build contained 2958 blocks and the completed build 8720.
+Apply took 593 ticks; completed Cancel preserved Undo, which restored the whole air area in 662 ticks.
+Exactly three paid phases cost $0.001081920, rounded to 1082 microUSD in the ledger (114705 → 115787);
+preview, Apply and Undo made no paid calls. The old unknown 111053 microUSD reserve and prior failed
+receipts remain intact, with no new unknown liability. One real Russian Scribe clip preserved its core
+meaning but failed exact transcription; live microphone and Ukrainian speech remain unaccepted.
+
+Production acceptance remains pending for the Swarm RO settings mount, persistent ledger ownership and
+runtime rights, both quota scopes with simultaneous builders, non-admin increases, live limit lowering,
+restart/resume persistence and ambiguous HTTP cancellation. A native zero-grant admin probe rejected the
+request before paid HTTP; production integration must preserve that rule. The upper output tier 16384 and
+provider price ceilings still require their own verification before enablement. The feature stays off by
+default, and deployment examples retain Whisper as the default STT model.
 
 #### Dokploy read-only views
 
