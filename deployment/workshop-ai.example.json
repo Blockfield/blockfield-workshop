@@ -3,7 +3,7 @@
   "generationModel": "meta/muse-spark-1.3-contributor",
   "guardModel": "typesafe/jev-1.13",
   "transcriptionModel": "openai/whisper-1",
-  "maxBlocks": 4096,
+  "maxBlocks": 16384,
   "blocksPerTick": 16,
   "minimumBuildTicks": 80,
   "palette": [
