@@ -1,0 +1,21 @@
+{
+  "enabled": false,
+  "generationModel": "meta/muse-spark-1.3-contributor",
+  "guardModel": "typesafe/jev-1.13",
+  "transcriptionModel": "openai/whisper-1",
+  "maxBlocks": 4096,
+  "blocksPerTick": 16,
+  "minimumBuildTicks": 80,
+  "palette": [
+    "minecraft:air",
+    "minecraft:stone",
+    "minecraft:stone_bricks",
+    "minecraft:cobblestone",
+    "minecraft:oak_planks",
+    "minecraft:oak_log",
+    "minecraft:glass",
+    "minecraft:white_concrete",
+    "minecraft:gray_concrete",
+    "minecraft:deepslate_bricks"
+  ]
+}

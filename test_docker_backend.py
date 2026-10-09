@@ -874,6 +874,316 @@ class DockerBackendTests(unittest.TestCase):
         self.save()
         return active, admin
 
+    def _setup_ai_fixture(self, enabled=True, key=True):
+        config = self.data["workshop"] / "config/blockfield/workshop-ai.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"enabled": enabled}))
+        self.backend.ai_settings_dir.mkdir(parents=True, exist_ok=True)
+        environment = [
+            "BLOCKFIELD_PROFILE=workshop",
+            "BLOCKFIELD_WORKSHOP_AI_USAGE_FILE=/data/blockfield-workshop/ai-usage.json",
+        ]
+        if key:
+            environment.append("BLOCKFIELD_WORKSHOP_AI_OPENROUTER_KEY=test-only-key")
+        spec = {
+            "Image": GAME_IMAGE,
+            "Env": environment,
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Source": str(self.data["workshop"]),
+                    "Target": "/data",
+                    "ReadOnly": False,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(self.backend.ai_settings_dir),
+                    "Target": "/blockfield-admin",
+                    "ReadOnly": True,
+                },
+            ],
+        }
+        self.state["services"]["bf-workshop"]["spec"] = spec
+        self.save()
+        return config, spec
+
+    def test_ai_disabled_without_key_keeps_ordinary_service_unchanged(self):
+        self.backend._check_workshop_ai({})
+        config, spec = self._setup_ai_fixture(enabled=False, key=False)
+        example = (
+            Path(__file__).parent / "deployment/workshop-ai.example.json"
+        ).read_bytes()
+        self.assertIs(json.loads(example)["enabled"], False)
+        config.write_bytes(example)
+        spec["Mounts"] = []
+        self.backend._check_workshop_ai(spec)
+        config.write_text("{}")
+        self.backend._check_workshop_ai(spec)
+
+    def test_ai_start_checks_wiring_and_keeps_owner_managed_environment(self):
+        _, spec = self._setup_ai_fixture()
+        environment = list(spec["Env"])
+        self.running("game")
+        self.backend.start(Goal("workshop", "v1", str(uuid4())))
+        self.load()
+        self.assertEqual(
+            self.state["services"]["bf-workshop"]["spec"]["Env"], environment
+        )
+        self.assertIn(
+            ["docker", "service", "scale", "--detach", "bf-workshop=1"], self.calls()
+        )
+        spec["Mounts"][1]["ReadOnly"] = False
+        self.state["services"]["bf-workshop"]["spec"] = spec
+        self.save()
+        before = self.calls()
+        with self.assertRaisesRegex(ValueError, "AI.*mount"):
+            self.backend.start(Goal("workshop", "v1", str(uuid4())))
+        self.assertNotIn(
+            ["docker", "service", "scale", "--detach", "bf-workshop=1"],
+            self.calls()[len(before) :],
+        )
+
+    def test_ai_rejects_foreign_or_shadowed_policy_usage_and_configuration(self):
+        _, original = self._setup_ai_fixture()
+        bad = [
+            ("writable policy", lambda spec: spec["Mounts"][1].update(ReadOnly=False)),
+            (
+                "foreign policy",
+                lambda spec: spec["Mounts"][1].update(Source=str(self.data["game"])),
+            ),
+            ("readonly usage", lambda spec: spec["Mounts"][0].update(ReadOnly=True)),
+            (
+                "foreign usage",
+                lambda spec: spec["Mounts"][0].update(Source=str(self.data["game"])),
+            ),
+            ("no persistent data", lambda spec: spec["Mounts"].pop(0)),
+            ("implicit usage location", lambda spec: spec["Env"].pop(1)),
+            (
+                "outside usage",
+                lambda spec: spec["Env"].__setitem__(
+                    1, "BLOCKFIELD_WORKSHOP_AI_USAGE_FILE=/tmp/ai-usage.json"
+                ),
+            ),
+            (
+                "wrong policy file",
+                lambda spec: spec["Env"].append(
+                    "BLOCKFIELD_WORKSHOP_AI_LIMITS_FILE=/blockfield-admin/settings.json"
+                ),
+            ),
+            (
+                "wrong profile",
+                lambda spec: spec["Env"].__setitem__(0, "BLOCKFIELD_PROFILE=game"),
+            ),
+        ]
+        for target in (
+            "/data/config",
+            "/data/config/blockfield/workshop-ai.json/child",
+            "/config",
+            "/data/blockfield-workshop/ai-usage.json",
+            "/data/blockfield-workshop/ai-usage.json.lock",
+            "/blockfield-admin/ai-limits.json",
+            "/data/../data/config",
+            "//data/blockfield-workshop",
+            "//blockfield-admin/ai-limits.json",
+        ):
+            bad.append(
+                (
+                    target,
+                    lambda spec, target=target: spec["Mounts"].append(
+                        {
+                            "Type": "bind",
+                            "Source": str(self.data["game"]),
+                            "Target": target,
+                            "ReadOnly": True,
+                        }
+                    ),
+                )
+            )
+        for field, target in (
+            ("Configs", "/data/config/blockfield/workshop-ai.json"),
+            ("Secrets", "/data/blockfield-workshop/ai-usage.json"),
+        ):
+            bad.append(
+                (
+                    field,
+                    lambda spec, field=field, target=target: spec.update(
+                        {field: [{"File": {"Name": target}}]}
+                    ),
+                )
+            )
+        for name, mutate in bad:
+            with self.subTest(name=name):
+                spec = json.loads(json.dumps(original))
+                mutate(spec)
+                with self.assertRaises(ValueError) as error:
+                    self.backend._check_workshop_ai(spec)
+                self.assertNotIn("test-only-key", str(error.exception))
+
+    def test_ai_requires_bounded_regular_config_key_and_non_symlink_usage(self):
+        config, spec = self._setup_ai_fixture()
+        config.unlink()
+        with self.assertRaisesRegex(ValueError, "persistent configuration"):
+            self.backend._check_workshop_ai(spec)
+        for contents in (
+            b'{"enabled":true}' + b" " * 32768,
+            b'{"enabled":"true"}',
+            b"{",
+        ):
+            config.write_bytes(contents)
+            with self.assertRaises(ValueError):
+                self.backend._check_workshop_ai(spec)
+        config.write_text('{"enabled":true}')
+        without_key = json.loads(json.dumps(spec))
+        without_key["Env"] = ["BLOCKFIELD_PROFILE=workshop"]
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(without_key)
+        foreign = Path(self.temp.name) / "foreign-usage"
+        foreign.mkdir()
+        (self.data["workshop"] / "blockfield-workshop").symlink_to(foreign)
+        with self.assertRaisesRegex(ValueError, "host paths"):
+            self.backend._check_workshop_ai(spec)
+        self.assertEqual(list(foreign.iterdir()), [])
+
+    def test_ai_uses_existing_readonly_view_verification(self):
+        _, spec = self._setup_ai_fixture()
+        view = Path(self.temp.name) / "ai-settings-readonly"
+        view.mkdir()
+        self.backend.ai_settings_readonly_dir = view
+        spec["Mounts"][1].update(Source=str(view), ReadOnly=False)
+        with mock.patch("docker_backend._check_readonly_view") as verify:
+            self.backend._check_workshop_ai(spec)
+            verify.assert_called_once_with(self.backend.ai_settings_dir, view)
+        with mock.patch(
+            "docker_backend._check_readonly_view",
+            side_effect=ValueError("view is writable"),
+        ):
+            with self.assertRaisesRegex(ValueError, "view is writable"):
+                self.backend._check_workshop_ai(spec)
+
+    def test_ai_rejects_writable_physical_policy_aliases_and_parents(self):
+        _, original = self._setup_ai_fixture()
+        settings = self.backend.ai_settings_dir
+        policy = settings / "ai-limits.json"
+        policy.write_text("{}")
+        alias = Path(self.temp.name) / "policy-symlink"
+        alias.symlink_to(settings, target_is_directory=True)
+        for source in (settings, settings.parent, alias):
+            with self.subTest(source=source):
+                spec = json.loads(json.dumps(original))
+                spec["Mounts"].append(
+                    {
+                        "Type": "bind",
+                        "Source": str(source),
+                        "Target": "/writable-policy",
+                        "ReadOnly": False,
+                    }
+                )
+                with self.assertRaisesRegex(ValueError, "writable.*AI policy"):
+                    self.backend._check_workshop_ai(spec)
+        self.backend.ai_settings_dir = self.data["workshop"] / "site-settings"
+        self.backend.ai_settings_dir.mkdir()
+        original["Mounts"][1]["Source"] = str(self.backend.ai_settings_dir)
+        with self.assertRaisesRegex(ValueError, "writable.*AI policy"):
+            self.backend._check_workshop_ai(original)
+
+    def test_ai_rejects_policy_hardlink_inside_unrelated_writable_directory(self):
+        _, spec = self._setup_ai_fixture()
+        policy = self.backend.ai_settings_dir / "ai-limits.json"
+        policy.write_text("{}")
+        unrelated = Path(self.temp.name) / "unrelated-writable"
+        unrelated.mkdir()
+        spec["Mounts"].append(
+            {
+                "Type": "bind",
+                "Source": str(unrelated),
+                "Target": "/writable-policy",
+                "ReadOnly": False,
+            }
+        )
+        self.backend._check_workshop_ai(spec)
+        hardlink = unrelated / "ai-limits.json"
+        hardlink.hardlink_to(policy)
+        for source in (unrelated, hardlink):
+            with self.subTest(source=source):
+                spec["Mounts"][-1]["Source"] = str(source)
+                with self.assertRaisesRegex(ValueError, "policy.*hardlinks"):
+                    self.backend._check_workshop_ai(spec)
+
+    def test_ai_policy_rejects_directories_and_valid_or_broken_symlinks(self):
+        _, spec = self._setup_ai_fixture()
+        policy = self.backend.ai_settings_dir / "ai-limits.json"
+        policy.mkdir()
+        with self.assertRaisesRegex(ValueError, "policy must be regular"):
+            self.backend._check_workshop_ai(spec)
+        policy.rmdir()
+        target = Path(self.temp.name) / "symlink-target.json"
+        target.write_text("{}")
+        policy.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "policy must be regular"):
+            self.backend._check_workshop_ai(spec)
+        target.unlink()
+        with self.assertRaisesRegex(ValueError, "policy must be regular"):
+            self.backend._check_workshop_ai(spec)
+
+    def test_ai_verified_kernel_readonly_policy_alias_remains_allowed(self):
+        _, spec = self._setup_ai_fixture()
+        settings = self.backend.ai_settings_dir
+        (settings / "ai-limits.json").write_text("{}")
+        view = Path(self.temp.name) / "kernel-readonly-policy"
+        view.mkdir()
+        self.backend.ai_settings_readonly_dir = view
+        spec["Mounts"][1].update(Source=str(view), ReadOnly=False)
+        original_stat, original_statvfs = os.stat, os.statvfs
+
+        def aliased_stat(path, *args, **kwargs):
+            if Path(path) == view and kwargs.get("follow_symlinks", True):
+                return original_stat(settings, *args, **kwargs)
+            return original_stat(path, *args, **kwargs)
+
+        def readonly_statvfs(path):
+            return (
+                mock.Mock(f_flag=os.ST_RDONLY)
+                if Path(path) == view
+                else original_statvfs(path)
+            )
+
+        with (
+            mock.patch("os.stat", side_effect=aliased_stat),
+            mock.patch("os.statvfs", side_effect=readonly_statvfs),
+        ):
+            self.backend._check_workshop_ai(spec)
+            spec["Mounts"].append(
+                {
+                    "Type": "bind",
+                    "Source": str(settings),
+                    "Target": "/writable-policy",
+                    "ReadOnly": False,
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "writable.*AI policy"):
+                self.backend._check_workshop_ai(spec)
+
+    def test_ai_settings_paths_are_host_controller_options_only(self):
+        env = {
+            "BF_GAME_SERVICE": "bf-game",
+            "BF_WORKSHOP_SERVICE": "bf-workshop",
+            "BF_GAME_DATA": "/srv/game",
+        }
+        defaults = DockerBackend.from_env(env)
+        self.assertEqual(defaults.ai_settings_dir, Path("/srv/game/blockfield-admin"))
+        self.assertIsNone(defaults.ai_settings_readonly_dir)
+        configured = DockerBackend.from_env(
+            env
+            | {
+                "BF_AI_SETTINGS_DIR": "/srv/site-settings",
+                "BF_AI_SETTINGS_READONLY_DIR": "/views/site-settings",
+            }
+        )
+        self.assertEqual(configured.ai_settings_dir, Path("/srv/site-settings"))
+        self.assertEqual(
+            configured.ai_settings_readonly_dir, Path("/views/site-settings")
+        )
+
     def test_check_readonly_view_core_validation(self):
         root = Path(self.temp.name)
         source = root / "canonical"

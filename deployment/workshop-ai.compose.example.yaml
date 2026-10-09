@@ -1,0 +1,20 @@
+# Merge these fields into the existing Workshop service; image/version stays in its base deployment.
+# Install workshop-ai.example.json at /srv/minecraft/workshop/data/config/blockfield/workshop-ai.json.
+# It remains disabled. Enabling or deploying requires the owner's explicit approval.
+services:
+  workshop:
+    environment:
+      BLOCKFIELD_PROFILE: workshop
+      BLOCKFIELD_WORKSHOP_AI_LIMITS_FILE: /blockfield-admin/ai-limits.json
+      BLOCKFIELD_WORKSHOP_AI_USAGE_FILE: /data/blockfield-workshop/ai-usage.json
+      # At approved enablement, the owner supplies BLOCKFIELD_WORKSHOP_AI_OPENROUTER_KEY
+      # in this service's private environment: a separate capped normal-credit key.
+    volumes:
+      - type: bind
+        source: /srv/minecraft/workshop/data
+        target: /data
+        read_only: false
+      - type: bind
+        source: /srv/minecraft/views/blockfield-admin
+        target: /blockfield-admin
+        read_only: true

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import time
 from uuid import UUID, uuid4
@@ -95,6 +96,8 @@ class DockerBackend:
         proxy_service: str | None = None,
         map_active_readonly_dir: Path | str | None = None,
         admin_readonly_dir: Path | str | None = None,
+        ai_settings_dir: Path | str | None = None,
+        ai_settings_readonly_dir: Path | str | None = None,
     ):
         if set(apps) != {"game", "workshop"} or not all(
             SERVICE.fullmatch(a.service) for a in apps.values()
@@ -122,6 +125,16 @@ class DockerBackend:
         )
         self.admin_readonly_dir = (
             Path(admin_readonly_dir) if admin_readonly_dir is not None else None
+        )
+        self.ai_settings_dir = (
+            Path(ai_settings_dir)
+            if ai_settings_dir is not None
+            else self.apps["game"].data / "blockfield-admin"
+        )
+        self.ai_settings_readonly_dir = (
+            Path(ai_settings_readonly_dir)
+            if ai_settings_readonly_dir is not None
+            else None
         )
         # candidates.MapStore (workshopctl wires it): extracts a candidate for the test profile.
         self.maps = None
@@ -158,6 +171,8 @@ class DockerBackend:
                 if env.get("BF_ADMIN_READONLY_DIR")
                 else None
             ),
+            ai_settings_dir=env.get("BF_AI_SETTINGS_DIR") or None,
+            ai_settings_readonly_dir=env.get("BF_AI_SETTINGS_READONLY_DIR") or None,
         )
 
     # ------------------------------------------------------------------ commands
@@ -546,8 +561,9 @@ class DockerBackend:
             result[key] = value
         return result
 
-    def _check_workshop_mounts(self) -> None:
-        spec = self.container_spec("workshop")
+    def _check_workshop_mounts(self, spec: dict | None = None) -> None:
+        if spec is None:
+            spec = self.container_spec("workshop")
         environment = self.container_env(spec)
         active = environment.get("BF_MAP_ACTIVE_DIR", "")
         drafts = environment.get("BLOCKFIELD_WORKSHOP_DRAFTS_DIR", "")
@@ -635,6 +651,192 @@ class DockerBackend:
                     "extra workshop mount shadows immutable active storage"
                 )
 
+    def _check_workshop_ai(self, spec: dict) -> None:
+        environment = self.container_env(spec)
+        has_key = bool(
+            environment.get("BLOCKFIELD_WORKSHOP_AI_OPENROUTER_KEY", "").strip()
+        )
+        config = self.apps["workshop"].data / "config/blockfield/workshop-ai.json"
+        try:
+            fd = os.open(config, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if has_key:
+                raise ValueError(
+                    "configured workshop AI needs its persistent configuration"
+                )
+            return
+        except OSError:
+            raise ValueError("unsafe workshop AI configuration") from None
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 32768:
+                raise ValueError("unsafe workshop AI configuration")
+            contents = os.read(fd, 32769)
+            if len(contents) > 32768:
+                raise ValueError("unsafe workshop AI configuration")
+            document = json.loads(contents)
+            if (
+                not isinstance(document, dict)
+                or type(document.get("enabled", False)) is not bool
+            ):
+                raise ValueError("invalid workshop AI configuration")
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise ValueError("invalid workshop AI configuration") from None
+        finally:
+            os.close(fd)
+        if not document.get("enabled", False) and not has_key:
+            return
+        if not has_key or environment.get("BLOCKFIELD_PROFILE") != "workshop":
+            raise ValueError(
+                "enabled workshop AI needs its own server key and workshop profile"
+            )
+        if (
+            environment.get(
+                "BLOCKFIELD_WORKSHOP_AI_LIMITS_FILE", "/blockfield-admin/ai-limits.json"
+            )
+            != "/blockfield-admin/ai-limits.json"
+            or environment.get(
+                "BLOCKFIELD_WORKSHOP_AI_USAGE_FILE",
+                "",
+            )
+            != "/data/blockfield-workshop/ai-usage.json"
+        ):
+            raise ValueError(
+                "workshop AI needs the canonical policy and persistent usage paths"
+            )
+        usage = self.apps["workshop"].data / "blockfield-workshop/ai-usage.json"
+        for path in (
+            self.ai_settings_dir,
+            self.apps["workshop"].data,
+            config,
+            usage,
+            usage.with_suffix(".json.lock"),
+        ):
+            if (
+                not path.is_absolute()
+                or str(path) == "/"
+                or str(path).startswith("//")
+                or str(path) != os.path.normpath(str(path))
+                or _has_symlink(path)
+            ):
+                raise ValueError("unsafe workshop AI host paths")
+        if not self.ai_settings_dir.is_dir():
+            raise ValueError("workshop AI site settings directory is missing")
+        if os.path.samefile(self.apps["workshop"].data, self.apps["game"].data):
+            raise ValueError("workshop AI usage must have its own data directory")
+        mounts = spec.get("Mounts", [])
+        required = (
+            (self.apps["workshop"].data, "/data", False, None),
+            (
+                self.ai_settings_dir,
+                "/blockfield-admin",
+                True,
+                self.ai_settings_readonly_dir,
+            ),
+        )
+        for source, target, readonly, view in required:
+            matches = [
+                mount
+                for mount in mounts
+                if isinstance(mount, dict) and mount.get("Target") == target
+            ]
+            if len(matches) != 1 or matches[0].get("Type") != "bind":
+                raise ValueError(
+                    "workshop AI needs its own persistent data and readonly site settings mounts"
+                )
+            mount = matches[0]
+            if (
+                mount.get("Source") == str(source)
+                and mount.get("ReadOnly", False) is readonly
+            ):
+                continue
+            if readonly and view is not None and mount.get("Source") == str(view):
+                _check_readonly_view(source, view)
+                continue
+            raise ValueError("unsafe workshop AI data or policy mount")
+        protected = (Path("/blockfield-admin"), Path("/data/blockfield-workshop"))
+        configurations = (
+            Path("/data/config/blockfield/workshop-ai.json"),
+            Path("/config/config/blockfield/workshop-ai.json"),
+        )
+        targets = []
+        try:
+            policy_sources = {
+                (metadata.st_dev, metadata.st_ino)
+                for metadata in (
+                    path.stat()
+                    for path in (self.ai_settings_dir, *self.ai_settings_dir.parents)
+                )
+            }
+            policy = self.ai_settings_dir / "ai-limits.json"
+            try:
+                metadata = policy.lstat()
+            except FileNotFoundError:
+                metadata = None
+            if metadata is not None:
+                # A hardlink in any writable directory bypasses the policy mount's RO flag.
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise ValueError(
+                        "workshop AI policy must be regular without symlinks or hardlinks"
+                    )
+                policy_sources.add((metadata.st_dev, metadata.st_ino))
+        except OSError:
+            raise ValueError("cannot verify workshop AI policy source") from None
+        for mount in mounts:
+            if not isinstance(mount, dict) or not isinstance(mount.get("Target"), str):
+                raise ValueError("invalid workshop AI mount")
+            if mount.get("Type") == "bind" and mount.get("ReadOnly", False) is not True:
+                if not isinstance(mount.get("Source"), str):
+                    raise ValueError("invalid workshop AI writable bind source")
+                source = Path(mount["Source"])
+                if (
+                    not source.is_absolute()
+                    or str(source) != mount["Source"]
+                    or ".." in source.parts
+                    or str(source).startswith("//")
+                ):
+                    raise ValueError("invalid workshop AI writable bind source")
+                try:
+                    metadata = source.stat()
+                    if (metadata.st_dev, metadata.st_ino) in policy_sources and not (
+                        os.statvfs(source).f_flag & os.ST_RDONLY
+                    ):
+                        raise ValueError("writable workshop bind exposes AI policy")
+                except OSError:
+                    raise ValueError(
+                        "cannot verify workshop AI writable bind source"
+                    ) from None
+            if mount["Target"] not in {"/data", "/blockfield-admin"}:
+                targets.append(mount["Target"])
+        # Swarm configs/secrets can shadow files without appearing in Mounts.
+        for entry in (*spec.get("Configs", []), *spec.get("Secrets", [])):
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("File"), dict)
+                or not isinstance(entry["File"].get("Name"), str)
+            ):
+                raise ValueError("invalid workshop AI file mount")
+            targets.append("/" + entry["File"]["Name"].lstrip("/"))
+        for value in targets:
+            target = Path(value)
+            if (
+                not target.is_absolute()
+                or value.startswith("//")
+                or str(target) != value
+                or ".." in target.parts
+                or any(
+                    root.is_relative_to(target) or target.is_relative_to(root)
+                    for root in protected
+                )
+                or any(
+                    path.is_relative_to(target) or target.is_relative_to(path)
+                    for path in configurations
+                )
+            ):
+                raise ValueError(
+                    "extra workshop mount shadows AI configuration, policy or usage"
+                )
+
     def preflight(self, goal: Goal) -> None:
         if goal.profile == "game":
             raise ValueError("Game lifecycle belongs to the server deployment")
@@ -664,11 +866,11 @@ class DockerBackend:
         if shutil.disk_usage(data).free < self.min_free_bytes:
             raise OSError("not enough free space for the backend data")
         self.game_image()
-        if (
-            goal.profile == "workshop"
-            and getattr(self.maps, "canonical_sessions", False) is True
-        ):
-            self._check_workshop_mounts()
+        if goal.profile == "workshop":
+            spec = self.container_spec("workshop")
+            self._check_workshop_ai(spec)
+            if getattr(self.maps, "canonical_sessions", False) is True:
+                self._check_workshop_mounts(spec)
 
     def observe(self) -> list[Process]:
         inventory = self.inventory()
