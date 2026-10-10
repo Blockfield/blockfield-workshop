@@ -318,34 +318,156 @@ the editor. A Java tablet submit already carries this exact ID; never replace it
 
 Workshop container configuration required before enabling canonical sessions:
 
-| Host source                         | Container target      | Access / environment                                                                                               |
-| ----------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `/srv/minecraft/maps-active`        | `/maps-active`        | RO; `BF_MAP_ACTIVE_DIR=/maps-active`                                                                               |
-| `/srv/minecraft/maps-active/drafts` | `/maps-active/drafts` | RW; `BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts`                                                           |
-| `/srv/minecraft/workshop/admin`     | `/workshop-admin`     | RO; `BLOCKFIELD_WORKSHOP_SESSION_FILE=/workshop-admin/session.json`                                                |
-| `/srv/minecraft/backend-lock`       | `/backend-lock`       | RW for app-specific `workshop/backend.lock`; `BLOCKFIELD_BACKEND_PROFILE_FILE=/backend-lock/workshop/profile.json` |
+| Host source                             | Container target      | Access / environment                                                                                                                   |
+| --------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `/srv/minecraft/maps-active`            | `/maps-active`        | RO; `BF_MAP_ACTIVE_DIR=/maps-active`                                                                                                   |
+| `/srv/minecraft/maps-active/drafts`     | `/maps-active/drafts` | RW; `BLOCKFIELD_WORKSHOP_DRAFTS_DIR=/maps-active/drafts`                                                                               |
+| `/srv/minecraft/workshop/admin`         | `/workshop-admin`     | RO; `BLOCKFIELD_WORKSHOP_SESSION_FILE=/workshop-admin/session.json`                                                                    |
+| `/srv/minecraft/backend-lock`           | `/backend-lock`       | RW for app-specific `workshop/backend.lock`; `BLOCKFIELD_BACKEND_PROFILE_FILE=/backend-lock/workshop/profile.json`                     |
+| `/srv/minecraft/workshop/data`          | `/data`               | RW; Workshop's own persistent data, including `blockfield-workshop/ai-usage.json`                                                      |
+| `/srv/minecraft/lobby/blockfield-admin` | `/blockfield-admin`   | RO before AI enablement; Dokploy uses the readonly mirror below; `BLOCKFIELD_WORKSHOP_AI_LIMITS_FILE=/blockfield-admin/ai-limits.json` |
 
 `BLOCKFIELD_PROFILE=workshop` remains mandatory. `profile.json` is host/root-owned mode 0644 and read-only to Minecraft,
 although the shared lock directory must permit the existing lock operation. Do not bind-mount `profile.json` as a single
 file: atomic replacement would leave the container reading the old inode. Session exports use a directory mount too.
-The adapter inspects the Swarm service specification read-only and rejects missing/incorrect mounts, writable active
-storage, archive mounts or additional mounts shadowing active bundles. Configured host/container paths may differ from
-these defaults, but they must identify the same physical storage. It never repairs Dokploy settings by itself.
+The adapter inspects the Swarm service specification read-only and validates the existing canonical map, drafts,
+session/admin and backend-lock mounts. It rejects missing/incorrect mounts, writable active storage, archive mounts
+or additional mounts shadowing active bundles. Configured host/container paths may differ from these defaults,
+but they must identify the same physical storage. When AI is enabled or its server key is assigned, the adapter
+also validates the AI settings, persistent data and configuration contract below. It never repairs Dokploy settings
+or injects secrets by itself.
+
+#### AI monetary budgets (offline preparation)
+
+The site keeps its existing RW settings directory `/srv/minecraft/lobby/blockfield-admin`
+(`BLOCKFIELD_SETTINGS_DIR=/blockfield-admin`). Workshop needs the additional **directory** RO bind above;
+under Dokploy, use `/srv/minecraft/views/blockfield-admin` as the read-only source described below.
+Its own `/data` does not contain Game's settings. This is a deployment prerequisite, not a completed mount
+change or deployment. AI policy is separate from Game's settings sync and does not pass through the controller inbox.
+The Java budget loader denies missing or malformed policy. The controller independently validates its physical
+source and read-only status before starting a configured AI backend.
+
+Prepared deployment inputs are [the disabled AI configuration](../deployment/workshop-ai.example.json),
+[the Workshop service overlay](../deployment/workshop-ai.compose.example.yaml), and
+[host-controller path options](../deployment/workshop-ai.controller.env.example). These are examples for the
+existing owner-managed service, not a new service or deployment command. Keep its immutable image, existing
+canonical map/session/lock mounts and other settings. The overlay supplies the additional policy mount and repeats
+the Workshop's own persistent `/data` mount. Install the disabled configuration at
+`BF_WORKSHOP_DATA/config/blockfield/workshop-ai.json`; it must remain a regular file in that data directory, not a
+Swarm config/secret or an additional bind mount. Do not add an image-side override at
+`/config/config/blockfield/workshop-ai.json` that changes it during the image's config sync.
+
+`BF_AI_SETTINGS_DIR` names the same physical host directory written by the site's `BLOCKFIELD_SETTINGS_DIR`
+mount; its default is `BF_GAME_DATA/blockfield-admin`. `BF_AI_SETTINGS_READONLY_DIR` optionally names the existing
+operator-created read-only mirror. The adapter repeats the canonical mirror check: no symlinks, the same inode
+as the settings source, and kernel `ST_RDONLY`. Otherwise the service specification must declare a direct RO bind.
+The AI runtime paths are fixed to `/blockfield-admin/ai-limits.json` and
+`/data/blockfield-workshop/ai-usage.json` for controller-managed services. Set `BLOCKFIELD_WORKSHOP_AI_USAGE_FILE`
+explicitly to that absolute path so the ledger cannot depend on a container working directory. The `/data` RW bind must point to
+`BF_WORKSHOP_DATA`, physically separate from Game's data. Nested binds and Swarm config/secret files may not shadow
+AI policy, ledger/lock or either live/image-side AI configuration path; symlinked configuration and usage paths
+are refused. Writable host binds may not expose the canonical settings directory or its ancestors through another
+container path. An existing `ai-limits.json` must be a regular non-symlink file with a single hardlink; this also
+rejects a policy hardlink hidden in a separately mounted writable directory.
+
+The adapter reads the bounded, regular AI configuration during Workshop preflight. Missing configuration with no
+AI key, or `enabled: false` with no AI key, preserves the ordinary service path. `enabled: true` requires the
+Workshop profile and a nonblank `BLOCKFIELD_WORKSHOP_AI_OPENROUTER_KEY` in that service's private environment.
+Assigning that key also requires the configuration and strict mount checks even while the feature is disabled.
+The controller never reads a key file, copies a key from its own environment, sends it to the site or prints its
+value. The owner supplies a separate capped normal-credit key directly to the Workshop service only during
+approved enablement. Installing these prepared inputs, changing `enabled` or deploying still requires explicit
+owner deployment approval; this source change performs none of those actions.
+
+`ai-limits.json` has this closed schema; empty grants deny every paid request:
+
+```json
+{
+  "schema": 1,
+  "revision": 0,
+  "currency": "USD",
+  "mode": "session",
+  "sessions": {},
+  "builders": {}
+}
+```
+
+`revision` is a nonnegative safe integer; `mode` is exactly `session` or `builder`. Each grant map has at most
+256 canonical lowercase UUID keys and integer microUSD values from 0 through `1000000000000` (1 USD =
+1000000 microUSD). Session mode shares the exact controller session UUID's allowance among all builders;
+builder mode charges that builder UUID across sessions. New sessions have no automatic grant. Only the
+authenticated site's `settings` administrator may grant or raise an allowance; an in-game Workshop owner
+has no bypass. Every reservation re-reads the policy, so lowering, revoking or changing mode affects the
+next reservation. Removing and re-adding a grant, resuming a session or restarting does not erase spending.
+
+The server owns `/data/blockfield-workshop/ai-usage.json`, under the persistent Workshop RW data mount.
+`BLOCKFIELD_WORKSHOP_AI_USAGE_FILE` may explicitly select that path; otherwise it is relative to the server
+working directory. Its sibling `ai-usage.json.lock` remains as an initialization marker and holds the ledger's
+exclusive advisory lock. Writes force the file and parent directory around an atomic replacement before
+paid HTTP begins. Missing initialized usage, corruption, conflicting ownership or uncertain disk writes
+close further reservations. **Never delete or reset the ledger or its lock marker to restore an allowance.**
+
+Before the input guard, generation reserves the whole job according to
+`effectiveCells = min(config.maxBlocks, selection volume)`: at most 4096 cells selects `max_tokens: 4096`
+and `111053` microUSD ($0.111053); 4097–16384 cells selects `8192` and `111872` microUSD ($0.111872);
+larger values select the hard output cap `16384` and `113511` microUSD ($0.113511).
+These conservative bounds cover full-context generation input, output including `minimal` reasoning,
+and two guard calls at unchanged tariffs. The `maxBlocks` hard limit remains 32768, with selection axes
+at most 128; a full 128³ selection cannot cause unbounded output growth. An allowance below the whole
+reservation denies the job before a paid request, including for owners. These reservations are not
+actual spend. Old unknown `111053` microUSD liabilities remain held without repricing or reset.
+Only complete, confirmed upstream usage can settle
+actual cost, rounded up to microUSD, and return the unused difference. An unknown HTTP outcome, error,
+timeout or cancellation with uncertain billing retains the full reservation across restarts. Reconcile
+upstream billing first; a site administrator may then raise the existing allowance instead of resetting
+usage. Voice transcription defaults to `openai/whisper-1`; `elevenlabs/scribe-v2` is also supported
+with the same observed $0.0001/second reserve ceiling and no automatic fallback. Whisper’s
+[2026-10-08 rate](https://openrouter.ai/openai/whisper-1/pricing) is $0.006/minute, billed to the nearest second.
+The server reserves from validated PCM bytes, rounded up to whole seconds, against the same monetary ledger
+before HTTP: the fixed 8-second recording cap gives at most `800` microUSD ($0.0008). It then checks the free
+public `/api/v1/models/openai/whisper-1/endpoints` catalog (or the configured Scribe catalog) and refuses mismatched provider tags, a rate above
+$0.0001/second or any other nonzero price before the single paid call. Confirmed `usage.cost` settles; missing
+cost retains the reservation. A confirmed positive overrun atomically records at least the full reservation
+and the known cumulative cost, together with `blocked: true` in the schema 1 ledger. The optional flag is a
+strict boolean and defaults to false for old ledgers. It blocks new reservations and later paid stages of
+already reserved jobs across restarts; settlement of requests already sent preserves it. Unrepresentable
+cost retains the reserve and blocks further calls. Raising a grant does not clear the block: investigate the
+provider tariff contract without resetting usage. This is accounting at the observed tariff, **not an enforceable
+provider price ceiling**: STT accepts no `max_price`, so a tariff change between catalog check and request is
+billed upstream beyond the reservation. Use a dedicated
+normal OpenRouter credits key with a spend cap, never a client/CI key or BYOK credentials.
+
+The isolated native acceptance stand passed small generation and a 20-floor highrise in a 16×80×16
+selection using the middle output tier (`max_tokens: 8192`): 100 cuboids and 8720 unique cells.
+Preview left the world empty; an intermediate build contained 2958 blocks and the completed build 8720.
+Apply took 593 ticks; completed Cancel preserved Undo, which restored the whole air area in 662 ticks.
+Exactly three paid phases cost $0.001081920, rounded to 1082 microUSD in the ledger (114705 → 115787);
+preview, Apply and Undo made no paid calls. The old unknown 111053 microUSD reserve and prior failed
+receipts remain intact, with no new unknown liability. One real Russian Scribe clip preserved its core
+meaning but failed exact transcription; live microphone and Ukrainian speech remain unaccepted.
+
+Production acceptance remains pending for the Swarm RO settings mount, persistent ledger ownership and
+runtime rights, both quota scopes with simultaneous builders, non-admin increases, live limit lowering,
+restart/resume persistence and ambiguous HTTP cancellation. A native zero-grant admin probe rejected the
+request before paid HTTP; production integration must preserve that rule. The upper output tier 16384 and
+provider price ceilings still require their own verification before enablement. The feature stays off by
+default, and deployment examples retain Whisper as the default STT model.
 
 #### Dokploy read-only views
 
 Production Dokploy Swarm Mounts cannot store the `ReadOnly` field (omitted or `false` in generated container specifications). Ordinary bind mounts created by Moby/runc do not add `rw` if the host source filesystem is already mounted read-only, preserving read-only host mount source flags across Dokploy service updates and redeployments.
 
-To ensure Minecraft cannot write to catalog or active maps under Dokploy, the host operator creates durable read-only bind mirror directories pointing to the canonical locations:
+To ensure Minecraft cannot write to catalog, active maps or AI policy under Dokploy, the host operator creates durable read-only bind mirror directories pointing to the canonical locations. The AI mirror is a preparation requirement; these example commands have not been executed as part of the offline work:
 
 ```sh
 # Host operator setup: create durable read-only bind mirrors
-mkdir -p /srv/minecraft/views/maps-active /srv/minecraft/views/workshop-admin
+mkdir -p /srv/minecraft/views/maps-active /srv/minecraft/views/workshop-admin /srv/minecraft/views/blockfield-admin
 mount --bind -o ro /srv/minecraft/maps-active /srv/minecraft/views/maps-active
 mount --bind -o ro /srv/minecraft/workshop/admin /srv/minecraft/views/workshop-admin
+mount --bind -o ro /srv/minecraft/lobby/blockfield-admin /srv/minecraft/views/blockfield-admin
 ```
 
-The mirror mounts must use `bind,ro` (**non-recursive** `bind`, never `rbind`) to guarantee no read-write submounts are exposed under the view. The container cannot write catalog or maps.
+The mirror mounts must use `bind,ro` (**non-recursive** `bind`, never `rbind`) to guarantee no read-write submounts are exposed under the view. The Workshop container cannot write catalog, maps or AI policy; the site's canonical settings mount remains read-write.
 
 Configure `/etc/blockfield/workshop.env`:
 
@@ -359,9 +481,10 @@ In Dokploy, configure the workshop service bind mounts:
 - `/srv/minecraft/views/maps-active` -> `/maps-active`
 - `/srv/minecraft/maps-active/drafts` -> `/maps-active/drafts` (read-write, exact original source)
 - `/srv/minecraft/views/workshop-admin` -> `/workshop-admin`
+- `/srv/minecraft/views/blockfield-admin` -> `/blockfield-admin` (AI policy, verified read-only by the operator)
 - `/srv/minecraft/backend-lock` -> `/backend-lock` (read-write, exact original source)
 
-The controller adapter verifies:
+For the existing maps-active and workshop-admin views, the controller adapter verifies:
 
 1. Mount source exactly matches the configured view path;
 2. Paths are absolute, normalized, without `..`, and not `/`;
@@ -370,6 +493,11 @@ The controller adapter verifies:
 5. The view filesystem flag `os.statvfs(view).f_flag & os.ST_RDONLY` is non-zero (mounted read-only).
 
 Drafts and lock mounts remain strictly exact original sources and read-write. When the view variables are absent or unconfigured, the adapter enforces the standard exact-source `ReadOnly: true` requirement.
+For AI policy, set `BF_AI_SETTINGS_DIR` to the site's canonical settings directory and
+`BF_AI_SETTINGS_READONLY_DIR` to its existing read-only mirror. AI preflight verifies the same source identity,
+symlink and read-only filesystem criteria before starting Workshop. The operator creates and maintains that
+mirror, including after host restarts; the controller does not create mounts. A direct bind of the site's
+writable canonical settings directory under Dokploy does not establish the required read-only protection.
 
 ### Offline initial imports (unreleased)
 
