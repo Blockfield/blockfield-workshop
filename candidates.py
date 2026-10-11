@@ -1086,7 +1086,7 @@ class MapStore:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(archive.read(entry))
         (target / "map-id").write_text(manifest["mapId"] + "\n")
-        _chown_tree(target)
+        _chown_tree(target, writable=False)
         return manifest["mapId"]
 
     # ------------------------------------------------------------------ helpers
@@ -2195,6 +2195,9 @@ class MapVersions:
                 )
         if not regions:
             raise ValueError("working copy has no region data")
+        # Drafts checked out before the permission change keep 0755/0644, which masks
+        # inherited operator ACLs; every resume path routes through here, so repair it once.
+        _chown_tree(target)
         return {
             "mapId": map_id,
             "versionDigest": version,
@@ -2274,11 +2277,11 @@ def _chown(path: Path) -> None:
         pass  # tests and non-root runs
 
 
-def _chown_tree(root: Path) -> None:
+def _chown_tree(root: Path, *, writable: bool = True) -> None:
     for directory, _, files in os.walk(root):
         _chown(Path(directory))
-        os.chmod(directory, 0o775)
+        os.chmod(directory, 0o775 if writable else 0o755)
         for name in files:
             _chown(Path(directory) / name)
             # Editable copies keep inherited operator ACLs effective after copying immutable blobs.
-            os.chmod(Path(directory) / name, 0o664)
+            os.chmod(Path(directory) / name, 0o664 if writable else 0o644)

@@ -326,6 +326,27 @@ class ZeroMapTests(unittest.TestCase):
         )
         self.assertEqual(self.create(session_id=session)["session"], archived)
 
+    def test_resumed_draft_regains_operator_write_permissions(self):
+        created = self.create()
+        draft = self.store.versions.working_copy(
+            created["mapId"], created["session"]["id"]
+        )
+        for directory, _, files in os.walk(draft):
+            os.chmod(directory, 0o755)
+            for name in files:
+                os.chmod(os.path.join(directory, name), 0o644)
+        self.store.versions.validate_working_copy(
+            created["mapId"], created["session"]["id"]
+        )
+        for directory, _, files in os.walk(draft):
+            self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o775, directory)
+            for name in files:
+                self.assertEqual(
+                    stat.S_IMODE(os.stat(os.path.join(directory, name)).st_mode),
+                    0o664,
+                    name,
+                )
+
     def test_selected_test_mode_is_frozen_and_unsupported_mode_does_not_stop_editor(
         self,
     ):

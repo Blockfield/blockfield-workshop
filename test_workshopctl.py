@@ -481,6 +481,20 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual((world / "region/r.0.0.mca").read_bytes(), b"lobby source")
         self.assertFalse((self.root / "active/lobby/head.json").exists())
 
+    def test_offline_gate_refuses_live_dev_game_java(self):
+        stopped = {
+            "unknown": 0,
+            "dev": 0,
+            "game": {"tasks": 0, "java": 0},
+            "workshop": {"tasks": 0, "java": 0},
+        }
+        backend = mock.Mock()
+        backend.inventory = lambda: dict(stopped)
+        workshopctl._require_stopped(backend)
+        backend.inventory = lambda: dict(stopped, dev=1)
+        with self.assertRaisesRegex(ValueError, "no Java"):
+            workshopctl._require_stopped(backend)
+
 
 if __name__ == "__main__":
     unittest.main()

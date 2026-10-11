@@ -1444,6 +1444,65 @@ class DockerBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "writable.*AI policy"):
             self.backend._check_workshop_ai(original)
 
+    def test_ai_rejects_writable_bind_volume_exposing_policy(self):
+        _, original = self._setup_ai_fixture()
+        settings = self.backend.ai_settings_dir
+        (settings / "ai-limits.json").write_text("{}")
+
+        def volume(device, **overrides):
+            mount = {
+                "Type": "volume",
+                "Source": "policy-shadow",
+                "Target": "/scratch",
+                "ReadOnly": False,
+                "VolumeOptions": {
+                    "DriverConfig": {
+                        "Name": "local",
+                        "Options": {"type": "none", "o": "bind", "device": device},
+                    }
+                },
+            }
+            mount.update(overrides)
+            return mount
+
+        spec = json.loads(json.dumps(original))
+        spec["Mounts"].append(volume(str(settings)))
+        with self.assertRaisesRegex(ValueError, "writable.*AI policy"):
+            self.backend._check_workshop_ai(spec)
+        spec = json.loads(json.dumps(original))
+        spec["Mounts"].append(volume(str(settings / "ai-limits.json")))
+        with self.assertRaisesRegex(ValueError, "writable.*AI policy"):
+            self.backend._check_workshop_ai(spec)
+        allowed = [
+            ("readonly mount", volume(str(settings), ReadOnly=True)),
+            ("unrelated device", volume(str(self.data["workshop"]))),
+            (
+                "plain named volume",
+                {"Type": "volume", "Source": "data", "Target": "/scratch"},
+            ),
+            (
+                "kernel readonly bind",
+                volume(
+                    str(settings),
+                    VolumeOptions={
+                        "DriverConfig": {
+                            "Name": "local",
+                            "Options": {
+                                "type": "none",
+                                "o": "bind,ro",
+                                "device": str(settings),
+                            },
+                        }
+                    },
+                ),
+            ),
+        ]
+        for name, mount in allowed:
+            with self.subTest(name=name):
+                spec = json.loads(json.dumps(original))
+                spec["Mounts"].append(mount)
+                self.backend._check_workshop_ai(spec)
+
     def test_ai_rejects_policy_hardlink_inside_unrelated_writable_directory(self):
         _, spec = self._setup_ai_fixture()
         policy = self.backend.ai_settings_dir / "ai-limits.json"
