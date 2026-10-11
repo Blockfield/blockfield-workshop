@@ -593,6 +593,36 @@ class DockerBackend:
             return None
         return data
 
+    def readiness_generation(self, profile: str) -> str | None:
+        """Generation in the app's readiness file; None when absent or invalid.
+
+        The controller compares the mod activity file against this so a stale or
+        foreign report (e.g. from before a restart) never counts as idleness.
+        """
+        path = self.apps[self.app_of(profile)].data / READY_FILE
+        if path.is_symlink():
+            return None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16384:
+                return None
+            contents = os.read(fd, 16385)
+            if len(contents) > 16384:
+                return None
+            document = json.loads(contents)
+        except (OSError, UnicodeError, ValueError):
+            return None
+        finally:
+            os.close(fd)
+        if not isinstance(document, dict):
+            return None
+        generation = document.get("generation")
+        return generation if isinstance(generation, str) and generation else None
+
     @staticmethod
     def _goal(profile: str, release, session, candidate=None, mode_id=None) -> Goal:
         try:

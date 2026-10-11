@@ -97,7 +97,8 @@ class GateTests(unittest.TestCase):
         for _ in range(5):
             self.controller.step()
             self.assertEqual(self.gate("game")["gate"], "public")
-            self.assertEqual(self.gate()["gate"], "closed")
+            # Starting never admits; the proxy shows members the waking message.
+            self.assertEqual(self.gate()["gate"], "STARTING")
             self.assertEqual(self.public("game")["mode"], "game")
         self.assertEqual(self.stamps(), before)
 
@@ -113,12 +114,16 @@ class GateTests(unittest.TestCase):
         )
         self.controller.request(str(uuid4()), self.goal, 0)
         self.controller.step()
-        closed = self.gate()
+        starting = self.gate()
         self.assertEqual(
-            (closed["gate"], closed["backend"], closed["allowed"]),
-            ("closed", "workshop", []),
+            (starting["gate"], starting["backend"], starting["allowed"]),
+            (
+                "STARTING",
+                "workshop",
+                [{"draslId": DRASL, "name": "Nether", "role": "admin"}],
+            ),
         )
-        self.assertEqual(closed["message"], DEFAULT_MESSAGE)
+        self.assertEqual(starting["message"], DEFAULT_MESSAGE)
         self.backend.ready(self.goal)
         self.controller.step()
         self.assertEqual(

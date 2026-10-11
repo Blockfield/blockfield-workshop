@@ -120,12 +120,16 @@ def check(records: list[dict]) -> list[str]:
             entries = r["backends"]
             for app, states in (
                 ("game", {"public", "draining", "closed"}),
-                ("workshop", {"builders", "testers", "closed"}),
+                ("workshop", {"builders", "testers", "closed", "sleeping"}),
             ):
                 entry = entries.get(app) if isinstance(entries, dict) else None
                 state = entry.get("gate") if isinstance(entry, dict) else None
                 if not isinstance(state, str) or state not in states:
                     violations.append(f"{r['t']}: invalid {app} gate")
+                elif state == "sleeping":
+                    # Cold Workshop: parked at 0 replicas with its goal intact.
+                    if app != "workshop" or r.get("workshop_java") != 0:
+                        violations.append(f"{r['t']}: sleeping gate needs no backend")
                 elif state != "closed" and (
                     r.get(f"{app}_java") != 1
                     or r.get(f"{app}_ready") is not True
