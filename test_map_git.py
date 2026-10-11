@@ -1,6 +1,7 @@
 """Map branches use immutable trees, frozen reviews and explicit binary conflicts."""
 
 import json
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -386,6 +387,25 @@ class MapGitTests(unittest.TestCase):
         )
         self.versions.validate_working_copy("konstaxa", session_id)
         self.assertEqual(archive.stat().st_mode & 0o777, 0o444)
+
+    def test_permission_repair_skips_symlinks_and_settled_files(self):
+        copy_id, bundle = self.draft("links")
+        outside = self.data / "outside-secret"
+        outside.write_text("x")
+        outside.chmod(0o600)
+        (bundle / "world/level.dat").symlink_to(outside)
+        (bundle / "world/dangling").symlink_to(self.data / "missing")
+        region = bundle / "world/region/r.0.0.mca"
+        region.chmod(0o644)
+        owner = (os.getuid(), os.getgid())
+        with mock.patch.object(candidates, "OWNER", owner):
+            self.versions.validate_working_copy("konstaxa", copy_id)
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(region.stat().st_mode & 0o777, 0o664)
+            with mock.patch("os.fchmod") as fchmod, mock.patch("os.fchown") as fchown:
+                self.versions.validate_working_copy("konstaxa", copy_id)
+            fchmod.assert_not_called()
+            fchown.assert_not_called()
 
     def test_review_target_cannot_move_under_approval(self):
         copy_id, bundle = self.draft("review")

@@ -150,15 +150,19 @@ def ensure_workshop_key(path: Path) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
     try:
-        os.write(fd, (secrets.token_hex(32) + "\n").encode())
         try:
-            os.fchown(fd, -1, WORKSHOP_KEY_GID)
-        except PermissionError:
-            pass  # tests and non-root runs: the file stays with the caller's group
-        os.fchmod(fd, 0o640)
-    finally:
-        os.close(fd)
-    os.replace(temporary, path)
+            os.write(fd, (secrets.token_hex(32) + "\n").encode())
+            try:
+                os.fchown(fd, -1, WORKSHOP_KEY_GID)
+            except PermissionError:
+                pass  # tests and non-root runs: the file stays with the caller's group
+            os.fchmod(fd, 0o640)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)  # never leave a partial secret behind
+        raise
 
 
 def member(value, *, scopes=None) -> dict:
@@ -203,12 +207,16 @@ def valid_message(value) -> str:
     return value.strip()
 
 
-def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+def atomic_write(
+    path: Path, data: bytes, mode: int = 0o600, owner: tuple[int, int] | None = None
+) -> None:
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + "-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
+            if owner is not None:
+                os.fchown(handle.fileno(), *owner)
             os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -774,10 +782,10 @@ class Controller:
         )
         if sleeping or starting:
             # The proxy and the site render this: the editor is parked at 0 replicas
-            # with its goal intact, not closed for maintenance. STARTING keeps members
+            # with its goal intact, not closed for maintenance. starting keeps members
             # in the lobby with the waking message instead of the closed one.
             workshop_gate = {
-                "gate": "sleeping" if sleeping else "STARTING",
+                "gate": "sleeping" if sleeping else "starting",
                 "message": self.message,
                 "allowed": self.members(),
             }
@@ -1290,6 +1298,10 @@ class Controller:
             return False
         if now - idle_since < int(self.idle_sleep_s * 1000):
             return False
+        # Stop admitting before the save: a join after the idle report would lose edits made
+        # after freeze. A failed save/stop lands in ERROR, which stays closed.
+        state["gate"] = "closed"
+        self._write(state)
         self.backend.save_and_freeze(current)
         self.backend.stop(current)
         remaining, _, managed = self._observe()
@@ -2074,34 +2086,7 @@ class Controller:
                 stored = {"set": False, "last4": "", "sha256Prefix": ""}
             else:
                 data = key.encode()
-                temporary = directory / f".openrouter.key.{os.getpid()}.tmp"
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
-                fd = os.open(
-                    temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                )
-                try:
-                    os.fchown(fd, AI_KEY_UID, AI_KEY_GID)
-                    os.fchmod(fd, 0o600)
-                    # A short write would leave a truncated key behind a "set" status.
-                    view = memoryview(data)
-                    while view:
-                        view = view[os.write(fd, view) :]
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                os.replace(temporary, path)
-                directory_fd = os.open(
-                    directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                )
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+                atomic_write(path, data, owner=(AI_KEY_UID, AI_KEY_GID))
                 stored = {
                     "set": True,
                     "last4": key[-4:],

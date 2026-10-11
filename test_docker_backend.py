@@ -1473,6 +1473,23 @@ class DockerBackendTests(unittest.TestCase):
         spec["Mounts"].append(volume(str(settings / "ai-limits.json")))
         with self.assertRaisesRegex(ValueError, "writable.*AI policy"):
             self.backend._check_workshop_ai(spec)
+        for options in (
+            {"type": "none", "o": "rbind", "device": str(settings)},
+            {"type": "tmpfs", "o": "bind", "device": str(settings)},
+            {"type": "none", "o": "bind,ro,rw", "device": str(settings)},
+        ):
+            with self.subTest(options=options):
+                spec = json.loads(json.dumps(original))
+                spec["Mounts"].append(
+                    volume(
+                        str(settings),
+                        VolumeOptions={
+                            "DriverConfig": {"Name": "local", "Options": options}
+                        },
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "writable.*AI policy"):
+                    self.backend._check_workshop_ai(spec)
         allowed = [
             ("readonly mount", volume(str(settings), ReadOnly=True)),
             ("unrelated device", volume(str(self.data["workshop"]))),

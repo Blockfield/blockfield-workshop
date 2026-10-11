@@ -18,6 +18,7 @@ from test_controller import FakeBackend
 from controller import (
     AI_KEY_UID as PRODUCTION_KEY_UID,
     AI_KEY_GID as PRODUCTION_KEY_GID,
+    ensure_workshop_key,
 )
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
@@ -682,6 +683,22 @@ class AiKeyInboxTests(unittest.TestCase):
         self.assertEqual((PRODUCTION_KEY_UID, PRODUCTION_KEY_GID), (1000, 1000))
         self.assertEqual(self.key_file().read_text(), self.key)
 
+    def test_failed_key_write_leaves_no_partial_key(self):
+        real_fsync = os.fsync
+
+        def full_disk(fd):
+            if "openrouter.key" in os.readlink(f"/proc/self/fd/{fd}"):
+                raise OSError(28, "No space left on device")
+            return real_fsync(fd)
+
+        with unittest.mock.patch("os.fsync", side_effect=full_disk):
+            request_id = self.put(key=self.key)
+            self.process()
+        self.assertFalse(self.result(request_id)["ok"])
+        self.assertEqual(
+            list((self.workshop_data / "blockfield-workshop").iterdir()), []
+        )
+
     def test_idempotent_replay_keeps_first_result(self):
         request_id = self.put(key=self.key)
         self.process()
@@ -725,6 +742,20 @@ class AiKeyInboxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkshopKeyTests(unittest.TestCase):
+    def test_failed_write_leaves_no_partial_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workshop.key"
+            with (
+                unittest.mock.patch(
+                    "os.write", side_effect=OSError(28, "No space left")
+                ),
+                self.assertRaises(OSError),
+            ):
+                ensure_workshop_key(path)
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 class SessionAndPlaytestTests(unittest.TestCase):

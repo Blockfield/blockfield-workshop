@@ -1032,11 +1032,11 @@ class DockerBackend:
                     if isinstance(options, dict)
                     else []
                 )
+                # With bind/rbind the kernel ignores the fs type, and a later rw undoes ro.
                 if (
                     isinstance(options, dict)
-                    and options.get("type") == "none"
-                    and "bind" in flags
-                    and "ro" not in flags
+                    and {"bind", "rbind"} & set(flags)
+                    and [f for f in flags if f in ("ro", "rw")][-1:] != ["ro"]
                     and isinstance(options.get("device"), str)
                 ):
                     device = Path(options["device"])
