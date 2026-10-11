@@ -39,6 +39,7 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 | `/srv/minecraft/backend-lock/game/profile.json`     | deploy/operator (optional)   | server guard, mod, controller  | Game profile/release/generation selection; absent permits verified legacy adoption                                                        |
 | `/srv/minecraft/backend-lock/workshop/profile.json` | controller `start()`         | server guard, mod              | `{schema:1,profile,generation,session,release,candidate?,modeId?}`; test uses the Workshop app                                            |
 | `<data>/.blockfield-ready.json`                     | mod on SERVER_STARTED        | controller                     | `{profile,generation,session,release}`; deleted before every start and during stop                                                        |
+| `<workshop data>/.blockfield-activity.json`         | mod every 30 s + join/leave  | controller                     | `{schema:1,generation,players,busy,updatedAt}`; Workshop profile only, mode 0644                                                          |
 | `/srv/minecraft/workshop/gate/gate.json`            | controller                   | proxy (`BLOCKFIELD_GATE_FILE`) | Schema1 legacy top fields describe Game; `backends.game` and `backends.workshop` each carry `{gate,message,allowed}`                      |
 | `/srv/minecraft/workshop/public/public.json`        | controller                   | public site                    | `{mode,message,since,workshop:{mode,message}}`; top mode reflects actual Game readiness                                                   |
 | `/srv/minecraft/workshop/controller/` (0700)        | controller                   | controller                     | `state.json`, `members.json`, `message.json`, `session.json`, `controller.lock`, `inbox.lock`                                             |
@@ -109,6 +110,53 @@ The adapter then runs one read-only `docker ps --no-trunc` filtered by both labe
 its cgroup container is that single returned container ID and it is the only such Java. Several or malformed dev
 containers, a second dev Java, other Compose projects/services and host Java still fail closed. The dev Game is
 never exported, gated, saved, scaled or stopped. Remove both variables when the dev stand is gone.
+
+## Cold Workshop sleep and wake
+
+The always-on editor sleeps when nobody builds, freeing its RAM on the game host, and wakes on
+demand. The Game is never touched: sleeping stops only the Workshop app after the ordinary
+graceful save/stop, and waking uses the ordinary start path. Sleep is disabled until the mod
+writes the activity file; rollout order is deploy-script support, then this controller with
+`BF_WORKSHOP_IDLE_SLEEP_S=0`, then the mod activity file, proxy, site, then `900`.
+
+```sh
+BF_WORKSHOP_IDLE_SLEEP_S=900   # /etc/blockfield/workshop.env; seconds of continuous idleness, 0 disables sleeping
+```
+
+Each timer step in stable phase `workshop` with a ready backend matching its goal checks the mod
+activity file `<workshop data>/.blockfield-activity.json`
+(`{schema:1,generation,players,busy,updatedAt}`, `updatedAt` in epoch ms). The editor is idle only
+when the file is fresh -- `generation` equals the current readiness generation and `updatedAt` is
+at most 120 s old -- with `players == 0` and `busy == false`. The file is read bounded (16 KiB),
+regular-file only, no symlinks; any missing/stale/foreign/unreadable report means not idle
+(fail-safe = stay awake). Continuous idleness is tracked as `idleSince` (epoch ms) in
+`state.json`; any activity clears it. After `BF_WORKSHOP_IDLE_SLEEP_S` seconds idle, and only
+with no phase transition, ERROR, test profile, pending release follow or unanswered inbox
+request, the controller saves/stops the Workshop app and records phase `sleeping` with the
+desired Workshop goal (session, maps, drafts) unchanged.
+
+While `sleeping` the Workshop app stays at 0 replicas and the timer never restarts it. Exact
+exported values, read by the proxy and the site:
+
+- `state.json` / `admin/status.json`: `phase` `sleeping`, `gate` `closed` (state) / `sleeping` (status).
+- `gate.json` `backends.workshop`: `{gate: "sleeping", allowed: <workshop members>}`; the Game entry is unchanged.
+- `public.json` `workshop`: `{mode: "sleeping", message: <maintenance message>}`.
+
+Wake sources share one transition: inbox `wake`
+`{schema:1,id,kind:"wake",actor:{draslId,name},createdAt}` from any workshop member (the proxy
+sends at most one per 60 s, the site behind its Workshop button), or `workshopctl wake` by the
+root operator. A sleeping editor restarts the same goal at the then-current Game digest
+(`STARTING` -> `workshop`); any other phase reports ok without side effects, including a wake
+while `STARTING`, and repeated wakes never issue a second start. Result payload is
+`{kind:"wake",phase,revision}`. Inbox requests that need a running Workshop while sleeping --
+`candidate`, `commit`, `limbo-export`, `map-create`, `map-properties` and a playtest `mode` --
+are refused with `Мастерская спит — запустите её`; every other kind keeps its current contract
+and never auto-wakes. The process journal accepts the `sleeping` workshop gate only with zero
+Workshop Java.
+
+```sh
+just python workshopctl.py wake      # start a sleeping editor now (idempotent); follow with status
+```
 
 ## Site admin inbox
 
@@ -747,6 +795,7 @@ just python workshopctl.py status          # actual editor/test phase plus passi
 just python workshopctl.py request game    # legacy spelling: resume the same persistent editor
 just python workshopctl.py request game --recover   # only from ERROR; read `error` in status first
 just python workshopctl.py cancel                    # abort a stuck Workshop STARTING transition now, no root needed
+just python workshopctl.py wake                      # start a sleeping editor now (idempotent)
 ```
 
 Drasl profile ids: `curl https://skins.blockfield.pro/account/users/profiles/minecraft/<Name>`. `members` applies online:

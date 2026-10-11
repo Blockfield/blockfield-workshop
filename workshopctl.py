@@ -4,7 +4,7 @@
 workshopctl request workshop --session <uuid> [--release vX.Y.Z]
 workshopctl request game [--release vX.Y.Z] [--recover]
 workshopctl members [draslId:name[:role[:mapId+mapId...]] ...]
-workshopctl step | status | cancel      # step applies the site admin inbox first
+workshopctl step | status | cancel | wake      # step applies the site admin inbox first
 """
 
 from __future__ import annotations
@@ -222,6 +222,9 @@ def main(argv=None, backend_factory=None) -> int:
     commands.add_parser("step")
     commands.add_parser("status")
     commands.add_parser(
+        "wake", help="start a sleeping Workshop editor again (idempotent)"
+    )
+    commands.add_parser(
         "cancel", help="unprivileged rollback of a stuck Workshop STARTING transition"
     )
     members = commands.add_parser(
@@ -300,6 +303,7 @@ def main(argv=None, backend_factory=None) -> int:
             admin_dir=Path(args.admin_dir),
             inbox_dir=Path(args.inbox_dir),
             start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
+            idle_sleep_s=float(env.get("BF_WORKSHOP_IDLE_SLEEP_S", 900)),
             maps=_map_store(env, backend),
             workshop_data_dir=Path(
                 env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")
@@ -318,6 +322,17 @@ def main(argv=None, backend_factory=None) -> int:
             }
         elif args.command == "cancel":
             result = controller.cancel()
+        elif args.command == "wake":
+            result = controller.wake(str(uuid4()))
+            if result.get("phase") == "REQUESTED":
+                result = {"wake": result, "state": controller.step()}
+                deadline = time.monotonic() + float(env.get("BF_STEP_FOLLOW_S", 12))
+                while (
+                    result["state"].get("phase") in FOLLOWED_PHASES
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(float(env.get("BF_STEP_POLL_S", 2)))
+                    result["state"] = controller.step()
         elif args.command == "import-map":
             result = _import_map(args, controller, backend)
         elif args.command == "export-limbo":
@@ -457,7 +472,8 @@ def main(argv=None, backend_factory=None) -> int:
         print(f"workshopctl: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    return 2 if result.get("phase") == "ERROR" else 0
+    phase = result.get("phase", (result.get("state") or {}).get("phase"))
+    return 2 if phase == "ERROR" else 0
 
 
 if __name__ == "__main__":

@@ -116,6 +116,20 @@ INBOX_MERGE_MAX_BYTES = 8 << 20
 INBOX_BATCH = 20
 INBOX_TTL_MS = 10 * 60 * 1000
 RESULTS_KEPT = 200
+# Cold Workshop (unreleased section 2): the always-on editor sleeps after 15 min
+# with no builders and no active work, and wakes on demand through the proxy/site.
+ACTIVITY_FILE = ".blockfield-activity.json"
+ACTIVITY_MAX_BYTES = 16384
+ACTIVITY_FRESH_MS = 120 * 1000
+SLEEP_MESSAGE = "Мастерская спит — запустите её"
+# Inbox kinds that need a running Workshop today; refused while sleeping.
+LIVE_ONLY_KINDS = {
+    "candidate",
+    "commit",
+    "limbo-export",
+    "map-create",
+    "map-properties",
+}
 # Workshop AI key from the site inbox: <workshop data>/blockfield-workshop/openrouter.key,
 # 0600 1000:1000. The value is write-only: it never appears in logs, results or exports.
 AI_KEY_PATTERN = re.compile(r"[\x21-\x7e]{20,2048}")
@@ -219,6 +233,7 @@ class Controller:
         admin_dir: Path | None = None,
         inbox_dir: Path | None = None,
         start_timeout: float = 600.0,
+        idle_sleep_s: float = 900.0,
         now: Callable[[], float] | None = None,
         maps=None,
         workshop_data_dir: Path | None = None,
@@ -227,6 +242,9 @@ class Controller:
         # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
         self.maps = maps
         self.start_timeout = start_timeout
+        # Cold Workshop idle sleep: seconds of continuous idleness before the stable
+        # editor sleeps; 0 disables sleeping entirely.
+        self.idle_sleep_s = idle_sleep_s
         self._now = now or time.time
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -313,6 +331,7 @@ class Controller:
             "SAVING": "closed",
             "STARTING": "closed",
             "ERROR": "closed",
+            "sleeping": "closed",
             "game": "public",
             "workshop": "builders",
             "test": "testers",
@@ -346,14 +365,20 @@ class Controller:
         state["desired"] = asdict(goal)
         if phase in {"game", "workshop", "test"} and phase != goal.profile:
             raise ValueError("stable phase does not match desired profile")
+        if phase == "sleeping" and goal.profile != "workshop":
+            raise ValueError("sleeping keeps a workshop goal")
         # Additive fields: absent on a state.json written before this fix, so default rather than reject.
         state.setdefault("since", 0)
         state.setdefault("errorMessage", None)
         state.setdefault("rollback", None)
+        # Cold Workshop idle timer: epoch ms of continuous idleness, None while active.
+        state.setdefault("idleSince", None)
         if type(state["since"]) is not int or not (
             state["errorMessage"] is None or isinstance(state["errorMessage"], str)
         ):
             raise ValueError("invalid state timing/error fields")
+        if state["idleSince"] is not None and type(state["idleSince"]) is not int:
+            raise ValueError("invalid state idle timer")
         if state["rollback"] is not None:
             try:
                 state["rollback"] = asdict(Goal(**state["rollback"]))
@@ -603,6 +628,101 @@ class Controller:
         data = json.dumps(session, sort_keys=True, ensure_ascii=False, allow_nan=False)
         return hashlib.sha256(data.encode()).hexdigest()
 
+    def _workshop_data_base(self) -> Path | None:
+        """Host Workshop app data dir (holds the mod activity file); None when unknown."""
+        if self.workshop_data_dir is not None:
+            return Path(self.workshop_data_dir)
+        apps = getattr(self.backend, "apps", None)
+        if apps is not None and "workshop" in apps:
+            return Path(apps["workshop"].data)
+        return None
+
+    def _read_activity(self) -> dict | None:
+        """Latest mod activity report; None means not provably idle (fail-safe = awake).
+
+        The file lives in the Workshop app data dir on the host. Any problem --
+        missing, symlink, non-regular, oversized, unreadable, invalid JSON or schema
+        -- reads as activity, so a broken reporter never lets the editor sleep.
+        """
+        base = self._workshop_data_base()
+        if base is None:
+            return None
+        path = base / ACTIVITY_FILE
+        if path.is_symlink():
+            return None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            try:
+                info = os.fstat(handle.fileno())
+            except OSError:
+                return None
+            if not stat.S_ISREG(info.st_mode) or info.st_size > ACTIVITY_MAX_BYTES:
+                return None
+            data = handle.read(ACTIVITY_MAX_BYTES + 1)
+        if len(data) > ACTIVITY_MAX_BYTES:
+            return None
+        try:
+            document = json.loads(data)
+        except ValueError:
+            return None
+        if (
+            not isinstance(document, dict)
+            or document.get("schema") != 1
+            or not isinstance(document.get("generation"), str)
+            or not document["generation"]
+            or type(document.get("players")) is not int
+            or type(document.get("busy")) is not bool
+            or type(document.get("updatedAt")) is not int
+        ):
+            return None
+        return document
+
+    def _readiness_generation(self) -> str | None:
+        """Current Workshop readiness generation; None when unknown (fail-safe = awake)."""
+        probe = getattr(self.backend, "readiness_generation", None)
+        if probe is None:
+            return None
+        try:
+            generation = probe("workshop")
+        except Exception:
+            return None
+        return generation if isinstance(generation, str) and generation else None
+
+    def _inbox_has_pending(self) -> bool:
+        """True unless the inbox provably holds no unanswered request."""
+        if not self.inbox_dir or not self.admin_dir:
+            return False
+        results = self.admin_dir / "results"
+        try:
+            names = os.listdir(self.inbox_dir)
+        except OSError:
+            return True
+        return any(
+            INBOX_NAME.fullmatch(name) and not (results / name).exists()
+            for name in names
+        )
+
+    def _activity_idle(self, state: dict) -> bool:
+        """Fresh idle activity report; any activity clears the idle timer."""
+        document = self._read_activity()
+        generation = self._readiness_generation()
+        now = self._now_ms()
+        idle = (
+            document is not None
+            and generation is not None
+            and document["generation"] == generation
+            and 0 <= now - document["updatedAt"] <= ACTIVITY_FRESH_MS
+            and document["players"] == 0
+            and document["busy"] is False
+        )
+        if not idle and state.get("idleSince") is not None:
+            state["idleSince"] = None
+            self._write(state)
+        return idle
+
     def _observe(self) -> tuple[list[Process], Process | None, Process | None]:
         processes = self.backend.observe()
         game = [p for p in processes if p.goal.profile == "game"]
@@ -640,11 +760,21 @@ class Controller:
         except Exception:
             gate = "closed"
         members_gate = gate in {"builders", "testers"}
-        workshop_gate = {
-            "gate": gate if members_gate else "closed",
-            "message": self.message,
-            "allowed": self.members() if members_gate else [],
-        }
+        sleeping = state.get("phase") == "sleeping"
+        if sleeping:
+            # The proxy and the site render this: the editor is parked at 0 replicas
+            # with its goal intact, not closed for maintenance.
+            workshop_gate = {
+                "gate": "sleeping",
+                "message": self.message,
+                "allowed": self.members(),
+            }
+        else:
+            workshop_gate = {
+                "gate": gate if members_gate else "closed",
+                "message": self.message,
+                "allowed": self.members() if members_gate else [],
+            }
         game_gate = {
             "gate": game_status["gate"],
             "message": "" if game_status["gate"] == "public" else self.default_message,
@@ -664,7 +794,11 @@ class Controller:
             "message": "" if mode == "game" else self.default_message,
             "since": int(time.time() * 1000),
             "workshop": {
-                "mode": "workshop" if members_gate else "maintenance",
+                "mode": "sleeping"
+                if sleeping
+                else "workshop"
+                if members_gate
+                else "maintenance",
                 "message": self.message,
             },
         }
@@ -733,111 +867,125 @@ class Controller:
         """
         UUID(operation)
         with self._locked():
-            state = self._read()
-            returning = goal.profile == "game"
-            if returning:
-                goal, session = self._editor_goal(goal.release, state)
-            if state.get("operation") == operation:
-                if state.get("desired") != asdict(goal):
-                    raise ValueError("operation ID reused with different intent")
-                return state
-            if (
-                type(expected_revision) is not int
-                or expected_revision != state["revision"]
-            ):
-                raise ValueError("stale state revision")
-            recovering = recover and state.get("phase") == "ERROR" and returning
-            if (
-                state.get("phase") not in {"UNINITIALIZED", "game", "workshop", "test"}
-                and not recovering
-            ):
-                raise RuntimeError("operation in progress or requires recovery")
-            self.backend.preflight(goal)
-            previous_session = self.session()
-            if goal.profile == "workshop":
-                if session is None:
-                    session = (
-                        previous_session
-                        if previous_session
-                        and previous_session.get("id") == goal.session
-                        else {
-                            "schema": 1,
-                            "id": goal.session,
-                            "maps": None,
-                            "startedAt": self._now_ms(),
-                            "startedBy": None,
-                        }
-                    )
-                if getattr(self.maps, "canonical_sessions", False) is True:
-                    session = self._selected_session(
-                        goal,
-                        session,
-                        resume_only=resume_only
-                        or bool(
-                            previous_session
-                            and previous_session.get("id") == goal.session
-                        ),
-                    )
-            revision = state["revision"] + 1
-            # The stable phase we're leaving IS the running goal (phase==goal.profile is an invariant of
-            # _read()); remember it now so a later STARTING timeout can roll back to it without
-            # relying on backend.observe() still agreeing once things go wrong.
-            previous_stable = (
-                state.get("desired")
-                if state.get("phase") in {"workshop", "test"}
-                else None
+            return self._request_locked(
+                operation,
+                goal,
+                expected_revision,
+                recover=recover,
+                session=session,
+                resume_only=resume_only,
             )
-            state = {
-                "schema": 1,
-                "revision": revision,
-                "phase": "ERROR" if recovering else "REQUESTED",
-                "gate": "closed",
-                "operation": operation,
-                "desired": asdict(goal),
-                "error": state.get("error") if recovering else None,
-                "errorMessage": state.get("errorMessage") if recovering else None,
-                "since": self._now_ms(),
-                "rollback": None if recovering else previous_stable,
-                "rollbackSession": previous_session
-                if previous_stable
-                and previous_stable["profile"] in {"workshop", "test"}
-                else None,
-            }
-            if (
-                len(
-                    json.dumps(
-                        state, ensure_ascii=False, sort_keys=True, allow_nan=False
-                    ).encode()
-                )
-                > 16384
-            ):
-                raise ValueError("controller state exceeds its bounded reader")
-            previous_state = self.file.read_bytes() if self.file.exists() else None
-            session_paths = [self.session_file] + (
-                [self.admin_dir / "session.json"] if self.admin_dir is not None else []
-            )
-            previous_exports = {
-                path: path.read_bytes() if path.exists() else None
-                for path in session_paths
-            }
-            try:
-                if session is not None:
-                    self._save_session(session)
-                self._write(state)
-            except Exception:
-                durable = self.file.read_bytes() if self.file.exists() else None
-                if session is not None and durable == previous_state:
-                    for path, data in previous_exports.items():
-                        if data is None:
-                            path.unlink(missing_ok=True)
-                        else:
-                            atomic_write(
-                                path,
-                                data,
-                                0o644 if path.parent == self.admin_dir else 0o600,
-                            )
-                raise
+
+    def _request_locked(
+        self,
+        operation: str,
+        goal: Goal,
+        expected_revision: int,
+        *,
+        recover: bool = False,
+        session: dict | None = None,
+        resume_only: bool = False,
+    ) -> dict:
+        """request() body under the controller lock, shared with wake()."""
+        UUID(operation)
+        state = self._read()
+        returning = goal.profile == "game"
+        if returning:
+            goal, session = self._editor_goal(goal.release, state)
+        if state.get("operation") == operation:
+            if state.get("desired") != asdict(goal):
+                raise ValueError("operation ID reused with different intent")
             return state
+        if type(expected_revision) is not int or expected_revision != state["revision"]:
+            raise ValueError("stale state revision")
+        recovering = recover and state.get("phase") == "ERROR" and returning
+        if (
+            state.get("phase")
+            not in {"UNINITIALIZED", "game", "workshop", "test", "sleeping"}
+            and not recovering
+        ):
+            raise RuntimeError("operation in progress or requires recovery")
+        self.backend.preflight(goal)
+        previous_session = self.session()
+        if goal.profile == "workshop":
+            if session is None:
+                session = (
+                    previous_session
+                    if previous_session and previous_session.get("id") == goal.session
+                    else {
+                        "schema": 1,
+                        "id": goal.session,
+                        "maps": None,
+                        "startedAt": self._now_ms(),
+                        "startedBy": None,
+                    }
+                )
+            if getattr(self.maps, "canonical_sessions", False) is True:
+                session = self._selected_session(
+                    goal,
+                    session,
+                    resume_only=resume_only
+                    or bool(
+                        previous_session and previous_session.get("id") == goal.session
+                    ),
+                )
+        revision = state["revision"] + 1
+        # The stable phase we're leaving IS the running goal (phase==goal.profile is an invariant of
+        # _read()); remember it now so a later STARTING timeout can roll back to it without
+        # relying on backend.observe() still agreeing once things go wrong.
+        previous_stable = (
+            state.get("desired") if state.get("phase") in {"workshop", "test"} else None
+        )
+        state = {
+            "schema": 1,
+            "revision": revision,
+            "phase": "ERROR" if recovering else "REQUESTED",
+            "gate": "closed",
+            "operation": operation,
+            "desired": asdict(goal),
+            "error": state.get("error") if recovering else None,
+            "errorMessage": state.get("errorMessage") if recovering else None,
+            "since": self._now_ms(),
+            "rollback": None if recovering else previous_stable,
+            "rollbackSession": previous_session
+            if previous_stable and previous_stable["profile"] in {"workshop", "test"}
+            else None,
+            "idleSince": None,
+        }
+        if (
+            len(
+                json.dumps(
+                    state, ensure_ascii=False, sort_keys=True, allow_nan=False
+                ).encode()
+            )
+            > 16384
+        ):
+            raise ValueError("controller state exceeds its bounded reader")
+        previous_state = self.file.read_bytes() if self.file.exists() else None
+        session_paths = [self.session_file] + (
+            [self.admin_dir / "session.json"] if self.admin_dir is not None else []
+        )
+        previous_exports = {
+            path: path.read_bytes() if path.exists() else None for path in session_paths
+        }
+        try:
+            if session is not None:
+                self._save_session(session)
+            self._write(state)
+        except Exception:
+            durable = self.file.read_bytes() if self.file.exists() else None
+            if session is not None and durable == previous_state:
+                for path, data in previous_exports.items():
+                    if data is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        atomic_write(
+                            path,
+                            data,
+                            0o644 if path.parent == self.admin_dir else 0o600,
+                        )
+            raise
+        return state
 
     def step(self, *, recover: bool = False) -> dict:
         """Reconcile Workshop only; Game is observed for readiness and release compatibility.
@@ -938,6 +1086,8 @@ class Controller:
                 elif previous_phase == "ERROR" and not recover:
                     self._export(state)
                     return state
+                elif previous_phase == "sleeping":
+                    return self._sleeping_step(state, goal, current)
                 if goal is None or goal.profile == "game":
                     release = goal.release if goal else None
                     if game is not None and game.ready:
@@ -1044,6 +1194,8 @@ class Controller:
                     previous_phase = "REQUESTED"
                 if current is not None and current.goal == goal:
                     if current.ready:
+                        if self._maybe_sleep(state, goal, current):
+                            return state
                         commit(goal.profile, OPEN_GATES[goal.profile])
                         self._export(state)
                         return state
@@ -1088,6 +1240,82 @@ class Controller:
                 )
                 self._write(state)
                 return state
+
+    def _maybe_sleep(self, state: dict, goal: Goal, current: Process) -> bool:
+        """Sleep the stable idle editor through the existing graceful save/stop path.
+
+        True when the backend was stopped and the phase is now sleeping. Never sleeps
+        a transition, ERROR, test profile, pending release follow or inbox backlog;
+        any missing/stale/foreign activity report keeps the editor awake.
+        """
+        if (
+            state.get("phase") != "workshop"
+            or goal is None
+            or goal.profile != "workshop"
+            or state.get("releaseFollow") is not None
+            or self._inbox_has_pending()
+        ):
+            if state.get("idleSince") is not None:
+                state["idleSince"] = None
+                self._write(state)
+            return False
+        if not self.idle_sleep_s or self.idle_sleep_s < 0:
+            if state.get("idleSince") is not None:
+                state["idleSince"] = None
+                self._write(state)
+            return False
+        if not self._activity_idle(state):
+            return False
+        now = self._now_ms()
+        idle_since = state.get("idleSince")
+        if type(idle_since) is not int:
+            state["idleSince"] = now
+            self._write(state)
+            return False
+        if now - idle_since < int(self.idle_sleep_s * 1000):
+            return False
+        self.backend.save_and_freeze(current)
+        self.backend.stop(current)
+        remaining, _, managed = self._observe()
+        if managed is not None:
+            raise RuntimeError("old backend not confirmed stopped")
+        if self.maps is not None and not remaining:
+            self.maps.versions.reclaim_unheaded_bundles()
+        state.update(
+            revision=state["revision"] + 1,
+            operation=str(uuid4()),
+            phase="sleeping",
+            gate="closed",
+            error=None,
+            errorMessage=None,
+            since=now,
+            rollback=None,
+            idleSince=None,
+        )
+        state.pop("releaseFollow", None)
+        self._write(state)
+        return True
+
+    def _sleeping_step(
+        self, state: dict, goal: Goal | None, current: Process | None
+    ) -> dict:
+        """Asleep: no backend is expected; an externally started matching backend is adopted."""
+        if (
+            goal is not None
+            and current is not None
+            and current.ready
+            and current.goal == goal
+        ):
+            if state["phase"] != "workshop":
+                state["since"] = self._now_ms()
+                state["phase"] = "workshop"
+                state["gate"] = OPEN_GATES[goal.profile]
+                self._write(state)
+            else:
+                self._export(state)
+            return state
+        self._export(state)
+        return state
 
     def _starting_wait(
         self, state: dict, goal: Goal, unexpected: Process | None
@@ -1174,6 +1402,41 @@ class Controller:
             return self._rollback(
                 state, Goal(**state["desired"]), "cancelled by admin request"
             )
+
+    def wake(self, operation: str, actor: dict | None = None) -> dict:
+        """Idempotent wake of a sleeping editor (site/proxy inbox "wake", workshopctl wake).
+
+        Sleeping restarts the same goal through the ordinary request path, so the next
+        step starts it like any other switch (STARTING -> workshop) at the then-current
+        Game digest; the session, maps and drafts are unchanged. Any other phase is
+        already awake or starting and reports ok without side effects. A member actor
+        (draslId/name) must belong to the workshop ACL; None is the root operator
+        (workshopctl) and skips that check.
+        """
+        UUID(operation)
+        with self._locked():
+            if actor is not None:
+                self._member_actor(actor)
+            state = self._read()
+            if state.get("phase") != "sleeping":
+                return {
+                    "kind": "wake",
+                    "phase": state.get("phase"),
+                    "revision": state.get("revision"),
+                }
+            goal = Goal(**state["desired"])
+            try:
+                _, game, _ = self._observe()
+            except Exception:
+                game = None
+            if game is not None and game.ready:
+                goal = replace(goal, release=game.goal.release)
+            state = self._request_locked(operation, goal, state["revision"])
+            return {
+                "kind": "wake",
+                "phase": state["phase"],
+                "revision": state["revision"],
+            }
 
     def process_inbox(self, now_ms: int | None = None) -> int:
         """Apply admin requests from the site, oldest first; each one gets exactly one result file.
@@ -1842,6 +2105,16 @@ class Controller:
 
     def _apply(self, request_id: str, document: dict) -> int | dict | None:
         kind = document.get("kind")
+        if kind == "wake":
+            actor = document.get("actor")
+            if not isinstance(actor, dict):
+                raise ValueError("invalid actor")
+            return self.wake(
+                request_id,
+                {"draslId": actor.get("draslId"), "name": actor.get("name")},
+            )
+        if kind in LIVE_ONLY_KINDS and self.status().get("phase") == "sleeping":
+            raise ValueError(SLEEP_MESSAGE)
         if kind in {"map-create", "map-properties"}:
             return self._map_change(request_id, document)
         if kind == "sessions":
@@ -2033,6 +2306,8 @@ class Controller:
                 goal = Goal("workshop", release, session["id"])
             elif profile == "test":
                 # A closed playtest of one candidate, started from the running workshop and returning to it.
+                if state.get("phase") == "sleeping":
+                    raise ValueError(SLEEP_MESSAGE)
                 if state.get("phase") != "workshop":
                     raise ValueError("a test starts only from the running workshop")
                 if self.maps is None:
