@@ -483,6 +483,50 @@ class MapVersionTests(unittest.TestCase):
         self.assertTrue(draft.exists())
         self.assertEqual(len(self.store.versions.history("konstaxa")), 3)
 
+    def test_reclaim_skipped_while_dev_game_java_runs(self):
+        first = self.candidate()
+        self.activate(first)
+        warm = Path(self.store.versions.head("konstaxa")["bundle"])
+        self.store.rollback(
+            "konstaxa",
+            ACTOR,
+            version_digest=first["baseVersion"],
+            expected_head=first["versionDigest"],
+        )
+        backend = FakeBackend()
+        controller = Controller(self.root / "state", backend, maps=self.store)
+        controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        controller.step()
+        backend.ready(Goal(**controller.status()["desired"]))
+        controller.step()
+        goal = Goal("workshop", "v1", str(uuid4()))
+        controller.request(str(uuid4()), goal, 1)
+        controller.step()
+        backend.ready(goal)
+        controller.step()
+        backend.processes = [p for p in backend.processes if p.goal.profile != "game"]
+        backend.inventory = lambda *, tasks=True: {"dev": 1}
+        controller.request(str(uuid4()), Goal("workshop", "v1", str(uuid4())), 2)
+        with mock.patch.object(
+            self.store.versions, "reclaim_unheaded_bundles"
+        ) as cleanup:
+            controller.step()
+        cleanup.assert_not_called()
+        self.assertTrue(
+            warm.exists(), "a live dev Game may still have captured this bundle"
+        )
+        backend.inventory = lambda *, tasks=True: {"dev": 0}
+        backend.ready(Goal(**controller.status()["desired"]))
+        controller.step()
+        controller.request(str(uuid4()), Goal("workshop", "v1", str(uuid4())), 3)
+        reclaim = self.store.versions.reclaim_unheaded_bundles
+        with mock.patch.object(
+            self.store.versions, "reclaim_unheaded_bundles", side_effect=reclaim
+        ) as cleanup:
+            controller.step()
+        cleanup.assert_called_once_with()
+        self.assertFalse(warm.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
