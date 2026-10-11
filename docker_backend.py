@@ -1039,10 +1039,14 @@ class DockerBackend:
         if shutil.disk_usage(data).free < self.min_free_bytes:
             raise OSError("not enough free space for the backend data")
         self.game_image()
-        if goal.profile == "workshop":
+        if self.app_of(goal.profile) == "workshop":
             spec = self.container_spec("workshop")
+            # The playtest runs the same Workshop service, so the same AI key/settings apply.
             self._check_workshop_ai(spec)
-            if getattr(self.maps, "canonical_sessions", False) is True:
+            if (
+                goal.profile == "workshop"
+                and getattr(self.maps, "canonical_sessions", False) is True
+            ):
                 self._check_workshop_mounts(spec)
 
     def observe(self) -> list[Process]:

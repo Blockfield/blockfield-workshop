@@ -855,6 +855,16 @@ class DockerBackendTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.backend.preflight(Goal("workshop", "v1", str(uuid4())))
 
+    def test_playtest_preflight_runs_the_workshop_ai_checks(self):
+        self.running("game")
+        self.ready("game", generation=None, session=None, release="v1")
+        self.backend.maps = mock.Mock()
+        with mock.patch.object(
+            self.backend, "_check_workshop_ai", side_effect=ValueError("ai checked")
+        ):
+            with self.assertRaisesRegex(ValueError, "ai checked"):
+                self.backend.preflight(Goal("test", "v1", str(uuid4()), "a" * 64))
+
     def test_workshop_restart_keeps_game_running_and_its_generation(self):
         self.running("game")
         self.ready("game", generation=None, session=None, release="v1")

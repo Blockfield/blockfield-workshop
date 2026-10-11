@@ -551,7 +551,7 @@ class AiKeyInboxTests(unittest.TestCase):
                 info.st_gid,
                 info.st_nlink,
             ),
-            (0o600, 1000, 1000, 1),
+            (0o600, os.getuid(), os.getgid(), 1),
         )
         status = json.loads((self.admin / "ai-key.json").read_text())
         self.assertEqual(
