@@ -142,6 +142,15 @@ ref, immutable commit/review, comparison or merge preview. Non-map control envel
   and `lead`/`admin` always have all maps regardless of `maps`.
 - `message` `{message}`: at most 200 characters, no control characters (Cc) or `§` (same rule as the site), stored in `controller/message.json` and exported to
   the Workshop gate/status; an empty message returns to `BF_MAINTENANCE_MESSAGE`. Game's unavailable message remains the configured default.
+- `ai-key` `{key}`: write-only workshop AI key from the site admin. `key` is printable ASCII
+  (`^[\x21-\x7e]{20,2048}$`); `null` removes the stored key. Under the controller lock the key is written
+  atomically to `<BF_WORKSHOP_DATA>/blockfield-workshop/openrouter.key` (temporary file in the same
+  directory, 0600 UID/GID 1000, fsync of file and directory, no symlinks anywhere on the path; the
+  `blockfield-workshop` directory is created 0755 1000:1000 only when absent, an existing one must
+  already be 1000:1000). The result keeps the standard envelope and carries
+  `{kind:"ai-key",set,last4,sha256Prefix,appliedAt}` both as payload and as top-level fields; `admin/ai-key.json`
+  keeps the latest `{schema:1,set,last4,sha256Prefix,appliedAt}` so the site can show "key set" without
+  reading any secret. The key never appears in logs, results, state or errors.
 
 ## Map candidates (candidates.py)
 
@@ -370,13 +379,20 @@ are refused. Writable host binds may not expose the canonical settings directory
 container path. An existing `ai-limits.json` must be a regular non-symlink file with a single hardlink; this also
 rejects a policy hardlink hidden in a separately mounted writable directory.
 
-The adapter reads the bounded, regular AI configuration during Workshop preflight. Missing configuration with no
-AI key, or `enabled: false` with no AI key, preserves the ordinary service path. `enabled: true` requires the
-Workshop profile and a nonblank `BLOCKFIELD_WORKSHOP_AI_OPENROUTER_KEY` in that service's private environment.
-Assigning that key also requires the configuration and strict mount checks even while the feature is disabled.
-The controller never reads a key file, copies a key from its own environment, sends it to the site or prints its
-value. The owner supplies a separate capped normal-credit key directly to the Workshop service only during
-approved enablement. Installing these prepared inputs, changing `enabled` or deploying still requires explicit
+The adapter reads the bounded, regular AI configuration during Workshop preflight. AI counts as configured
+when the host configuration is `enabled: true`, the site settings
+`<BF_AI_SETTINGS_DIR>/workshop-ai-settings.json` are `enabled: true`, the inbox-managed key file
+`<BF_WORKSHOP_DATA>/blockfield-workshop/openrouter.key` exists, or the legacy environment key is assigned.
+With nothing configured the ordinary service path is preserved. While configured, every strict mount/path/RO-view
+check above still applies: the site settings file is validated (closed schema
+`{schema,revision,enabled,generationModel,guardModel,transcriptionModel}`, regular single hardlink, no
+symlinks, at most 4096 bytes) when present, and the key file is validated (regular, 0600, UID/GID 1000,
+single hardlink, no symlinks, at most 2048 bytes; its content is never read) when present. A key source
+(key file or environment key) is required only while AI is enabled; the environment key alone no longer
+enables anything and remains only as a stand/dev fallback. The controller never reads, copies, sends or
+prints a key value. The owner re-enters the separate capped normal-credit key on the site, then removes
+`BLOCKFIELD_WORKSHOP_AI_OPENROUTER_KEY` from the Dokploy environment so the inbox-managed file is the
+single source. Installing these prepared inputs, changing `enabled` or deploying still requires explicit
 owner deployment approval; this source change performs none of those actions.
 
 `ai-limits.json` has this closed schema; empty grants deny every paid request:
