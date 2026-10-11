@@ -682,6 +682,22 @@ class AiKeyInboxTests(unittest.TestCase):
         self.assertEqual((PRODUCTION_KEY_UID, PRODUCTION_KEY_GID), (1000, 1000))
         self.assertEqual(self.key_file().read_text(), self.key)
 
+    def test_failed_key_write_leaves_no_partial_key(self):
+        real_fsync = os.fsync
+
+        def full_disk(fd):
+            if "openrouter.key" in os.readlink(f"/proc/self/fd/{fd}"):
+                raise OSError(28, "No space left on device")
+            return real_fsync(fd)
+
+        with unittest.mock.patch("os.fsync", side_effect=full_disk):
+            request_id = self.put(key=self.key)
+            self.process()
+        self.assertFalse(self.result(request_id)["ok"])
+        self.assertEqual(
+            list((self.workshop_data / "blockfield-workshop").iterdir()), []
+        )
+
     def test_idempotent_replay_keeps_first_result(self):
         request_id = self.put(key=self.key)
         self.process()

@@ -131,8 +131,16 @@ class SleepTests(unittest.TestCase):
         self.assertEqual(self.controller.status()["idleSince"], idle_since)
         self.advance(31)
         self.write_activity()
+        gates = []
+        save = self.backend.save_and_freeze
+        self.backend.save_and_freeze = lambda process: (
+            gates.append(json.loads((self.dir / "gate.json").read_text())),
+            save(process),
+        )
         state = self.controller.step()
         self.assertEqual(state["phase"], "sleeping")
+        # The proxy stops admitting before the save, not after the stop.
+        self.assertEqual(gates[0]["backends"]["workshop"]["gate"], "closed")
         self.assertEqual(
             state["desired"],
             {
@@ -361,7 +369,7 @@ class SleepTests(unittest.TestCase):
         ]
         self.assertEqual(
             (workshop["gate"], [m["name"] for m in workshop["allowed"]]),
-            ("STARTING", ["Nether"]),
+            ("starting", ["Nether"]),
         )
         self.backend.ready(Goal("workshop", "v2", self.goal.session))
         self.backend.generation = GENERATION
@@ -476,6 +484,14 @@ class SleepTests(unittest.TestCase):
         }
         self.assertEqual(check([record]), [])
         self.assertTrue(check([{**record, "workshop_java": 1}]))
+        # A waking editor has a not-yet-ready backend, or none at all.
+        for java in (0, 1):
+            starting = {**record, "workshop_java": java}
+            starting["backends"] = {
+                **record["backends"],
+                "workshop": {"gate": "starting"},
+            }
+            self.assertEqual(check([starting]), [])
         self.assertTrue(
             check(
                 [

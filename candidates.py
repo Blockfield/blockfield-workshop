@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import zipfile
@@ -2278,10 +2279,35 @@ def _chown(path: Path) -> None:
 
 
 def _chown_tree(root: Path, *, writable: bool = True) -> None:
-    for directory, _, files in os.walk(root):
-        _chown(Path(directory))
-        os.chmod(directory, 0o775 if writable else 0o755)
+    # Drafts are writable by the game server: fwalk and O_NOFOLLOW keep a planted symlink
+    # from redirecting root's chown/chmod outside the tree. Correct entries cost one lstat.
+    for _, _, files, directory_fd in os.fwalk(root):
+        _repair(directory_fd, os.fstat(directory_fd), 0o775 if writable else 0o755)
         for name in files:
-            _chown(Path(directory) / name)
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             # Editable copies keep inherited operator ACLs effective after copying immutable blobs.
-            os.chmod(Path(directory) / name, 0o664 if writable else 0o644)
+            mode = 0o664 if writable else 0o644
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or (stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
+                == (mode, *OWNER)
+            ):
+                continue
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
+            )
+            try:
+                _repair(fd, os.fstat(fd), mode)
+            finally:
+                os.close(fd)
+
+
+def _repair(fd: int, info: os.stat_result, mode: int) -> None:
+    if (info.st_uid, info.st_gid) != OWNER:
+        try:
+            os.fchown(fd, *OWNER)
+        except PermissionError:
+            pass  # tests and non-root runs
+    if stat.S_IMODE(info.st_mode) != mode:
+        os.fchmod(fd, mode)

@@ -98,7 +98,7 @@ class GateTests(unittest.TestCase):
             self.controller.step()
             self.assertEqual(self.gate("game")["gate"], "public")
             # Starting never admits; the proxy shows members the waking message.
-            self.assertEqual(self.gate()["gate"], "STARTING")
+            self.assertEqual(self.gate()["gate"], "starting")
             self.assertEqual(self.public("game")["mode"], "game")
         self.assertEqual(self.stamps(), before)
 
@@ -118,7 +118,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(
             (starting["gate"], starting["backend"], starting["allowed"]),
             (
-                "STARTING",
+                "starting",
                 "workshop",
                 [{"draslId": DRASL, "name": "Nether", "role": "admin"}],
             ),
