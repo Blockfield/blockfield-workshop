@@ -765,7 +765,7 @@ class DockerBackend:
             if len(contents) > AI_SITE_SETTINGS_MAX_BYTES:
                 raise ValueError("invalid workshop AI site settings")
             document = json.loads(contents)
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
             raise ValueError("invalid workshop AI site settings") from None
         finally:
             os.close(fd)
@@ -850,7 +850,7 @@ class DockerBackend:
                     or type(document.get("enabled", False)) is not bool
                 ):
                     raise ValueError("invalid workshop AI configuration")
-            except (OSError, UnicodeError, json.JSONDecodeError):
+            except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
                 raise ValueError("invalid workshop AI configuration") from None
             finally:
                 os.close(fd)
@@ -895,7 +895,15 @@ class DockerBackend:
                 raise ValueError("unsafe workshop AI host paths")
         if not self.ai_settings_dir.is_dir():
             raise ValueError("workshop AI site settings directory is missing")
-        if os.path.samefile(self.apps["workshop"].data, self.apps["game"].data):
+        workshop_data, game_data = (
+            self.apps[app].data.resolve() for app in ("workshop", "game")
+        )
+        # Nested data would put the ledger inside Game's writable /data (or the reverse).
+        if (
+            os.path.samefile(workshop_data, game_data)
+            or workshop_data.is_relative_to(game_data)
+            or game_data.is_relative_to(workshop_data)
+        ):
             raise ValueError("workshop AI usage must have its own data directory")
         mounts = spec.get("Mounts", [])
         required = (

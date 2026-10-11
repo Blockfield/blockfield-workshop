@@ -1,5 +1,6 @@
 """DockerBackend against fake `docker`/`pgrep` executables on PATH and a fake /proc."""
 
+import dataclasses
 import json
 import os
 import shlex
@@ -1232,6 +1233,24 @@ class DockerBackendTests(unittest.TestCase):
         config.write_text(json.dumps({"enabled": False}))
         self._write_site_settings(self._valid_site_settings())
         self.backend._check_workshop_ai(spec)
+
+    def test_ai_settings_reject_deep_nesting_and_nested_data(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        path = self.backend.ai_settings_dir / "workshop-ai-settings.json"
+        path.write_text("[" * 4000)
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+        path.unlink()
+        nested = self.data["game"] / "workshop"
+        (nested / "blockfield-workshop").mkdir(parents=True)
+        key = nested / "blockfield-workshop/openrouter.key"
+        key.write_bytes(b"sk-or-v1-" + b"x" * 32)
+        key.chmod(0o600)
+        workshop = dataclasses.replace(self.backend.apps["workshop"], data=nested)
+        with mock.patch.dict(self.backend.apps, {"workshop": workshop}):
+            with self.assertRaisesRegex(ValueError, "own data directory"):
+                self.backend._check_workshop_ai(spec)
 
     def test_ai_site_settings_closed_schema(self):
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
