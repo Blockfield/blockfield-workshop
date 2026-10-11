@@ -6,6 +6,7 @@ import shlex
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -109,6 +110,11 @@ class DockerBackendTests(unittest.TestCase):
         self.assertEqual(observed[1].goal.release, "unknown")
 
     def setUp(self):
+        # Production requires a 1000:1000 key file; tests create it as the running user.
+        for name, value in (("AI_KEY_UID", os.getuid()), ("AI_KEY_GID", os.getgid())):
+            patcher = unittest.mock.patch(f"docker_backend.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
@@ -1240,6 +1246,12 @@ class DockerBackendTests(unittest.TestCase):
                 generationModel="has space/x"
             ),
             "generation empty": self._valid_site_settings(generationModel=""),
+            "generation colon vendor": self._valid_site_settings(
+                generationModel="a:b/c"
+            ),
+            "transcription unsupported": self._valid_site_settings(
+                transcriptionModel="provider/stt"
+            ),
             "generation too long": self._valid_site_settings(
                 generationModel="a" * 64 + "/" + "b" * 64
             ),

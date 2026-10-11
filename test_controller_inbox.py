@@ -15,6 +15,10 @@ from pathlib import Path
 from uuid import uuid4
 from controller import Controller, DEFAULT_MESSAGE, Goal, Process, INBOX_MERGE_MAX_BYTES
 from test_controller import FakeBackend
+from controller import (
+    AI_KEY_UID as PRODUCTION_KEY_UID,
+    AI_KEY_GID as PRODUCTION_KEY_GID,
+)
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
 ADMIN = {"draslId": DRASL, "name": "Nether", "role": "admin"}
@@ -476,13 +480,14 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(self.controller.message, text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AiKeyInboxTests(unittest.TestCase):
     def setUp(self):
         InboxTests.setUp(self)
+        # Production writes 1000:1000; tests own the file as whatever user runs them.
+        for name, value in (("AI_KEY_UID", os.getuid()), ("AI_KEY_GID", os.getgid())):
+            patcher = unittest.mock.patch(f"controller.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.workshop_data = self.dir / "workshop-data"
         self.workshop_data.mkdir()
         self.controller.workshop_data_dir = self.workshop_data
@@ -672,8 +677,9 @@ class AiKeyInboxTests(unittest.TestCase):
             self.process()
             self.assertTrue(self.result(request_id)["ok"])
         directory = self.workshop_data / "blockfield-workshop"
-        chown.assert_called_once_with(directory, 1000, 1000)
-        self.assertEqual(fchown.call_args[0][1:], (1000, 1000))
+        chown.assert_called_once_with(directory, os.getuid(), os.getgid())
+        self.assertEqual(fchown.call_args[0][1:], (os.getuid(), os.getgid()))
+        self.assertEqual((PRODUCTION_KEY_UID, PRODUCTION_KEY_GID), (1000, 1000))
         self.assertEqual(self.key_file().read_text(), self.key)
 
     def test_idempotent_replay_keeps_first_result(self):

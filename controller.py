@@ -1808,7 +1808,10 @@ class Controller:
                 try:
                     os.fchown(fd, AI_KEY_UID, AI_KEY_GID)
                     os.fchmod(fd, 0o600)
-                    os.write(fd, data)
+                    # A short write would leave a truncated key behind a "set" status.
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view) :]
                     os.fsync(fd)
                 finally:
                     os.close(fd)

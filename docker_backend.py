@@ -46,7 +46,9 @@ COMPOSE_LABELS = (
 AI_SITE_SETTINGS_FILE = "workshop-ai-settings.json"
 AI_SITE_SETTINGS_MAX_BYTES = 4096
 AI_SITE_SETTINGS_REVISION_MAX = 2**53 - 1
-AI_MODEL = re.compile(r"[a-zA-Z0-9._/:-]{1,128}")
+# Same shape as the mod: vendor/name with an optional :variant such as :free.
+AI_MODEL = re.compile(r"[a-zA-Z0-9._-]{1,64}/[a-zA-Z0-9._/:-]{1,126}")
+AI_TRANSCRIPTION_MODELS = frozenset({"elevenlabs/scribe-v2", "openai/whisper-1"})
 AI_GUARD_MODEL = re.compile(r"typesafe/jev-[a-zA-Z0-9._-]{1,64}")
 # Inbox-managed key: <workshop data>/blockfield-workshop/openrouter.key, 0600 1000:1000.
 AI_KEY_PATH = Path("blockfield-workshop/openrouter.key")
@@ -790,11 +792,10 @@ class DockerBackend:
             or not 0 <= document["revision"] <= AI_SITE_SETTINGS_REVISION_MAX
             or type(document.get("enabled")) is not bool
             or type(generation) is not str
+            or len(generation) > 128
             or AI_MODEL.fullmatch(generation) is None
-            or "/" not in generation
             or type(transcription) is not str
-            or AI_MODEL.fullmatch(transcription) is None
-            or "/" not in transcription
+            or transcription not in AI_TRANSCRIPTION_MODELS
             or type(guard) is not str
             or AI_GUARD_MODEL.fullmatch(guard) is None
         ):
