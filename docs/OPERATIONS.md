@@ -31,6 +31,8 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
   unresolved operations defer that refresh. A client release must wait for compatible readiness of both backends.
   Dokploy may retain a mutable tag in its service specification; the adapter resolves the sole running Game
   container's image ID to exactly one server repository digest and refuses missing or ambiguous observations.
+  A Workshop start or refresh that lands while Game is restarting, stopped, or mid-rollout (zero or two Game
+  containers) therefore fails preflight into ERROR and needs explicit recovery once exactly one Game runs again.
 
 ### Contracts
 
@@ -92,7 +94,7 @@ and a single-file bind mount would keep showing the old inode.
 - A snapshot closes only Workshop, flushes/stops it, copies immutable map history, then restores the same editor.
   An interrupted save/stop/start remains closed and recoverable; a copy failure restarts the saved editor and reports
   the failed request. Game entry and campaigns continue. Cold SSD bundles are reclaimed only with **both** apps
-  confirmed absent, because a running Game may still have captured an older immutable bundle.
+  confirmed absent and no live dev Game Java, because a running Game may still have captured an older immutable bundle.
 
 The Docker adapter's command allowlist permits only the configured Workshop service's scale/image update and trusted
 Workshop save/export RCON commands, plus read-only service/container/process observations of Game and Workshop.
@@ -109,7 +111,8 @@ BF_DEV_COMPOSE_SERVICE=game                    # com.docker.compose.service
 The adapter then runs one read-only `docker ps --no-trunc` filtered by both labels. A Java counts as dev only when
 its cgroup container is that single returned container ID and it is the only such Java. Several or malformed dev
 containers, a second dev Java, other Compose projects/services and host Java still fail closed. The dev Game is
-never exported, gated, saved, scaled or stopped. Remove both variables when the dev stand is gone.
+never exported, gated, saved, scaled or stopped. While its Java runs, bundle reclamation and offline map
+import/application wait instead of rewriting the store it may still read. Remove both variables when the dev stand is gone.
 
 ## Cold Workshop sleep and wake
 

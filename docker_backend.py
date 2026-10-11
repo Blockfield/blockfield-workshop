@@ -1017,6 +1017,49 @@ class DockerBackend:
                     raise ValueError(
                         "cannot verify workshop AI writable bind source"
                     ) from None
+            elif (
+                mount.get("Type") == "volume"
+                and mount.get("ReadOnly", False) is not True
+            ):
+                # A local volume with type=none,o=bind,device=<host path> is a writable host bind.
+                volume = mount.get("VolumeOptions")
+                driver = (
+                    volume.get("DriverConfig") if isinstance(volume, dict) else None
+                )
+                options = driver.get("Options") if isinstance(driver, dict) else None
+                flags = (
+                    str(options.get("o", "")).split(",")
+                    if isinstance(options, dict)
+                    else []
+                )
+                if (
+                    isinstance(options, dict)
+                    and options.get("type") == "none"
+                    and "bind" in flags
+                    and "ro" not in flags
+                    and isinstance(options.get("device"), str)
+                ):
+                    device = Path(options["device"])
+                    if (
+                        not device.is_absolute()
+                        or str(device) != options["device"]
+                        or ".." in device.parts
+                        or str(device).startswith("//")
+                    ):
+                        raise ValueError("invalid workshop AI writable bind source")
+                    try:
+                        metadata = device.stat()
+                        if (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                        ) in policy_sources and not (
+                            os.statvfs(device).f_flag & os.ST_RDONLY
+                        ):
+                            raise ValueError("writable workshop bind exposes AI policy")
+                    except OSError:
+                        raise ValueError(
+                            "cannot verify workshop AI writable bind source"
+                        ) from None
             if mount["Target"] not in {"/data", "/blockfield-admin"}:
                 targets.append(mount["Target"])
         # Swarm configs/secrets can shadow files without appearing in Mounts.

@@ -731,6 +731,13 @@ class Controller:
             raise RuntimeError("multiple full backends of the same app observed")
         return processes, game[0] if game else None, workshop[0] if workshop else None
 
+    def _dev_java_present(self) -> bool:
+        """A tolerated dev Game is invisible to observe() but may still read the map store."""
+        inventory = getattr(self.backend, "inventory", None)
+        if inventory is None:
+            return False
+        return bool(inventory(tasks=False).get("dev"))
+
     def _export(self, state: dict, *, deadline: int | None = None) -> None:
         """Proxy gate (private ACL) and public site status. Rewritten only when content changes.
 
@@ -1223,7 +1230,11 @@ class Controller:
                     remaining, _, managed = self._observe()
                     if managed is not None:
                         raise RuntimeError("old backend not confirmed stopped")
-                    if self.maps is not None and not remaining:
+                    if (
+                        self.maps is not None
+                        and not remaining
+                        and not self._dev_java_present()
+                    ):
                         self.maps.versions.reclaim_unheaded_bundles()
                 commit("STARTING", "closed")
                 self.backend.start(goal)
@@ -1772,7 +1783,7 @@ class Controller:
                 remaining, _, managed = self._observe()
                 if managed is not None:
                     raise RuntimeError("workshop not confirmed stopped")
-                if not remaining:
+                if not remaining and not self._dev_java_present():
                     self.maps.versions.reclaim_unheaded_bundles()
             except Exception as error:
                 fail(error)

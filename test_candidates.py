@@ -1,6 +1,7 @@
 """Map candidates: workshop snapshot -> review -> publish/reject -> rollback."""
 
 import json
+import os
 import tempfile
 import time
 import zipfile
@@ -341,6 +342,17 @@ class BaseAndPlaytestTests(unittest.TestCase):
         self.assertFalse((target / "manifest.json").exists())
         with self.assertRaises(ValueError):
             self.store.sha256_of("0" * 32)
+
+    def test_extract_for_the_playtest_is_not_group_writable(self):
+        meta = self.store.create("konstaxa", ACTOR)
+        target = self.data / "test-candidate-locked"
+        self.store.extract(self.store.sha256_of(meta["id"]), target)
+        for directory, _, files in os.walk(target):
+            self.assertEqual(Path(directory).stat().st_mode & 0o777, 0o755, directory)
+            for name in files:
+                self.assertEqual(
+                    (Path(directory) / name).stat().st_mode & 0o777, 0o644, name
+                )
 
     def test_published_json_merged_into_git_is_retired(self):
         self.published.mkdir()
