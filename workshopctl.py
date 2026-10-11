@@ -301,6 +301,9 @@ def main(argv=None, backend_factory=None) -> int:
             inbox_dir=Path(args.inbox_dir),
             start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
             maps=_map_store(env, backend),
+            workshop_data_dir=Path(
+                env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")
+            ),
         )
         if hasattr(backend, "maps"):
             backend.maps = controller.maps

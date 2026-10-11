@@ -2,9 +2,11 @@
 
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
+import stat
 import tempfile
 import time
 import unittest
@@ -13,6 +15,10 @@ from pathlib import Path
 from uuid import uuid4
 from controller import Controller, DEFAULT_MESSAGE, Goal, Process, INBOX_MERGE_MAX_BYTES
 from test_controller import FakeBackend
+from controller import (
+    AI_KEY_UID as PRODUCTION_KEY_UID,
+    AI_KEY_GID as PRODUCTION_KEY_GID,
+)
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
 ADMIN = {"draslId": DRASL, "name": "Nether", "role": "admin"}
@@ -472,6 +478,249 @@ class InboxTests(unittest.TestCase):
         self.assertTrue(self.result(request_id)["ok"])
         self.assertFalse(self.result(section)["ok"])
         self.assertEqual(self.controller.message, text)
+
+
+class AiKeyInboxTests(unittest.TestCase):
+    def setUp(self):
+        InboxTests.setUp(self)
+        # Production writes 1000:1000; tests own the file as whatever user runs them.
+        for name, value in (("AI_KEY_UID", os.getuid()), ("AI_KEY_GID", os.getgid())):
+            patcher = unittest.mock.patch(f"controller.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.workshop_data = self.dir / "workshop-data"
+        self.workshop_data.mkdir()
+        self.controller.workshop_data_dir = self.workshop_data
+        self.key = "sk-or-v1-" + "Ab12" * 10
+        self.other_key = "sk-or-v1-" + "Zz99" * 10
+
+    def process(self, **kwargs):
+        with contextlib.redirect_stderr(self.log):
+            return self.controller.process_inbox(**kwargs)
+
+    result = InboxTests.result
+    read = InboxTests.read
+
+    def put(self, request_id=None, **fields):
+        request_id = request_id or str(uuid4())
+        document = {
+            "schema": 1,
+            "id": request_id,
+            "kind": "ai-key",
+            "actor": {"draslId": DRASL, "name": "Nether"},
+            "createdAt": int(time.time() * 1000),
+            **fields,
+        }
+        path = self.inbox / f"{request_id}.json"
+        path.write_text(json.dumps(document))
+        return request_id
+
+    def key_file(self):
+        return self.workshop_data / "blockfield-workshop/openrouter.key"
+
+    def test_set_replace_delete_and_status(self):
+        request_id = self.put(key=self.key)
+        self.assertEqual(self.process(), 1)
+        result = self.result(request_id)
+        self.assertEqual(
+            (result["ok"], result["error"], result["kind"], result["set"]),
+            (True, None, "ai-key", True),
+        )
+        self.assertEqual(
+            (result["last4"], result["sha256Prefix"]),
+            (self.key[-4:], hashlib.sha256(self.key.encode()).hexdigest()[:8]),
+        )
+        self.assertEqual(
+            result["payload"],
+            {
+                "kind": "ai-key",
+                "set": True,
+                "last4": self.key[-4:],
+                "sha256Prefix": hashlib.sha256(self.key.encode()).hexdigest()[:8],
+                "appliedAt": result["appliedAt"],
+            },
+        )
+        self.assertIs(type(result["appliedAt"]), int)
+        key_path = self.key_file()
+        self.assertEqual(key_path.read_text(), self.key)
+        info = key_path.stat()
+        self.assertEqual(
+            (
+                stat.S_IMODE(info.st_mode),
+                info.st_uid,
+                info.st_gid,
+                info.st_nlink,
+            ),
+            (0o600, os.getuid(), os.getgid(), 1),
+        )
+        status = json.loads((self.admin / "ai-key.json").read_text())
+        self.assertEqual(
+            status,
+            {
+                "schema": 1,
+                "set": True,
+                "last4": self.key[-4:],
+                "sha256Prefix": hashlib.sha256(self.key.encode()).hexdigest()[:8],
+                "appliedAt": result["appliedAt"],
+            },
+        )
+        self.assertEqual(os.listdir(self.inbox), [])
+        self.assertIn(
+            f"inbox {request_id} kind='ai-key' actor=Nether ok", self.log.getvalue()
+        )
+
+        replace = self.put(key=self.other_key)
+        self.process()
+        self.assertEqual(self.key_file().read_text(), self.other_key)
+        self.assertTrue(self.result(replace)["set"])
+
+        remove = self.put(key=None)
+        self.process()
+        result = self.result(remove)
+        self.assertEqual(
+            (result["ok"], result["set"], result["last4"], result["sha256Prefix"]),
+            (True, False, "", ""),
+        )
+        self.assertFalse(key_path.exists())
+        status = json.loads((self.admin / "ai-key.json").read_text())
+        self.assertEqual(status["set"], False)
+        # Removing an absent key is still a successful no-op.
+        self.process()
+        again = self.put(key=None)
+        self.process()
+        self.assertTrue(self.result(again)["ok"])
+        self.assertFalse(key_path.exists())
+
+    def test_invalid_keys_are_refused_generically(self):
+        for label, fields in (
+            ("too short", {"key": "x" * 19}),
+            ("too long", {"key": "x" * 2049}),
+            ("space", {"key": "sk-or-v1-abc def-ghi-jkl-mno"}),
+            ("newline", {"key": "sk-or-v1-abc\n" + "x" * 20}),
+            ("non-ascii", {"key": "sk-or-v1-ключ-" + "x" * 20}),
+            ("empty", {"key": ""}),
+            ("non-string", {"key": 123}),
+            ("missing", {}),
+        ):
+            with self.subTest(label):
+                request_id = self.put(**fields)
+                self.process()
+                result = self.result(request_id)
+                self.assertEqual(
+                    (result["ok"], result["error"]), (False, "invalid ai-key request")
+                )
+                self.assertNotIn("kind", result)
+        self.assertFalse(self.key_file().exists())
+        self.assertFalse((self.admin / "ai-key.json").exists())
+
+    def test_symlinks_on_the_key_path_are_refused(self):
+        target = self.dir / "outside.txt"
+        target.write_text("untouched")
+        directory = self.workshop_data / "blockfield-workshop"
+        directory.mkdir()
+        cases = []
+        link = directory / "openrouter.key"
+        link.symlink_to(target)
+        cases.append(self.put(key=self.key))
+        self.process()
+        self.assertEqual(self.result(cases[-1])["error"], "unsafe ai-key path")
+        link.unlink()
+        linked = self.dir / "linked-dir"
+        linked.mkdir()
+        directory.rmdir()
+        directory.symlink_to(linked, target_is_directory=True)
+        cases.append(self.put(key=self.key))
+        self.process()
+        self.assertEqual(self.result(cases[-1])["error"], "unsafe ai-key path")
+        self.assertEqual(target.read_text(), "untouched")
+        self.assertEqual(list(linked.iterdir()), [])
+        self.assertFalse(self.key_file().exists())
+        self.assertFalse((self.admin / "ai-key.json").exists())
+
+    def test_existing_directory_must_be_a_plain_owned_directory(self):
+        directory = self.workshop_data / "blockfield-workshop"
+        directory.mkdir()
+        real_stat = os.stat
+
+        class FakeStat:
+            def __init__(self, values):
+                self.st_mode, self.st_uid, self.st_gid, self.st_ino = values
+
+        def patched(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if Path(path) == directory:
+                return FakeStat((info.st_mode, 4242, 4242, info.st_ino))
+            return info
+
+        with unittest.mock.patch("os.stat", side_effect=patched):
+            request_id = self.put(key=self.key)
+            self.process()
+            self.assertEqual(
+                self.result(request_id)["error"], "unsafe ai-key directory"
+            )
+        (directory / "marker.txt").write_text("x")
+        for child in directory.iterdir():
+            child.unlink()
+        directory.rmdir()
+        directory.write_text("not a directory")
+        request_id = self.put(key=self.key)
+        self.process()
+        self.assertEqual(self.result(request_id)["error"], "unsafe ai-key directory")
+        self.assertFalse((self.admin / "ai-key.json").exists())
+
+    def test_key_file_gets_exact_owner_and_mode(self):
+        with (
+            unittest.mock.patch("os.chown") as chown,
+            unittest.mock.patch("os.fchown") as fchown,
+        ):
+            request_id = self.put(key=self.key)
+            self.process()
+            self.assertTrue(self.result(request_id)["ok"])
+        directory = self.workshop_data / "blockfield-workshop"
+        chown.assert_called_once_with(directory, os.getuid(), os.getgid())
+        self.assertEqual(fchown.call_args[0][1:], (os.getuid(), os.getgid()))
+        self.assertEqual((PRODUCTION_KEY_UID, PRODUCTION_KEY_GID), (1000, 1000))
+        self.assertEqual(self.key_file().read_text(), self.key)
+
+    def test_idempotent_replay_keeps_first_result(self):
+        request_id = self.put(key=self.key)
+        self.process()
+        done = self.result(request_id)
+        (self.inbox / f"{request_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "id": request_id,
+                    "kind": "ai-key",
+                    "actor": {"draslId": DRASL, "name": "Nether"},
+                    "createdAt": int(time.time() * 1000),
+                    "key": self.other_key,
+                }
+            )
+        )
+        self.assertEqual(self.process(), 0)
+        self.assertEqual(self.result(request_id), done)
+        self.assertEqual(self.key_file().read_text(), self.key)
+        self.assertEqual(os.listdir(self.inbox), [])
+
+    def test_key_never_appears_outside_its_file(self):
+        second = "sk-or-v1-" + "Qq77" * 10
+        self.put(key=self.key)
+        self.put(key=second)
+        self.put(key="way-too-short")
+        self.process()
+        self.process()
+        log = self.log.getvalue()
+        self.assertNotIn(self.key, log)
+        self.assertNotIn(second, log)
+        for path in self.dir.rglob("*"):
+            if path.is_file() and path != self.key_file():
+                with self.subTest(path=path):
+                    data = path.read_bytes()
+                    self.assertNotIn(self.key.encode(), data)
+                    self.assertNotIn(second.encode(), data)
+        state = json.loads((self.dir / "state" / "state.json").read_text())
+        self.assertNotIn(self.key, json.dumps(state))
 
 
 if __name__ == "__main__":

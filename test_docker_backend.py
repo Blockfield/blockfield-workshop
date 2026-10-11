@@ -1,11 +1,13 @@
 """DockerBackend against fake `docker`/`pgrep` executables on PATH and a fake /proc."""
 
+import dataclasses
 import json
 import os
 import shlex
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -109,6 +111,11 @@ class DockerBackendTests(unittest.TestCase):
         self.assertEqual(observed[1].goal.release, "unknown")
 
     def setUp(self):
+        # Production requires a 1000:1000 key file; tests create it as the running user.
+        for name, value in (("AI_KEY_UID", os.getuid()), ("AI_KEY_GID", os.getgid())):
+            patcher = unittest.mock.patch(f"docker_backend.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
@@ -849,6 +856,16 @@ class DockerBackendTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.backend.preflight(Goal("workshop", "v1", str(uuid4())))
 
+    def test_playtest_preflight_runs_the_workshop_ai_checks(self):
+        self.running("game")
+        self.ready("game", generation=None, session=None, release="v1")
+        self.backend.maps = mock.Mock()
+        with mock.patch.object(
+            self.backend, "_check_workshop_ai", side_effect=ValueError("ai checked")
+        ):
+            with self.assertRaisesRegex(ValueError, "ai checked"):
+                self.backend.preflight(Goal("test", "v1", str(uuid4()), "a" * 64))
+
     def test_workshop_restart_keeps_game_running_and_its_generation(self):
         self.running("game")
         self.ready("game", generation=None, session=None, release="v1")
@@ -1135,8 +1152,12 @@ class DockerBackendTests(unittest.TestCase):
     def test_ai_requires_bounded_regular_config_key_and_non_symlink_usage(self):
         config, spec = self._setup_ai_fixture()
         config.unlink()
-        with self.assertRaisesRegex(ValueError, "persistent configuration"):
+        # A legacy env key alone still runs the strict checks; valid mounts pass.
+        self.backend._check_workshop_ai(spec)
+        spec["Mounts"][1]["ReadOnly"] = False
+        with self.assertRaisesRegex(ValueError, "AI.*mount"):
             self.backend._check_workshop_ai(spec)
+        spec["Mounts"][1]["ReadOnly"] = True
         for contents in (
             b'{"enabled":true}' + b" " * 32768,
             b'{"enabled":"true"}',
@@ -1156,6 +1177,230 @@ class DockerBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "host paths"):
             self.backend._check_workshop_ai(spec)
         self.assertEqual(list(foreign.iterdir()), [])
+
+    def _valid_site_settings(self, **overrides):
+        document = {
+            "schema": 1,
+            "revision": 3,
+            "enabled": True,
+            "generationModel": "meta/muse-spark-1.3-contributor",
+            "guardModel": "typesafe/jev-1.13",
+            "transcriptionModel": "elevenlabs/scribe-v2",
+        }
+        document.update(overrides)
+        return document
+
+    def _write_site_settings(self, document):
+        path = self.backend.ai_settings_dir / "workshop-ai-settings.json"
+        path.write_text(json.dumps(document))
+        return path
+
+    def _write_key_file(self, data=b"sk-or-v1-" + b"x" * 32, mode=0o600):
+        directory = self.data["workshop"] / "blockfield-workshop"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "openrouter.key"
+        path.write_bytes(data)
+        os.chmod(path, mode)
+        return path
+
+    def test_ai_site_settings_enabled_without_key_is_refused(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_site_settings(self._valid_site_settings())
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(spec)
+        self._write_key_file()
+        self.backend._check_workshop_ai(spec)
+
+    def test_ai_key_file_without_enabled_still_runs_strict_checks(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        self.backend._check_workshop_ai(spec)
+        spec["Mounts"][0]["ReadOnly"] = True
+        with self.assertRaisesRegex(ValueError, "mount"):
+            self.backend._check_workshop_ai(spec)
+
+    def test_ai_nothing_configured_keeps_ordinary_path(self):
+        self.backend._check_workshop_ai({})
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_site_settings(self._valid_site_settings(enabled=False))
+        spec["Mounts"] = []
+        self.backend._check_workshop_ai(spec)
+
+    def test_ai_env_key_no_longer_required_beside_a_key_file(self):
+        config, spec = self._setup_ai_fixture(enabled=True, key=False)
+        self._write_key_file()
+        self.backend._check_workshop_ai(spec)
+        config.write_text(json.dumps({"enabled": False}))
+        self._write_site_settings(self._valid_site_settings())
+        self.backend._check_workshop_ai(spec)
+
+    def test_ai_settings_reject_deep_nesting_and_nested_data(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        path = self.backend.ai_settings_dir / "workshop-ai-settings.json"
+        path.write_text("[" * 4000)
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+        path.unlink()
+        nested = self.data["game"] / "workshop"
+        (nested / "blockfield-workshop").mkdir(parents=True)
+        key = nested / "blockfield-workshop/openrouter.key"
+        key.write_bytes(b"sk-or-v1-" + b"x" * 32)
+        key.chmod(0o600)
+        workshop = dataclasses.replace(self.backend.apps["workshop"], data=nested)
+        with mock.patch.dict(self.backend.apps, {"workshop": workshop}):
+            with self.assertRaisesRegex(ValueError, "own data directory"):
+                self.backend._check_workshop_ai(spec)
+
+    def test_ai_site_settings_closed_schema(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        valid = self._valid_site_settings()
+        bad_documents = {
+            "extra key": valid | {"debug": True},
+            "missing key": {
+                key: value
+                for key, value in valid.items()
+                if key != "transcriptionModel"
+            },
+            "schema 2": self._valid_site_settings(schema=2),
+            "revision -1": self._valid_site_settings(revision=-1),
+            "revision 2**53": self._valid_site_settings(revision=2**53),
+            "revision bool": self._valid_site_settings(revision=True),
+            "enabled string": self._valid_site_settings(enabled="true"),
+            "generation without slash": self._valid_site_settings(
+                generationModel="gpt-4"
+            ),
+            "generation bad chars": self._valid_site_settings(
+                generationModel="has space/x"
+            ),
+            "generation empty": self._valid_site_settings(generationModel=""),
+            "generation colon vendor": self._valid_site_settings(
+                generationModel="a:b/c"
+            ),
+            "transcription unsupported": self._valid_site_settings(
+                transcriptionModel="provider/stt"
+            ),
+            "generation too long": self._valid_site_settings(
+                generationModel="a" * 64 + "/" + "b" * 64
+            ),
+            "guard wrong family": self._valid_site_settings(
+                guardModel="meta/muse-spark-1.3-contributor"
+            ),
+            "guard too long": self._valid_site_settings(
+                guardModel="typesafe/jev-" + "x" * 65
+            ),
+            "non-dict": [1, 2],
+            "invalid json": b"{",
+        }
+        for name, document in bad_documents.items():
+            with self.subTest(name=name):
+                path = self.backend.ai_settings_dir / "workshop-ai-settings.json"
+                if isinstance(document, bytes):
+                    path.write_bytes(document)
+                else:
+                    path.write_text(json.dumps(document))
+                with self.assertRaisesRegex(
+                    ValueError, "invalid workshop AI site settings"
+                ):
+                    self.backend._check_workshop_ai(spec)
+        path = self.backend.ai_settings_dir / "workshop-ai-settings.json"
+        path.write_bytes(json.dumps(valid).encode() + b" " * 5000)
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+        path.write_text(json.dumps(self._valid_site_settings(revision=2**53 - 1)))
+        self.backend._check_workshop_ai(spec)
+
+    def test_ai_site_settings_rejects_links_and_directories(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        path = self.backend.ai_settings_dir / "workshop-ai-settings.json"
+        path.mkdir()
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+        path.rmdir()
+        target = Path(self.temp.name) / "settings-target.json"
+        target.write_text(json.dumps(self._valid_site_settings()))
+        path.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+        target.unlink()
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+        path.unlink()
+        path.write_text(json.dumps(self._valid_site_settings()))
+        alias = Path(self.temp.name) / "settings-hardlink.json"
+        alias.hardlink_to(path)
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+        alias.unlink()
+        self.backend._check_workshop_ai(spec)
+
+    def test_ai_key_file_metadata_without_reading_content(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        path = self._write_key_file()
+        real_open = os.open
+
+        def guarded_open(p, *args, **kwargs):
+            if Path(p) == path:
+                raise AssertionError("key content must never be read")
+            return real_open(p, *args, **kwargs)
+
+        with (
+            mock.patch("docker_backend.os.open", side_effect=guarded_open),
+            mock.patch("builtins.open", side_effect=AssertionError("no open")),
+        ):
+            self.backend._check_workshop_ai(spec)
+        for name, mutate in (
+            ("readable mode", lambda: os.chmod(path, 0o644)),
+            ("oversize", lambda: path.write_bytes(b"x" * 2049)),
+            (
+                "symlink",
+                lambda: (path.unlink(), path.symlink_to("elsewhere")),
+            ),
+        ):
+            with self.subTest(name=name):
+                path.unlink(missing_ok=True)
+                self._write_key_file()
+                mutate()
+                with self.assertRaisesRegex(ValueError, "unsafe workshop AI key file"):
+                    self.backend._check_workshop_ai(spec)
+        path.unlink(missing_ok=True)
+        path.symlink_to(Path(self.temp.name) / "dangling-target")
+        with self.assertRaisesRegex(ValueError, "unsafe workshop AI key file"):
+            self.backend._check_workshop_ai(spec)
+        path.unlink()
+        path = self._write_key_file()
+        alias = Path(self.temp.name) / "key-hardlink"
+        alias.hardlink_to(path)
+        with self.assertRaisesRegex(ValueError, "unsafe workshop AI key file"):
+            self.backend._check_workshop_ai(spec)
+        alias.unlink()
+        real_lstat = os.lstat
+
+        def bad_owner(p, *args, **kwargs):
+            info = real_lstat(p, *args, **kwargs)
+            if Path(p) == path:
+                return os.stat_result(
+                    (
+                        info.st_mode,
+                        info.st_ino,
+                        info.st_dev,
+                        info.st_nlink,
+                        4242,
+                        info.st_gid,
+                        info.st_size,
+                        info.st_atime,
+                        info.st_mtime,
+                        info.st_ctime,
+                    )
+                )
+            return info
+
+        with mock.patch("docker_backend.os.lstat", side_effect=bad_owner):
+            with self.assertRaisesRegex(ValueError, "unsafe workshop AI key file"):
+                self.backend._check_workshop_ai(spec)
+        self.backend._check_workshop_ai(spec)
 
     def test_ai_uses_existing_readonly_view_verification(self):
         _, spec = self._setup_ai_fixture()

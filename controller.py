@@ -116,6 +116,11 @@ INBOX_MERGE_MAX_BYTES = 8 << 20
 INBOX_BATCH = 20
 INBOX_TTL_MS = 10 * 60 * 1000
 RESULTS_KEPT = 200
+# Workshop AI key from the site inbox: <workshop data>/blockfield-workshop/openrouter.key,
+# 0600 1000:1000. The value is write-only: it never appears in logs, results or exports.
+AI_KEY_PATTERN = re.compile(r"[\x21-\x7e]{20,2048}")
+AI_KEY_UID = 1000
+AI_KEY_GID = 1000
 
 
 WORKSHOP_KEY_GID = 1000  # the site and the workshop server both run as uid/gid 1000 and mount admin/ read-only
@@ -216,6 +221,7 @@ class Controller:
         start_timeout: float = 600.0,
         now: Callable[[], float] | None = None,
         maps=None,
+        workshop_data_dir: Path | None = None,
     ):
         """A missed STARTING deadline restores a previous Workshop/test goal when available."""
         # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
@@ -237,6 +243,9 @@ class Controller:
         self.default_message = message.strip()[:500] or DEFAULT_MESSAGE
         self.admin_dir = Path(admin_dir) if admin_dir else None
         self.inbox_dir = Path(inbox_dir) if inbox_dir else None
+        self.workshop_data_dir = (
+            Path(workshop_data_dir) if workshop_data_dir is not None else None
+        )
         if self.admin_dir:
             (self.admin_dir / "results").mkdir(parents=True, exist_ok=True)
             for path in (self.admin_dir, self.admin_dir / "results"):
@@ -1242,6 +1251,14 @@ class Controller:
                     }
                     if payload is not None:
                         result["payload"] = payload
+                        if (
+                            isinstance(payload, dict)
+                            and payload.get("kind") == "ai-key"
+                        ):
+                            # The site contract reads the ai-key status flat
+                            # (kind/set/last4/sha256Prefix/appliedAt); the envelope
+                            # above stays untouched for uniform result polling.
+                            result.update(payload)
                     atomic_write(
                         results / name,
                         json.dumps(result, ensure_ascii=False, sort_keys=True).encode(),
@@ -1730,6 +1747,99 @@ class Controller:
                 raise copy_error
             return payload
 
+    def _apply_ai_key(self, request_id: str, document: dict) -> dict:
+        """Write-only workshop AI key from the site; null removes it.
+
+        Runs under the controller lock. The key value never reaches logs, results,
+        state or exceptions: only its last4/sha256 prefix leave this function.
+        """
+        if "key" not in document:
+            raise ValueError("invalid ai-key request")
+        key = document["key"]
+        if key is not None and (
+            type(key) is not str or AI_KEY_PATTERN.fullmatch(key) is None
+        ):
+            raise ValueError("invalid ai-key request")
+        with self._locked():
+            base = self.workshop_data_dir
+            if base is None:
+                apps = getattr(self.backend, "apps", None)
+                if apps is not None and "workshop" in apps:
+                    base = apps["workshop"].data
+            if base is None:
+                raise ValueError("workshop data directory is not configured")
+            directory, path = (
+                Path(base) / "blockfield-workshop",
+                Path(base) / "blockfield-workshop/openrouter.key",
+            )
+            for node in (path, *path.parents):
+                if node.is_symlink():
+                    raise ValueError("unsafe ai-key path")
+                if node == Path(base):
+                    break
+            try:
+                info = os.stat(directory)
+            except FileNotFoundError:
+                directory.mkdir(mode=0o755)
+                os.chmod(directory, 0o755)
+                os.chown(directory, AI_KEY_UID, AI_KEY_GID)
+            else:
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != AI_KEY_UID
+                    or info.st_gid != AI_KEY_GID
+                ):
+                    raise ValueError("unsafe ai-key directory")
+            if key is None:
+                path.unlink(missing_ok=True)
+                stored = {"set": False, "last4": "", "sha256Prefix": ""}
+            else:
+                data = key.encode()
+                temporary = directory / f".openrouter.key.{os.getpid()}.tmp"
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                fd = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+                try:
+                    os.fchown(fd, AI_KEY_UID, AI_KEY_GID)
+                    os.fchmod(fd, 0o600)
+                    # A short write would leave a truncated key behind a "set" status.
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view) :]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(temporary, path)
+                directory_fd = os.open(
+                    directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                stored = {
+                    "set": True,
+                    "last4": key[-4:],
+                    "sha256Prefix": hashlib.sha256(data).hexdigest()[:8],
+                }
+            applied_at = self._now_ms()
+            atomic_write(
+                self.admin_dir / "ai-key.json",
+                json.dumps(
+                    {"schema": 1, **stored, "appliedAt": applied_at},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode(),
+                0o644,
+            )
+            return {"kind": "ai-key", **stored, "appliedAt": applied_at}
+
     def _apply(self, request_id: str, document: dict) -> int | dict | None:
         kind = document.get("kind")
         if kind in {"map-create", "map-properties"}:
@@ -1886,6 +1996,8 @@ class Controller:
                         )
             self.export_maps()
             return result
+        if kind == "ai-key":
+            return self._apply_ai_key(request_id, document)
         if kind != "mode":
             raise ValueError("unknown kind")
         profile, expected, recover = (

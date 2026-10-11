@@ -42,6 +42,19 @@ COMPOSE_LABELS = (
     "label=com.docker.compose.project=",
     "label=com.docker.compose.service=",
 )
+# Site-managed workshop AI settings (contract: closed schema, regular single-link file).
+AI_SITE_SETTINGS_FILE = "workshop-ai-settings.json"
+AI_SITE_SETTINGS_MAX_BYTES = 4096
+AI_SITE_SETTINGS_REVISION_MAX = 2**53 - 1
+# Same shape as the mod: vendor/name with an optional :variant such as :free.
+AI_MODEL = re.compile(r"[a-zA-Z0-9._-]{1,64}/[a-zA-Z0-9._/:-]{1,126}")
+AI_TRANSCRIPTION_MODELS = frozenset({"elevenlabs/scribe-v2", "openai/whisper-1"})
+AI_GUARD_MODEL = re.compile(r"typesafe/jev-[a-zA-Z0-9._-]{1,64}")
+# Inbox-managed key: <workshop data>/blockfield-workshop/openrouter.key, 0600 1000:1000.
+AI_KEY_PATH = Path("blockfield-workshop/openrouter.key")
+AI_KEY_MAX_BYTES = 2048
+AI_KEY_UID = 1000
+AI_KEY_GID = 1000
 
 
 @dataclass(frozen=True)
@@ -718,45 +731,138 @@ class DockerBackend:
                     "extra workshop mount shadows immutable active storage"
                 )
 
+    def _ai_site_enabled(self) -> bool:
+        """Site settings enabled flag; missing file means host fallback. Invalid refuses."""
+        path = self.ai_settings_dir / AI_SITE_SETTINGS_FILE
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise ValueError("unsafe workshop AI site settings") from None
+        if (
+            _has_symlink(path)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size > AI_SITE_SETTINGS_MAX_BYTES
+        ):
+            raise ValueError("invalid workshop AI site settings")
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise ValueError("unsafe workshop AI site settings") from None
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size > AI_SITE_SETTINGS_MAX_BYTES
+            ):
+                raise ValueError("invalid workshop AI site settings")
+            contents = os.read(fd, AI_SITE_SETTINGS_MAX_BYTES + 1)
+            if len(contents) > AI_SITE_SETTINGS_MAX_BYTES:
+                raise ValueError("invalid workshop AI site settings")
+            document = json.loads(contents)
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+            raise ValueError("invalid workshop AI site settings") from None
+        finally:
+            os.close(fd)
+        if not isinstance(document, dict):
+            raise ValueError("invalid workshop AI site settings")
+        generation, guard, transcription = (
+            document.get("generationModel"),
+            document.get("guardModel"),
+            document.get("transcriptionModel"),
+        )
+        if (
+            set(document)
+            != {
+                "schema",
+                "revision",
+                "enabled",
+                "generationModel",
+                "guardModel",
+                "transcriptionModel",
+            }
+            or type(document.get("schema")) is not int
+            or document["schema"] != 1
+            or type(document.get("revision")) is not int
+            or not 0 <= document["revision"] <= AI_SITE_SETTINGS_REVISION_MAX
+            or type(document.get("enabled")) is not bool
+            or type(generation) is not str
+            or len(generation) > 128
+            or AI_MODEL.fullmatch(generation) is None
+            or type(transcription) is not str
+            or transcription not in AI_TRANSCRIPTION_MODELS
+            or type(guard) is not str
+            or AI_GUARD_MODEL.fullmatch(guard) is None
+        ):
+            raise ValueError("invalid workshop AI site settings")
+        return document["enabled"]
+
+    def _has_ai_key_file(self) -> bool:
+        """Inbox-managed key presence; validated by metadata only, content never read."""
+        path = self.apps["workshop"].data / AI_KEY_PATH
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise ValueError("unsafe workshop AI key file") from None
+        if (
+            _has_symlink(path)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size > AI_KEY_MAX_BYTES
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != AI_KEY_UID
+            or info.st_gid != AI_KEY_GID
+        ):
+            raise ValueError("unsafe workshop AI key file")
+        return True
+
     def _check_workshop_ai(self, spec: dict) -> None:
         environment = self.container_env(spec)
-        has_key = bool(
+        env_key = bool(
             environment.get("BLOCKFIELD_WORKSHOP_AI_OPENROUTER_KEY", "").strip()
         )
+        host_enabled = False
         config = self.apps["workshop"].data / "config/blockfield/workshop-ai.json"
         try:
             fd = os.open(config, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         except FileNotFoundError:
-            if has_key:
-                raise ValueError(
-                    "configured workshop AI needs its persistent configuration"
-                )
-            return
+            pass
         except OSError:
             raise ValueError("unsafe workshop AI configuration") from None
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 32768:
-                raise ValueError("unsafe workshop AI configuration")
-            contents = os.read(fd, 32769)
-            if len(contents) > 32768:
-                raise ValueError("unsafe workshop AI configuration")
-            document = json.loads(contents)
-            if (
-                not isinstance(document, dict)
-                or type(document.get("enabled", False)) is not bool
-            ):
-                raise ValueError("invalid workshop AI configuration")
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            raise ValueError("invalid workshop AI configuration") from None
-        finally:
-            os.close(fd)
-        if not document.get("enabled", False) and not has_key:
+        else:
+            try:
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 32768:
+                    raise ValueError("unsafe workshop AI configuration")
+                contents = os.read(fd, 32769)
+                if len(contents) > 32768:
+                    raise ValueError("unsafe workshop AI configuration")
+                document = json.loads(contents)
+                if (
+                    not isinstance(document, dict)
+                    or type(document.get("enabled", False)) is not bool
+                ):
+                    raise ValueError("invalid workshop AI configuration")
+            except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+                raise ValueError("invalid workshop AI configuration") from None
+            finally:
+                os.close(fd)
+            host_enabled = document.get("enabled", False)
+        site_enabled = self._ai_site_enabled()
+        key_file = self._has_ai_key_file()
+        if not (host_enabled or site_enabled or key_file or env_key):
             return
-        if not has_key or environment.get("BLOCKFIELD_PROFILE") != "workshop":
-            raise ValueError(
-                "enabled workshop AI needs its own server key and workshop profile"
-            )
+        if environment.get("BLOCKFIELD_PROFILE") != "workshop":
+            raise ValueError("workshop container profile is not configured")
+        if (host_enabled or site_enabled) and not (key_file or env_key):
+            raise ValueError("enabled workshop AI needs its own server key")
         if (
             environment.get(
                 "BLOCKFIELD_WORKSHOP_AI_LIMITS_FILE", "/blockfield-admin/ai-limits.json"
@@ -789,7 +895,15 @@ class DockerBackend:
                 raise ValueError("unsafe workshop AI host paths")
         if not self.ai_settings_dir.is_dir():
             raise ValueError("workshop AI site settings directory is missing")
-        if os.path.samefile(self.apps["workshop"].data, self.apps["game"].data):
+        workshop_data, game_data = (
+            self.apps[app].data.resolve() for app in ("workshop", "game")
+        )
+        # Nested data would put the ledger inside Game's writable /data (or the reverse).
+        if (
+            os.path.samefile(workshop_data, game_data)
+            or workshop_data.is_relative_to(game_data)
+            or game_data.is_relative_to(workshop_data)
+        ):
             raise ValueError("workshop AI usage must have its own data directory")
         mounts = spec.get("Mounts", [])
         required = (
@@ -933,10 +1047,14 @@ class DockerBackend:
         if shutil.disk_usage(data).free < self.min_free_bytes:
             raise OSError("not enough free space for the backend data")
         self.game_image()
-        if goal.profile == "workshop":
+        if self.app_of(goal.profile) == "workshop":
             spec = self.container_spec("workshop")
+            # The playtest runs the same Workshop service, so the same AI key/settings apply.
             self._check_workshop_ai(spec)
-            if getattr(self.maps, "canonical_sessions", False) is True:
+            if (
+                goal.profile == "workshop"
+                and getattr(self.maps, "canonical_sessions", False) is True
+            ):
                 self._check_workshop_mounts(spec)
 
     def observe(self) -> list[Process]:
