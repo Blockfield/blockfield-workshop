@@ -768,11 +768,16 @@ class Controller:
             gate = "closed"
         members_gate = gate in {"builders", "testers"}
         sleeping = state.get("phase") == "sleeping"
-        if sleeping:
+        starting = (
+            state.get("phase") in {"REQUESTED", "SAVING", "STARTING"}
+            and (state.get("desired") or {}).get("profile") == "workshop"
+        )
+        if sleeping or starting:
             # The proxy and the site render this: the editor is parked at 0 replicas
-            # with its goal intact, not closed for maintenance.
+            # with its goal intact, not closed for maintenance. STARTING keeps members
+            # in the lobby with the waking message instead of the closed one.
             workshop_gate = {
-                "gate": "sleeping",
+                "gate": "sleeping" if sleeping else "STARTING",
                 "message": self.message,
                 "allowed": self.members(),
             }

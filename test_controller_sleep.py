@@ -355,6 +355,14 @@ class SleepTests(unittest.TestCase):
         )
         self.assertEqual(self.controller.step()["phase"], "STARTING")
         self.assertEqual(self.backend.events, ["save", "stop", "start"])
+        # The proxy keeps showing members the waking message until the editor is ready.
+        workshop = json.loads((self.dir / "gate.json").read_text())["backends"][
+            "workshop"
+        ]
+        self.assertEqual(
+            (workshop["gate"], [m["name"] for m in workshop["allowed"]]),
+            ("STARTING", ["Nether"]),
+        )
         self.backend.ready(Goal("workshop", "v2", self.goal.session))
         self.backend.generation = GENERATION
         restarted = self.controller.step()
