@@ -2298,7 +2298,12 @@ def _chown_tree(root: Path, *, writable: bool = True) -> None:
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
             )
             try:
-                _repair(fd, os.fstat(fd), mode)
+                fresh = os.fstat(fd)
+                # The entry can be swapped for a hard link to an outside inode
+                # between the stat above and open; O_NOFOLLOW misses hard links.
+                if not stat.S_ISREG(fresh.st_mode) or fresh.st_nlink != 1:
+                    continue
+                _repair(fd, fresh, mode)
             finally:
                 os.close(fd)
 
