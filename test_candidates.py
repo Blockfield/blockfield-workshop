@@ -258,6 +258,41 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(exported["candidates"][0]["author"], ACTOR)
 
 
+class ChownTreeRaceTests(unittest.TestCase):
+    def test_chown_tree_skips_file_hardlinked_after_stat(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            target = root / "entry.dat"
+            target.write_bytes(b"draft")
+            os.chmod(target, 0o600)  # wrong mode so the pre-open check proceeds
+            real_fstat = os.fstat
+
+            def fake_fstat(fd):
+                info = real_fstat(fd)
+                return os.stat_result(
+                    (
+                        info.st_mode,
+                        info.st_ino,
+                        info.st_dev,
+                        2,  # swapped for a hard link to an outside inode after stat
+                        info.st_uid,
+                        info.st_gid,
+                        info.st_size,
+                        info.st_atime,
+                        info.st_mtime,
+                        info.st_ctime,
+                    )
+                )
+
+            with (
+                mock.patch.object(candidates.os, "fstat", side_effect=fake_fstat),
+                mock.patch.object(candidates, "_repair") as repair,
+            ):
+                candidates._chown_tree(root)
+            # Only the directory is repaired; the file opened after the swap is skipped.
+            self.assertEqual(repair.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 
