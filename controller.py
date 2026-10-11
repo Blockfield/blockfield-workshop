@@ -150,15 +150,19 @@ def ensure_workshop_key(path: Path) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
     try:
-        os.write(fd, (secrets.token_hex(32) + "\n").encode())
         try:
-            os.fchown(fd, -1, WORKSHOP_KEY_GID)
-        except PermissionError:
-            pass  # tests and non-root runs: the file stays with the caller's group
-        os.fchmod(fd, 0o640)
-    finally:
-        os.close(fd)
-    os.replace(temporary, path)
+            os.write(fd, (secrets.token_hex(32) + "\n").encode())
+            try:
+                os.fchown(fd, -1, WORKSHOP_KEY_GID)
+            except PermissionError:
+                pass  # tests and non-root runs: the file stays with the caller's group
+            os.fchmod(fd, 0o640)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)  # never leave a partial secret behind
+        raise
 
 
 def member(value, *, scopes=None) -> dict:

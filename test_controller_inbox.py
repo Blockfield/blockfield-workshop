@@ -18,6 +18,7 @@ from test_controller import FakeBackend
 from controller import (
     AI_KEY_UID as PRODUCTION_KEY_UID,
     AI_KEY_GID as PRODUCTION_KEY_GID,
+    ensure_workshop_key,
 )
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
@@ -741,6 +742,20 @@ class AiKeyInboxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkshopKeyTests(unittest.TestCase):
+    def test_failed_write_leaves_no_partial_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workshop.key"
+            with (
+                unittest.mock.patch(
+                    "os.write", side_effect=OSError(28, "No space left")
+                ),
+                self.assertRaises(OSError),
+            ):
+                ensure_workshop_key(path)
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 class SessionAndPlaytestTests(unittest.TestCase):
