@@ -104,7 +104,6 @@ def _require_stopped(backend):
         inventory = backend.inventory()
         if (
             inventory["unknown"]
-            or inventory.get("dev")
             or any(
                 inventory[profile]["tasks"] or inventory[profile]["java"]
                 for profile in ("game", "workshop")
