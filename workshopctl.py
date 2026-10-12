@@ -102,13 +102,9 @@ def _offline(backend):
 def _require_stopped(backend):
     if hasattr(backend, "inventory"):
         inventory = backend.inventory()
-        if (
-            inventory["unknown"]
-            or inventory.get("dev")
-            or any(
-                inventory[profile]["tasks"] or inventory[profile]["java"]
-                for profile in ("game", "workshop")
-            )
+        if inventory["unknown"] or any(
+            inventory[profile]["tasks"] or inventory[profile]["java"]
+            for profile in ("game", "workshop")
         ):
             raise ValueError(
                 "offline map import/application requires both backends at zero replicas and no Java"
