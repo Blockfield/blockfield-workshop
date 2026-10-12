@@ -483,5 +483,6 @@ class MapVersionTests(unittest.TestCase):
         self.assertTrue(draft.exists())
         self.assertEqual(len(self.store.versions.history("konstaxa")), 3)
 
+
 if __name__ == "__main__":
     unittest.main()
