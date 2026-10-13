@@ -123,9 +123,8 @@ ACTIVITY_MAX_BYTES = 16384
 ACTIVITY_FRESH_MS = 120 * 1000
 SLEEP_MESSAGE = "Мастерская спит — запустите её"
 # Inbox kinds that need a running Workshop today; refused while sleeping.
+# candidate/commit work asleep too: sleep already saved and stopped the editor.
 LIVE_ONLY_KINDS = {
-    "candidate",
-    "commit",
     "limbo-export",
     "map-create",
     "map-properties",
@@ -1713,7 +1712,8 @@ class Controller:
             if authorize:
                 actor = self._map_actor(actor, map_id)
             state = self._read()
-            if state["phase"] != "workshop":
+            sleeping = state["phase"] == "sleeping"
+            if state["phase"] != "workshop" and not sleeping:
                 raise ValueError("snapshot requires a stable workshop")
             if getattr(self.maps, "canonical_sessions", False) is True:
                 selected = self.session()
@@ -1747,12 +1747,28 @@ class Controller:
                     raise ValueError("stale branch head: refresh before committing")
                 options.update(branch=branch, expected_branch_head=expected_branch_head)
             _, _, current = self._observe()
-            if (
+            if sleeping:
+                if current is not None:
+                    raise RuntimeError("sleeping workshop has a running backend")
+            elif (
                 current is None
                 or not current.ready
                 or asdict(current.goal) != state["desired"]
             ):
                 raise RuntimeError("snapshot backend does not match controller state")
+
+            def take():
+                if commit:
+                    return self.maps.commit(
+                        map_id,
+                        actor,
+                        note,
+                        working_copy_id=working_copy_id,
+                        branch=branch,
+                        expected_head=expected_branch_head,
+                    )
+                return self.maps.create(map_id, actor, note, **options)
+
             if branch is not None and not commit:
                 meta = self.maps.review(
                     map_id,
@@ -1762,6 +1778,11 @@ class Controller:
                     branch=branch,
                     expected_head=expected_branch_head,
                 )
+                self.export_maps()
+                return meta
+            if sleeping:
+                # _maybe_sleep saved and stopped the editor, so the drafts on disk are final.
+                meta = take()
                 self.export_maps()
                 return meta
             # Durable closed state: a controller crash must not reopen a half-finished snapshot.
@@ -1798,17 +1819,7 @@ class Controller:
             # comes back either way; only the request reports the error.
             meta, copy_error = None, None
             try:
-                if commit:
-                    meta = self.maps.commit(
-                        map_id,
-                        actor,
-                        note,
-                        working_copy_id=working_copy_id,
-                        branch=branch,
-                        expected_head=expected_branch_head,
-                    )
-                else:
-                    meta = self.maps.create(map_id, actor, note, **options)
+                meta = take()
                 self.export_maps()
             except Exception as error:
                 copy_error = error

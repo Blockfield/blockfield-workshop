@@ -470,6 +470,37 @@ class GitInboxTests(unittest.TestCase):
         self.assertEqual(self.backend.events, events)
         self.assertEqual(self.controller.status()["phase"], "workshop")
 
+    def test_sleeping_workshop_commits_and_reviews_from_disk_without_starting(self):
+        self.make_ready()
+        self.backend.processes = [self.game]
+        state = self.controller._read()
+        state.update(phase="sleeping", gate="closed")
+        self.controller._write(state)
+        self.backend.events.clear()
+        self.region.write_bytes(b"edited before sleep")
+        base = dict(mapId="arena", branch=self.branch, workingCopyId=self.session["id"])
+        committed = self.send(
+            "commit",
+            **base,
+            expectedBranchHead=self.heads["arena"]["versionDigest"],
+            note="Update arena",
+        )
+        self.assertTrue(committed["ok"], committed["error"])
+        digest = committed["payload"]["versionDigest"]
+        reviewed = self.send("candidate", **base, expectedBranchHead=digest)
+        self.assertTrue(reviewed["ok"], reviewed["error"])
+        self.assertEqual(reviewed["payload"]["versionDigest"], digest)
+        self.assertEqual(self.backend.events, [])
+        self.assertEqual(self.backend.processes, [self.game])
+        self.assertEqual(self.controller.status()["phase"], "sleeping")
+        # A Workshop that came up behind the controller's back may still be writing the drafts.
+        self.backend.processes.append(
+            Process(Goal(**self.controller.status()["desired"]), True)
+        )
+        refused = self.send("commit", **base, expectedBranchHead=digest, note="Again")
+        self.assertFalse(refused["ok"])
+        self.assertEqual(self.backend.events, [])
+
     def test_review_noop_and_metadata_failure_leave_branch_and_backend_unchanged(self):
         base = dict(mapId="arena", branch=self.branch, workingCopyId=self.session["id"])
         noop = self.send(
