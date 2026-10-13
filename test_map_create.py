@@ -261,7 +261,7 @@ class ZeroMapTests(unittest.TestCase):
         incomplete = self.commit(
             created,
             map_package.seed_config(
-                "new_map", "New map", list(map_package.SUPPORTED_MODES)
+                "new_map", "Unfinished map", list(map_package.SUPPORTED_MODES)
             ),
         )
         self.assertIsNone(self.store.versions.head("new_map"))

@@ -1700,9 +1700,10 @@ class Controller:
         branch=None,
         expected_branch_head=None,
         commit=False,
+        review=False,
         authorize=False,
     ) -> dict:
-        # A map that is not a draft is refused before entry closes and the workshop stops (stand acceptance 2026-09-24).
+        # Refuse a missing draft before issuing any save commands.
         options = (
             {"working_copy_id": working_copy_id} if working_copy_id is not None else {}
         )
@@ -1780,63 +1781,20 @@ class Controller:
                 )
                 self.export_maps()
                 return meta
-            if sleeping:
-                # _maybe_sleep saved and stopped the editor, so the drafts on disk are final.
-                meta = take()
-                self.export_maps()
-                return meta
-            # Durable closed state: a controller crash must not reopen a half-finished snapshot.
-            state.update(
-                phase="ERROR",
-                gate="closed",
-                error="SnapshotInterrupted",
-                errorMessage="snapshot did not finish; recover before reopening",
-                since=self._now_ms(),
-            )
-            self._write(state)
-
-            def fail(error: Exception) -> None:
-                state.update(
-                    phase="ERROR",
-                    gate="closed",
-                    error=type(error).__name__,
-                    errorMessage=str(error),
+            # Asleep the drafts on disk are final; awake maps.hold_saves flushes the running editor
+            # and pauses autosave for the copy. Neither path restarts Workshop.
+            meta = take()
+            if review:
+                # The tablet's one button: commit what is built now, then review that commit.
+                meta = self.maps.review(
+                    map_id,
+                    actor,
+                    note,
+                    working_copy_id=working_copy_id,
+                    branch=branch,
+                    expected_head=meta["versionDigest"],
                 )
-                self._write(state)
-
-            try:
-                self.backend.save_and_freeze(current)
-                self.backend.stop(current)
-                remaining, _, managed = self._observe()
-                if managed is not None:
-                    raise RuntimeError("workshop not confirmed stopped")
-                if not remaining:
-                    self.maps.versions.reclaim_unheaded_bundles()
-            except Exception as error:
-                fail(error)
-                raise
-            # Saved and stopped: a failed copy (e.g. ENOSPC, prod 2026-09-25) leaves the drafts intact, so the workshop
-            # comes back either way; only the request reports the error.
-            meta, copy_error = None, None
-            try:
-                meta = take()
-                self.export_maps()
-            except Exception as error:
-                copy_error = error
-            try:
-                state.update(
-                    phase="STARTING",
-                    error=None,
-                    errorMessage=None,
-                    since=self._now_ms(),
-                )
-                self._write(state)
-                self.backend.start(current.goal)
-            except Exception as error:
-                fail(error)
-                raise
-            if copy_error is not None:
-                raise copy_error
+            self.export_maps()
             return meta
 
     def _member_actor(self, actor: dict) -> dict:
@@ -2187,6 +2145,8 @@ class Controller:
             )
             result = None
             if kind in {"candidate", "commit"}:
+                if "commit" in document and type(document["commit"]) is not bool:
+                    raise ValueError("commit must be a boolean")
                 result = self._snapshot(
                     document.get("mapId"),
                     actor,
@@ -2194,7 +2154,9 @@ class Controller:
                     working_copy_id=document.get("workingCopyId"),
                     branch=document.get("branch"),
                     expected_branch_head=document.get("expectedBranchHead"),
-                    commit=kind == "commit",
+                    # candidate {commit: true} is the tablet's commit-and-review in one request.
+                    commit=kind == "commit" or document.get("commit") is True,
+                    review=kind == "candidate" and document.get("commit") is True,
                     authorize=True,
                 )
             elif kind == "limbo-export":

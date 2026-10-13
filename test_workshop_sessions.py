@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -375,7 +376,7 @@ class GitInboxTests(unittest.TestCase):
             second["versionDigest"],
         )
         self.assertIn(self.game, self.backend.processes)
-        self.assertEqual(self.backend.events, ["save", "stop", "start"] * 2)
+        self.assertEqual(self.backend.events, [])
 
     def test_stale_head_wrong_copy_and_branch_fail_before_backend_mutation(self):
         first = self.commit(b"committed")
@@ -499,6 +500,164 @@ class GitInboxTests(unittest.TestCase):
         )
         refused = self.send("commit", **base, expectedBranchHead=digest, note="Again")
         self.assertFalse(refused["ok"])
+        self.assertEqual(self.backend.events, [])
+
+    def test_tablet_submit_commits_and_reviews_without_restarting(self):
+        self.make_ready()
+        self.backend.events.clear()
+        base = dict(
+            mapId="arena",
+            branch=self.branch,
+            workingCopyId=self.session["id"],
+            expectedBranchHead=self.heads["arena"]["versionDigest"],
+            note="Submitted from the tablet",
+            commit=True,
+        )
+        unchanged = self.send("candidate", **base)
+        self.assertFalse(unchanged["ok"])
+        self.assertEqual(unchanged["error"], "no changes since the last branch commit")
+        self.region.write_bytes(b"built in game")
+        submitted = self.send("candidate", **base)
+        self.assertTrue(submitted["ok"], submitted["error"])
+        review = submitted["payload"]
+        branch = self.store.versions.branch("arena", self.branch)
+        self.assertEqual(review["versionDigest"], branch["versionDigest"])
+        self.assertEqual(review["status"], "pending")
+        self.assertEqual(review["targetHead"], self.heads["arena"]["versionDigest"])
+        self.assertEqual(self.backend.events, [])
+        self.assertEqual(self.controller.status()["phase"], "workshop")
+
+    def test_hot_commit_and_submit_matrix_and_precise_refusals(self):
+        self.make_ready()
+        workshop = self.backend.processes[-1]
+        for phase in ("workshop", "sleeping"):
+            self.backend.processes = [self.game] + (
+                [workshop] if phase == "workshop" else []
+            )
+            state = self.controller._read()
+            state.update(
+                phase=phase, gate="builders" if phase == "workshop" else "closed"
+            )
+            self.controller._write(state)
+            for kind in ("commit", "candidate"):
+                with self.subTest(phase=phase, kind=kind):
+                    head = self.store.versions.branch("arena", self.branch)[
+                        "versionDigest"
+                    ]
+                    base = dict(
+                        mapId="arena",
+                        branch=self.branch,
+                        workingCopyId=self.session["id"],
+                        expectedBranchHead=head,
+                        note="Built arena",
+                        commit=True,
+                    )
+                    for fields, error in (
+                        ({}, "no changes"),
+                        ({"note": " "}, "commit message required"),
+                        ({"commit": "true"}, "commit must be a boolean"),
+                    ):
+                        refused = self.send(kind, **(base | fields))
+                        self.assertFalse(refused["ok"])
+                        self.assertIn(error, refused["error"])
+                        self.assertEqual(
+                            self.store.versions.branch("arena", self.branch)[
+                                "versionDigest"
+                            ],
+                            head,
+                        )
+                    self.region.write_bytes(f"{phase}/{kind}".encode())
+                    with mock.patch.object(
+                        self.controller, "_write", wraps=self.controller._write
+                    ) as write:
+                        result = self.send(kind, **base)
+                        write.assert_not_called()
+                    self.assertTrue(result["ok"], result["error"])
+                    digest = result["payload"]["versionDigest"]
+                    self.assertNotEqual(digest, head)
+                    manifest = self.store.versions.read("arena", digest)
+                    self.assertEqual(manifest["author"], self.builder)
+                    self.assertEqual(manifest["source"], "commit")
+                    self.assertEqual(manifest["note"], base["note"])
+                    if kind == "candidate":
+                        self.assertEqual(result["payload"]["status"], "pending")
+                        self.assertEqual(
+                            result["payload"]["targetHead"],
+                            self.heads["arena"]["versionDigest"],
+                        )
+                    again = self.send(kind, **(base | {"expectedBranchHead": digest}))
+                    self.assertFalse(again["ok"])
+                    self.assertIn("no changes", again["error"])
+                    self.assertEqual(self.controller.status()["phase"], phase)
+        self.assertEqual(self.backend.events, [])
+
+    def test_save_guard_failures_and_concurrent_snapshot_preserve_branch(self):
+        self.make_ready()
+        head = self.heads["arena"]["versionDigest"]
+        self.region.write_bytes(b"built in game")
+        base = dict(
+            mapId="arena",
+            branch=self.branch,
+            workingCopyId=self.session["id"],
+            expectedBranchHead=head,
+            note="Submit",
+            commit=True,
+        )
+
+        @contextmanager
+        def restore_failure():
+            yield
+            raise RuntimeError("save-on did not confirm autosave restored")
+
+        with mock.patch.object(self.store, "hold_saves", restore_failure):
+            failed = self.send("candidate", **base)
+        self.assertFalse(failed["ok"])
+        self.assertIn("save-on", failed["error"])
+        self.assertEqual(
+            self.store.versions.branch("arena", self.branch)["versionDigest"], head
+        )
+        other = Controller(self.root / "state", self.backend, maps=self.store)
+
+        @contextmanager
+        def concurrent():
+            with self.assertRaises(BlockingIOError):
+                other._snapshot(
+                    "arena",
+                    self.builder,
+                    "Concurrent",
+                    working_copy_id=self.session["id"],
+                    branch=self.branch,
+                    expected_branch_head=head,
+                    commit=True,
+                )
+            yield
+
+        with mock.patch.object(self.store, "hold_saves", concurrent):
+            result = self.send("candidate", **base)
+        self.assertTrue(result["ok"], result["error"])
+        self.assertEqual(self.backend.events, [])
+
+    def test_submit_review_failure_retains_commit_for_review_retry(self):
+        self.make_ready()
+        self.region.write_bytes(b"built in game")
+        base = dict(mapId="arena", branch=self.branch, workingCopyId=self.session["id"])
+        with mock.patch.object(
+            self.store, "_write_meta", side_effect=OSError("disk full")
+        ):
+            failed = self.send(
+                "candidate",
+                **base,
+                commit=True,
+                note="Submit",
+                expectedBranchHead=self.heads["arena"]["versionDigest"],
+            )
+        self.assertFalse(failed["ok"])
+        self.assertIn("disk full", failed["error"])
+        digest = self.store.versions.branch("arena", self.branch)["versionDigest"]
+        self.assertNotEqual(digest, self.heads["arena"]["versionDigest"])
+        retry = self.send("candidate", **base, expectedBranchHead=digest)
+        self.assertTrue(retry["ok"], retry["error"])
+        self.assertEqual(retry["payload"]["versionDigest"], digest)
         self.assertEqual(self.backend.events, [])
 
     def test_review_noop_and_metadata_failure_leave_branch_and_backend_unchanged(self):

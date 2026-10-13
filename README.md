@@ -34,7 +34,7 @@ Game и мастерская работают одновременно, кажд
 Готовность и ACL прокси проверяет отдельно для Game и мастерской.
 
 Кандидаты ZIP используют Python 3.12.14 / zlib 1.3.2; неверный compressor
-останавливает snapshot до закрытия входа. `just` и systemd используют pinned Python.
+останавливает snapshot до создания артефакта. `just` и systemd используют pinned Python.
 Контроллер остаётся host-systemd service: запускать второй controller в контейнере нельзя.
 На хост он ставится из checkout этого репозитория (см. OPERATIONS).
 

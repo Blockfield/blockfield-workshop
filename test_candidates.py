@@ -79,57 +79,32 @@ class CandidateTests(unittest.TestCase):
             now=lambda: self.clock[0],
         )
 
-    def test_running_snapshot_stops_before_copy_and_waits_for_readiness(self):
+    def test_running_snapshot_keeps_workshop_open_and_holds_saves(self):
         backend = FakeBackend()
         goal = Goal("workshop", "v1", str(uuid4()))
         backend.ready(goal)
         control = Controller(self.root / "controller", backend, maps=self.store)
         control.request(str(uuid4()), goal, 0)
-        control.step()
+        self.assertEqual(control.step()["gate"], "builders")
+        workshop = backend.processes[-1]
         create = self.store.create
 
         def snapshot(*args):
-            self.assertEqual([p.goal.profile for p in backend.processes], ["game"])
-            self.assertEqual(control.status()["gate"], "closed")
-            gate = json.loads(control.gate_file.read_bytes())
-            self.assertEqual(gate["backends"]["game"]["gate"], "public")
+            self.assertIn(workshop, backend.processes)
+            self.assertEqual(control.status()["gate"], "builders")
             return create(*args)
 
         with mock.patch.object(self.store, "create", side_effect=snapshot):
             control._snapshot("konstaxa", ACTOR, "")
-        self.assertEqual(backend.events, ["save", "stop", "start"])
-        self.assertEqual(control.status()["phase"], "STARTING")
-        self.assertEqual(control.step()["gate"], "closed")
-        backend.ready(goal)
+        self.assertEqual(self.held, ["off", "on"])
+        self.assertEqual(backend.events, [])
+        with mock.patch.object(self.store, "create", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                control._snapshot("konstaxa", ACTOR, "")
+        # A failed copy only fails the request: the editor and its drafts are untouched.
+        self.assertEqual(backend.events, [])
+        self.assertEqual(control.status()["phase"], "workshop")
         self.assertEqual(control.step()["gate"], "builders")
-
-        for failure in ("save", "stop", "copy", "start"):
-            backend.fail_save = failure == "save"
-            backend.fail_stop = failure == "stop"
-            backend.fail_start = failure == "start"
-            with mock.patch.object(
-                self.store,
-                "create",
-                side_effect=OSError("disk full") if failure == "copy" else snapshot,
-            ):
-                with self.assertRaises((OSError, RuntimeError)):
-                    control._snapshot("konstaxa", ACTOR, "")
-            if failure == "copy":
-                # The drafts survived the saved stop: the workshop restarts instead of waiting for recovery.
-                self.assertEqual(control.status()["phase"], "STARTING")
-                self.assertEqual(backend.events[-1], "start")
-            else:
-                self.assertEqual(control.status()["phase"], "ERROR")
-            self.assertEqual(control.step()["gate"], "closed")
-            self.assertLessEqual(len(backend.processes), 2)
-            self.assertEqual(backend.processes[0].goal.profile, "game")
-            # Restore a ready workshop fixture for the next independent fault.
-            backend.ready(goal)
-            state = control.status()
-            state.update(
-                phase="workshop", gate="builders", error=None, errorMessage=None
-            )
-            control._write(state)
 
     def test_snapshot_of_a_map_without_draft_does_not_stop_the_workshop(self):
         backend = FakeBackend()
