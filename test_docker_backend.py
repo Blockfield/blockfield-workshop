@@ -145,7 +145,11 @@ class DockerBackendTests(unittest.TestCase):
                 },
             },
             "java": {},
-            "rcon": {"save-all flush": "Saved the game"},
+            "rcon": {
+                "save-all flush": "Saved the game",
+                "save-off": "Automatic saving is now disabled",
+                "save-on": "Automatic saving is now enabled",
+            },
             "container_images": {GAME_CID: GAME_IMAGE_ID},
             "repo_digests": {GAME_IMAGE_ID: [GAME_IMAGE]},
         }
@@ -700,11 +704,18 @@ class DockerBackendTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             self.backend.stop(process)
 
-    def test_save_requires_success_and_snapshot_requires_no_workshop_java(self):
+    def test_save_requires_success_and_live_snapshot_pauses_autosave(self):
+        with self.backend.workshop_saves_held():
+            pass
+        self.assertFalse(any(call[1] == "exec" for call in self.calls()))
         self.running("workshop")
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(OSError):
             with self.backend.workshop_saves_held():
-                self.fail("live snapshot")
+                raise OSError("copy failed")
+        self.assertEqual(
+            [call[4:] for call in self.calls() if call[1] == "exec"],
+            [["save-off"], ["save-all", "flush"], ["save-on"]],
+        )
         for response in ("", "Saving failed", "Saved the game"):
             self.load()
             self.state["rcon"]["save-all flush"] = response
@@ -715,6 +726,36 @@ class DockerBackendTests(unittest.TestCase):
             else:
                 with self.assertRaises(RuntimeError):
                     self.backend.save_and_freeze(process)
+
+    def test_live_snapshot_restores_autosave_after_rcon_failures(self):
+        self.running("workshop")
+        off = "Automatic saving is now disabled"
+        on = "Automatic saving is now enabled"
+        for responses in (
+            [TimeoutError("save-off timed out"), on],
+            ["", on],
+            [off, TimeoutError("flush timed out"), on],
+            [off, "Saving failed", on],
+            [off, None, on],
+        ):
+            with self.subTest(responses=responses):
+                with mock.patch.object(
+                    self.backend, "_rcon", side_effect=responses
+                ) as rcon:
+                    with self.assertRaises((RuntimeError, TimeoutError)):
+                        with self.backend.workshop_saves_held():
+                            self.fail("must not copy an unflushed world")
+                    self.assertEqual(
+                        rcon.call_args_list[-1], mock.call("workshop", "save-on")
+                    )
+        for response in (None, "", TimeoutError("restore timed out")):
+            with self.subTest(response=response):
+                with mock.patch.object(
+                    self.backend, "_rcon", side_effect=[off, "Saved the game", response]
+                ):
+                    with self.assertRaises((RuntimeError, TimeoutError)):
+                        with self.backend.workshop_saves_held():
+                            pass
 
     def test_fence_scales_unselected_app(self):
         (self.lock / "profile.json").write_text(

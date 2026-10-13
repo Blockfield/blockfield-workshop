@@ -66,7 +66,8 @@ class MapGitTests(unittest.TestCase):
             self.base,
         )
         before = {path.name for path in (self.versions.archive / "blobs").glob("*/*")}
-        self.assertEqual(self.commit("lighting", copy_id), second)
+        with self.assertRaisesRegex(ValueError, "no changes"):
+            self.commit("lighting", copy_id)
         self.assertEqual(
             before,
             {path.name for path in (self.versions.archive / "blobs").glob("*/*")},

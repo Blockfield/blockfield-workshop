@@ -336,33 +336,34 @@ class MapStore:
             files = self.versions.world_files(
                 world, json.dumps(config, ensure_ascii=False, indent=2).encode()
             )
-            if branch is not None:
-                if working_copy_id is None or expected_branch_head is None:
-                    raise ValueError(
-                        "branch snapshot requires working copy and expectedBranchHead"
-                    )
-                version = self.versions.commit_branch(
-                    map_id,
-                    branch,
-                    files,
-                    author,
-                    note or f"Update map {map_id}",
-                    expected_branch_head,
-                    working_copy_id,
-                    base_version,
+        # Publish refs only after autosave restoration has succeeded.
+        if branch is not None:
+            if working_copy_id is None or expected_branch_head is None:
+                raise ValueError(
+                    "branch snapshot requires working copy and expectedBranchHead"
                 )
-                base_version = expected_branch_head
-            else:
-                version = self.versions._record(
-                    map_id,
-                    files,
-                    parent=base_version,
-                    author=author,
-                    created_at=now_ms,
-                    source="candidate",
-                    source_id=candidate_id,
-                    note=note,
-                )
+            version = self.versions.commit_branch(
+                map_id,
+                branch,
+                files,
+                author,
+                note or f"Update map {map_id}",
+                expected_branch_head,
+                working_copy_id,
+                base_version,
+            )
+            base_version = expected_branch_head
+        else:
+            version = self.versions._record(
+                map_id,
+                files,
+                parent=base_version,
+                author=author,
+                created_at=now_ms,
+                source="candidate",
+                source_id=candidate_id,
+                note=note,
+            )
         if not review:
             return {
                 "mapId": map_id,
@@ -1447,8 +1448,12 @@ class MapVersions:
             )
         if not isinstance(note, str) or not note.strip() or len(note) > 200:
             raise ValueError("commit message required (1–200 characters)")
-        if files == self.read(map_id, expected_head)["files"]:
-            return expected_head
+        previous = self.read(map_id, expected_head)["files"]
+        # JSON whitespace/key order is not a builder edit; preserve the original blob.
+        if self._same(self._config(files), self._config(previous)):
+            files = files | {"map.json": previous["map.json"]}
+        if files == previous:
+            raise ValueError("no changes since the last branch commit")
         version = self._record(
             map_id,
             files,

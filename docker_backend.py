@@ -1157,17 +1157,46 @@ class DockerBackend:
 
     @contextmanager
     def workshop_saves_held(self):
-        """The controller must stop the workshop before copying world and markup together."""
-        if self.inventory()["workshop"]["java"]:
-            raise RuntimeError("stop the workshop before taking a consistent snapshot")
-        yield
+        """Hot snapshot: chunks are flushed and autosave is off while the copy runs, so builders stay
+        connected. The mod replaces markup files atomically; a stopped editor has nothing to hold."""
+        if self.inventory(tasks=False)["workshop"]["java"] == 0:
+            yield
+            return
+        try:
+            result = self._rcon("workshop", "save-off")
+            if result is None or not any(
+                message in result
+                for message in (
+                    "Automatic saving is now disabled",
+                    "Saving is already turned off",
+                )
+            ):
+                raise RuntimeError("save-off did not confirm autosave disabled")
+            result = self._rcon("workshop", "save-all", "flush")
+            if result is None or "Saved the game" not in result:
+                raise RuntimeError("save-all did not confirm success for live snapshot")
+            yield
+        finally:
+            # A timed-out save-off may still have reached Java.
+            result = self._rcon("workshop", "save-on")
+            if result is None or not any(
+                message in result
+                for message in (
+                    "Automatic saving is now enabled",
+                    "Saving is already turned on",
+                )
+            ):
+                raise RuntimeError("save-on did not confirm autosave restored")
+
+    def _flush(self, profile: str) -> None:
+        result = self._rcon(profile, "save-all", "flush")
+        if result is not None and "Saved the game" not in result:
+            raise RuntimeError(f"save-all did not confirm success: {result}")
 
     def save_and_freeze(self, process: Process) -> None:
         if process.goal.profile == "game":
             raise ValueError("Workshop controller cannot save or stop Game")
-        result = self._rcon(process.goal.profile, "save-all", "flush")
-        if result is not None and "Saved the game" not in result:
-            raise RuntimeError(f"save-all did not confirm success: {result}")
+        self._flush(process.goal.profile)
 
     def _scale(self, profile: str, replicas: int) -> None:
         if profile == "game":

@@ -91,10 +91,12 @@ and a single-file bind mount would keep showing the old inode.
   controller attempts one Workshop-only restoration. It verifies the unchanged session/copies and old-release
   preflight before fencing Workshop, then waits for exact readiness. A changed/corrupt session, unrelated error or
   failed restoration requires manual recovery. Success and explicit session/test requests clear the marker.
-- A snapshot closes only Workshop, flushes/stops it, copies immutable map history, then restores the same editor.
-  An interrupted save/stop/start remains closed and recoverable; a copy failure restarts the saved editor and reports
-  the failed request. Game entry and campaigns continue. Cold SSD bundles are reclaimed only with **both** apps
-  confirmed absent.
+- A snapshot never closes entry or restarts Workshop. A running editor uses `save-off`, confirmed `save-all flush`,
+  then copies immutable world/config blobs and restores `save-on` in `finally`, including on copy/RCON failures.
+  A sleeping editor copies its already-saved drafts without starting. Refs are published only after confirmed
+  autosave restoration. Failed RCON/flush/copy/restoration returns an error without committing or changing the
+  phase/gate; a restoration error means autosave needs operator inspection. Game entry and campaigns continue.
+  Cold SSD bundles are reclaimed only with **both** apps confirmed absent.
 
 The Docker adapter's command allowlist permits only the configured Workshop service's scale/image update and trusted
 Workshop save/export RCON commands, plus read-only service/container/process observations of Game and Workshop.
@@ -198,8 +200,9 @@ snapshot/release contract (same envelope and validation as above):
 
 - `candidate` `{mapId, workingCopyId?, note?}`: snapshot an isolated working copy or the legacy draft
   `<BF_WORKSHOP_DATA>/world/dimensions/blockfield_workshop/<mapId>/{region,entities,poi}` plus its markup JSON into
-  immutable CAS files and `<BF_CANDIDATES_DIR>/<id>.json`. No ZIP is written until an explicit export or playtest. While the workshop runs its saving is
-  stopped: the controller closes entry, flushes and stops the workshop, confirms the JVM exited, then copies world and JSON. It restarts the same session and opens entry only after readiness. Save/stop/export/start failures remain closed and recoverable. Empty placeholder region files are skipped.
+  immutable CAS files and `<BF_CANDIDATES_DIR>/<id>.json`. No ZIP is written until an explicit export or playtest.
+  Running snapshots hold autosave through the hot-copy guard above; sleeping snapshots read disk. Neither path
+  stops/starts Workshop or emits ERROR/STARTING transitions. Empty placeholder region files are skipped.
 - `publish` `{candidateId, force?}` (the site's «Принять»): pending only, and never over a newer accepted version of the
   same map. The draft's base (`blockfield-base.json`, written by the mod when it copies a template into the workshop:
   sha256 over the sorted `<kind>/<file>\0<sha256>\n` lines of region/entities/poi, `candidates.template_digest`) must
@@ -290,9 +293,11 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   includes `name`, `versionDigest`, CAS `generation`, `workingCopyId`, `createdBy` and `createdAt`.
 - `commit {mapId, branch, workingCopyId, expectedBranchHead, note}` saves a sequential commit from the exact selected
   ready editor session and its selected map branch. A nonempty 1–200-character message and explicit expected branch
-  head are required. The controller flushes/stops only Workshop, commits immutable files and advances the branch
-  atomically, then restarts the same editor. Repeated commits retain the copy's original provenance while appending
-  to its branch; another copy advancing that branch makes the old copy stale.
+  head are required. The hot-copy guard flushes a running Workshop and holds autosave only while copying;
+  sleeping drafts are copied directly. The controller commits immutable files and advances the branch atomically
+  without closing entry or restarting. Repeated commits retain the copy's original provenance while appending
+  to its branch; another copy advancing that branch makes the old copy stale. An unchanged tree is refused with
+  `no changes since the last branch commit`; JSON formatting/key order alone is not a change.
 - `compare {mapId, before, after}` compares two immutable map digests and returns file additions/changes/deletions,
   Anvil region coordinate bounds and JSON field before/after values. It does not inspect mutable drafts.
 - `merge-preview {mapId, versionDigest, expectedHead, resolutions?}` compares a source commit to exact current main
@@ -309,6 +314,17 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   It never saves uncommitted edits, advances the branch or stops Workshop. Commit changes first; a branch equal to
   main has nothing to review. Later branch commits do not change reviewed bytes or stop continued editing. An omitted
   branch keeps the legacy snapshot contract.
+- `candidate {mapId, branch, workingCopyId, expectedBranchHead, commit:true, note}` is the tablet's one-press
+  commit-and-review: hot-snapshot the current draft (or read sleeping drafts), advance its branch, then freeze that
+  **new** digest and current main into a pending review under the same controller lock. A nonempty 1–200-character
+  note is required. `commit` must be a boolean. Unchanged drafts, stale heads, wrong session/copy/branch, denied ACL,
+  invalid note and failed saves/copies produce `ok:false,error:<precise reason>` in `admin/results/<request UUID>.json`.
+  Neither command changes phase/gate or stops/starts Workshop. Concurrent requests cannot overlap save guards:
+  a busy controller lock leaves the inbox request queued for the next pass, which rechecks its expected head.
+  Commit manifests retain actor/note/source/parents; review metadata pins author, source branch and target head;
+  inbox completion logs record request/kind/actor/outcome. The process journal has no snapshot lifecycle events.
+  If review validation or metadata export fails after a successful commit, that commit remains retained; the result
+  reports failure. Submit a branch-aware `candidate` without `commit:true` to review the retained commit again.
 - `publish {candidateId, expectedHead, resolutions?, force?}` accepts and activates. `expectedHead` is the current version digest,
   or explicit `null` if no head exists. Missing `expectedHead` preserves branchless legacy acceptance-only behaviour;
   branch-aware reviews require the explicit field.
@@ -358,9 +374,11 @@ draft storage; immutable history, active bundles and controller metadata retain 
 
 The existing site mode API remains `mode {profile:"workshop",expectedRevision,session:"new"|"resume",maps?:[id...]}`.
 The controller exports `admin/session.json {schema:1,id,maps,...}`. For native submit/create requests the site must
-take `workingCopyId` from this export, match `status.json.desired.session` in phase `workshop`, check map membership
-and actor ACL, and forward `candidate {mapId,workingCopyId,note?}`. The controller repeats these checks before stopping
-the editor. A Java tablet submit already carries this exact ID; never replace it with a fresh or client-selected UUID.
+take `workingCopyId` from this export, match `status.json.desired.session` in phase `workshop` or the confirmed
+`sleeping` session, check map membership and actor ACL, and forward the selected `branch`, `expectedBranchHead`,
+`commit:true` and a nonempty `note` with `candidate {mapId,workingCopyId,...}`. The controller repeats these checks
+before any save commands. A Java tablet submit already carries this exact ID; never replace it with a fresh or
+client-selected UUID. Ordinary branch review without `commit:true` still reviews only the existing commit.
 `admin/maps.json` is the catalog/history API described above; it includes `arena`, `lobby` and `limbo` through one schema.
 
 Workshop container configuration required before enabling canonical sessions:
