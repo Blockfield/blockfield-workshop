@@ -137,9 +137,10 @@ sends at most one per 60 s, the site behind its Workshop button), or `workshopct
 root operator. A sleeping editor restarts the same goal at the then-current Game digest
 (`STARTING` -> `workshop`); any other phase reports ok without side effects, including a wake
 while `STARTING`, and repeated wakes never issue a second start. Result payload is
-`{kind:"wake",phase,revision}`. Inbox requests that need a running Workshop while sleeping --
-`candidate`, `commit`, `limbo-export`, `map-create`, `map-properties` and a playtest `mode` --
-are refused with `Мастерская спит — запустите её`; every other kind keeps its current contract
+`{kind:"wake",phase,revision}`. `commit` and `candidate` work while sleeping: sleep already saved
+and stopped the editor, so the controller snapshots the drafts on disk without starting it, and
+refuses if any Workshop backend is observed. Inbox requests that need a running Workshop while
+sleeping -- `limbo-export`, `map-create`, `map-properties` and a playtest `mode` -- are refused with `Мастерская спит — запустите её`; every other kind keeps its current contract
 and never auto-wakes. The process journal accepts the `sleeping` workshop gate only with zero
 Workshop Java.
 

@@ -438,8 +438,6 @@ class SleepTests(unittest.TestCase):
         self.controller.set_members([dict(ADMIN)])
         self.sleep()
         for kind, fields in (
-            ("candidate", {"mapId": "konstaxa", "note": "hi"}),
-            ("commit", {"mapId": "konstaxa"}),
             ("limbo-export", {"versionDigest": "v"}),
             ("map-create", {"mapId": "fresh"}),
             ("mode", {"profile": "test", "expectedRevision": 99}),
