@@ -97,15 +97,20 @@ def each(command, files, *, capture=False):
 
 def eol():
     output = run("git", "ls-files", "--eol", capture=True)
-    bad = sorted(
-        line.split("\t", 1)[1]
-        for line in output.splitlines()
-        if line.startswith(("i/crlf", "i/mixed"))
-    )
+    bad = []
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4:
+            continue
+        index, _worktree, attr, path = fields
+        if "attr/-text" in attr:
+            continue  # stored byte-for-byte, Git never converts
+        if index in ("i/crlf", "i/mixed") or path.lower().endswith((".bat", ".cmd")):
+            bad.append(line.split("\t", 1)[1])
     if bad:
         raise SystemExit(
-            "CRLF line endings in the Git index:\n"
-            + "\n".join(bad)
+            "CRLF in the Git index or .bat/.cmd without -text:\n"
+            + "\n".join(sorted(bad))
             + "\nFix with: git add --renormalize ."
         )
 
