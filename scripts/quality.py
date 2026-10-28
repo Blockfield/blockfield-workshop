@@ -95,6 +95,21 @@ def each(command, files, *, capture=False):
             raise RuntimeError(output)
 
 
+def eol():
+    output = run("git", "ls-files", "--eol", capture=True)
+    bad = sorted(
+        line.split("\t", 1)[1]
+        for line in output.splitlines()
+        if line.startswith(("i/crlf", "i/mixed"))
+    )
+    if bad:
+        raise SystemExit(
+            "CRLF line endings in the Git index:\n"
+            + "\n".join(bad)
+            + "\nFix with: git add --renormalize ."
+        )
+
+
 def kotlin(files, format=False):
     if not files:
         return
@@ -135,6 +150,7 @@ def lint(files):
 
 
 def formatting(files, write=False):
+    eol()
     each(
         ["ruff", "format", *([] if write else ["--check"])],
         [f for f in files if f.endswith(".py")],
