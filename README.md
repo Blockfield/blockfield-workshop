@@ -38,6 +38,10 @@ Game и мастерская работают одновременно, кажд
 Контроллер остаётся host-systemd service: запускать второй controller в контейнере нельзя.
 На хост он ставится из checkout этого репозитория (см. OPERATIONS).
 
+[Предложенный контракт переноса контроллера в Dokploy](docs/WORKSHOP-CONTAINER-CONTRACT.md)
+ограничен мастерской; действующий host-controller остаётся единственным владельцем
+до отдельного согласованного переключения.
+
 [Операции и протокол файлов](docs/OPERATIONS.md), [systemd](systemd/),
 [изолированный E2E](e2e/README.md). Публикация карт и пины находятся
 в [blockfield-server/scripts/maps](https://github.com/Blockfield/blockfield-server/tree/main/scripts/maps);
