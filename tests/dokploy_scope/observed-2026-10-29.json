@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "kind": "dokploy-scope-preflight",
+  "recorded_at": "2026-10-29 21:03:23 UTC",
+  "scope": {
+    "installation": "existing connected Dokploy; no disposable installation supplied",
+    "authorization": "named disposable W01 resources only; no existing application mutations",
+    "identity": "existing MCP provisioning identity; no scoped test identity issued"
+  },
+  "observations": {
+    "version": "v0.30.10",
+    "release_tag": "v0.29.5",
+    "statements": {
+      "organization": ["update", "delete"],
+      "member": ["read", "create", "update", "delete"],
+      "invitation": ["create", "cancel"],
+      "team": ["create", "update", "delete"],
+      "ac": ["create", "read", "update", "delete"],
+      "project": ["create", "delete"],
+      "service": ["create", "read", "delete"],
+      "environment": "[REDACTED]",
+      "docker": ["read"],
+      "sshKeys": ["read", "create", "delete"],
+      "gitProviders": ["read", "create", "delete"],
+      "traefikFiles": ["read", "write"],
+      "api": ["read"],
+      "volume": ["read", "create", "delete"],
+      "deployment": ["read", "create", "cancel"],
+      "envVars": ["read", "write"],
+      "projectEnvVars": ["read", "write"],
+      "environmentEnvVars": ["read", "write"],
+      "server": ["read", "create", "delete", "terminal"],
+      "registry": ["read", "create", "delete"],
+      "certificate": ["read", "create", "update", "delete"],
+      "backup": ["read", "create", "update", "delete", "restore"],
+      "volumeBackup": ["read", "create", "update", "delete", "restore"],
+      "schedule": ["read", "create", "update", "delete"],
+      "domain": ["read", "create", "delete"],
+      "destination": ["read", "create", "delete"],
+      "notification": ["read", "create", "update", "delete"],
+      "tag": ["read", "create", "update", "delete"],
+      "logs": ["read"],
+      "monitoring": ["read"],
+      "auditLog": ["read"],
+      "vaultProvider": ["read", "create", "update", "delete"],
+      "dnsProvider": ["read", "create", "update", "delete"]
+    },
+    "custom_roles_before": [],
+    "custom_role_request": {
+      "endpoint": "customRole.create",
+      "roleName": "w01-disposable-scope-20261029",
+      "permissions": {
+        "service": ["read"],
+        "deployment": ["read", "create"],
+        "api": ["read"]
+      }
+    },
+    "custom_role_result": {
+      "success": false,
+      "error": "Failed to execute customRole-create",
+      "details": "Error: Request failed with status code 403"
+    },
+    "custom_roles_after": []
+  },
+  "source_model": {
+    "commit": "073713f0b863eca4285ad24db00550af1b39397a",
+    "installed_build_verified": false,
+    "files": [
+      {
+        "path": "apps/dokploy/server/api/routers/application.ts",
+        "sha256": "19c49bba700bbf62defb07fecfe37bf16f037931a52a618f811f8d72e306abff"
+      },
+      {
+        "path": "packages/server/src/services/permission.ts",
+        "sha256": "8079fd7d14c32b2ab04cbaf7945829ec2cab0e130ba5107bbbc495c43bbeb98a"
+      },
+      {
+        "path": "packages/server/src/lib/access-control.ts",
+        "sha256": "436fc3ff1d52e75a58311e039904c544baec3225b2d012d9ebce33124f125b76"
+      }
+    ],
+    "routes": {
+      "application.one": ["service:read"],
+      "application.stop": ["deployment:create"],
+      "application.start": ["deployment:create"],
+      "application.reload": ["deployment:create"],
+      "application.deploy": ["deployment:create"],
+      "application.saveDockerProvider": ["service:create"],
+      "application.update": ["service:create"]
+    },
+    "ordinary_read_returns_broad_application": true,
+    "member_base_grants_forbidden": [
+      "envVars:read",
+      "envVars:write",
+      "volume:read",
+      "volume:create",
+      "volume:delete",
+      "schedule:create"
+    ],
+    "note": "Pinned source inference only, not direct-token behavior on the installed build."
+  },
+  "direct_scope_cases": [],
+  "cleanup": {
+    "created_resources": [],
+    "revoked_credentials": [],
+    "attempted_resource": {
+      "kind": "customRole",
+      "name": "w01-disposable-scope-20261029",
+      "result": "403; absent from successful customRole.all after the attempt"
+    },
+    "outstanding_resources": []
+  },
+  "production_admission": false
+}
