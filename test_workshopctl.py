@@ -491,6 +491,58 @@ class WorkshopctlTests(unittest.TestCase):
         backend.inventory = lambda: dict(stopped)
         workshopctl._require_stopped(backend)
 
+    def write_catalog(self, *releases):
+        (self.root / "controller").mkdir(parents=True, exist_ok=True)
+        catalog = {
+            release: {
+                "schema": 1,
+                "revision": 1,
+                "release": release,
+                "imageDigest": "ghcr.io/blockfield/blockfield-server@sha256:"
+                + chr(ord("a") + index) * 64,
+                "serverRuntime": {"java": "21"},
+                "clientContract": {"pack": "1.0"},
+                "source": {"publishedAt": "2026-10-30", "checksums": {"jar": "ok"}},
+            }
+            for index, release in enumerate(releases)
+        }
+        (self.root / "controller/releases.json").write_text(json.dumps(catalog))
+        return catalog
+
+    def test_verified_release_catalog_gates_offline_staging(self):
+        catalog = self.write_catalog("v1", "v2")
+        session = str(uuid4())
+        self.backend.processes = []
+        code, state = self.ctl(
+            "request", "workshop", "--session", session, "--release", "v1"
+        )
+        self.assertEqual(code, 0, state)
+        self.assertEqual(state["desired"]["release"], "v1")
+        code, target = self.ctl("target")
+        self.assertEqual(code, 0, target)
+        self.assertEqual(target["target"], catalog["v1"])
+        code, state = self.ctl("step")
+        self.assertEqual((code, state["phase"]), (0, "STARTING"))
+        self.assertEqual(self.ctl("target")[1]["target"], catalog["v1"])
+        self.backend.ready(Goal("workshop", "v1", session))
+        self.assertEqual(self.ctl("step")[1]["gate"], "builders")
+        code, error = self.ctl(
+            "request", "workshop", "--session", str(uuid4()), "--release", "v9"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("verified published", error)
+        self.assertEqual(self.ctl("target")[1]["target"], catalog["v1"])
+
+    def test_catalog_rejects_floating_or_foreign_digest(self):
+        catalog = self.write_catalog("v1")
+        catalog["v1"]["imageDigest"] = "ghcr.io/blockfield/blockfield-server:latest"
+        (self.root / "controller/releases.json").write_text(json.dumps(catalog))
+        code, error = self.ctl(
+            "request", "workshop", "--session", str(uuid4()), "--release", "v1"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("immutable server imageDigest", error)
+
 
 if __name__ == "__main__":
     unittest.main()

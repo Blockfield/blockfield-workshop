@@ -786,34 +786,36 @@ class GitInboxTests(unittest.TestCase):
         self.assertEqual((next_copy / "world/region/r.0.0.mca").read_bytes(), b"arena")
         self.assertEqual(self.controller.session()["branches"], {"arena": "other"})
 
-    def test_failed_release_follow_restores_original_branches_and_edited_bytes(self):
+    def test_game_release_change_preserves_branches_and_draft_bytes(self):
+        # Game rollouts never retarget Workshop: branches and unsaved drafts
+        # survive; only an explicit operation selects another release.
         original = self.controller.session_file.read_bytes()
         self.region.write_bytes(b"preserved draft")
         self.backend.processes[0] = Process(Goal("game", "v2"), True)
         self.backend.fail_start = True
-        self.assertEqual(self.controller.step()["phase"], "ERROR")
-        self.backend.fail_start = False
-        old_game = Process(Goal("game", "v1"), True)
-        self.backend.processes[0] = old_game
         state = self.controller.step()
-        self.assertEqual(state["phase"], "STARTING")
-        self.assertEqual(state["desired"]["release"], "v1")
+        self.assertEqual(state["phase"], "workshop")
+        self.assertIsNone(state.get("releaseFollow"))
         self.assertEqual(self.controller.session_file.read_bytes(), original)
         self.assertEqual(self.region.read_bytes(), b"preserved draft")
-        self.assertIn(old_game, self.backend.processes)
+        self.assertIn(Process(Goal("game", "v2"), True), self.backend.processes)
+        self.backend.fail_start = False
         self.make_ready()
         self.assertEqual(self.controller.status()["gate"], "builders")
 
-    def test_corrupt_copy_prevents_release_rollback_before_fence_or_start(self):
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
+    def test_explicit_release_change_needs_recovery_after_failed_start(self):
         self.backend.fail_start = True
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v2", self.session["id"]),
+            self.controller.status()["revision"],
+        )
         self.assertEqual(self.controller.step()["phase"], "ERROR")
-        (self.copy / "manifest.json").write_text("{}")
-        self.backend.processes[0] = Process(Goal("game", "v1"), True)
+        self.backend.fail_start = False
         events = list(self.backend.events)
         state = self.controller.step()
         self.assertEqual(state["phase"], "ERROR")
-        self.assertIsNone(state["releaseFollow"])
+        self.assertIsNone(state.get("releaseFollow"))
         self.assertEqual(self.backend.events, events)
 
     def new_session(self):

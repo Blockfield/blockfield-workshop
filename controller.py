@@ -244,6 +244,8 @@ class Controller:
         now: Callable[[], float] | None = None,
         maps=None,
         workshop_data_dir: Path | None = None,
+        releases: dict | None = None,
+        target_file: Path | None = None,
     ):
         """A missed STARTING deadline restores a previous Workshop/test goal when available."""
         # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
@@ -265,6 +267,12 @@ class Controller:
         )
         self.message_file = self.directory / "message.json"
         self.session_file = self.directory / "session.json"
+        # Last approved Workshop target: a verified published immutable server
+        # release record. It survives with Game off; staging never reads live Game.
+        self.target_file = (
+            Path(target_file) if target_file else self.directory / "target.json"
+        )
+        self.releases = dict(releases) if releases else {}
         self.default_message = message.strip()[:500] or DEFAULT_MESSAGE
         self.admin_dir = Path(admin_dir) if admin_dir else None
         self.inbox_dir = Path(inbox_dir) if inbox_dir else None
@@ -475,6 +483,27 @@ class Controller:
             )
         except (OSError, ValueError):
             return None
+
+    def approved_target(self) -> dict | None:
+        """The last approved Workshop release record, kept while Game is off."""
+        import releases as release_catalog
+
+        return release_catalog.load_approved_target(self.target_file)
+
+    def _select_release(self, release: str) -> dict | None:
+        """Validate a pinned release and persist it as the approved target.
+
+        Returns the verified record, or None when no catalog is configured
+        (legacy runs accept any pinned release). Raises on unknown releases,
+        floating tags or foreign registries.
+        """
+        import releases as release_catalog
+
+        if not self.releases:
+            return None
+        record = release_catalog.resolve(self.releases, release)
+        release_catalog.save_approved_target(self.target_file, record)
+        return record
 
     def _map_ids(self) -> set[str]:
         return self.maps.map_ids() if self.maps is not None else MAP_IDS
@@ -1000,10 +1029,9 @@ class Controller:
         return state
 
     def step(self, *, recover: bool = False) -> dict:
-        """Reconcile Workshop only; Game is observed for readiness and release compatibility.
+        """Reconcile Workshop only; Game is observed for status display, never selection.
 
-        ERROR requires explicit recovery, except the one recorded automatic release refresh
-        restored by a ready Game rollback to its exact previous release. STARTING waits closed:
+        ERROR requires explicit recovery. STARTING waits closed:
         absence cannot distinguish a failed request from an accepted, delayed start.
         Explicit recovery fences pending starts before considering another start.
         A repeated step never counts as forced interruption. State is written only when
@@ -1064,46 +1092,26 @@ class Controller:
                     raise RuntimeError(
                         "Workshop selection is missing or invalid; explicit recovery required"
                     )
-                follow = state.get("releaseFollow")
-                if (
-                    not recover
-                    and follow is not None
-                    and game is not None
-                    and game.ready
-                    and game.goal.release == follow["previous"]["release"]
-                ):
-                    # A rollback is attempted once; corrupt sessions or failed preflight still require manual recovery.
-                    state.update(phase="ERROR", gate="closed", releaseFollow=None)
-                    self._write(state)
-                    if self._session_digest() != follow["sessionDigest"]:
-                        raise ValueError(
-                            "release rollback requires the exact original workshop session"
-                        )
-                    goal = Goal(**follow["previous"])
-                    self.backend.preflight(goal)
-                    if getattr(self.maps, "canonical_sessions", False) is True:
-                        self._selected_session(goal, resume_only=True)
-                    # Consume this exact rollback before any stop/start; a failed restoration is never retried implicitly.
-                    state.update(
-                        revision=state["revision"] + 1,
-                        operation=str(uuid4()),
-                        desired=asdict(goal),
-                        releaseFollow=None,
-                        rollback=None,
-                        since=self._now_ms(),
-                    )
-                    self._write(state)
-                    recover = True
-                    previous_phase = "ERROR"
-                elif previous_phase == "ERROR" and not recover:
+                # releaseFollow is legacy data from live-Game following, retired:
+                # selection never tracks the running Game anymore. ERROR still
+                # needs explicit recovery; nothing here consumes the record.
+                if previous_phase == "ERROR" and not recover:
                     self._export(state)
                     return state
                 elif previous_phase == "sleeping":
                     return self._sleeping_step(state, goal, current)
                 if goal is None or goal.profile == "game":
-                    release = goal.release if goal else None
-                    if game is not None and game.ready:
-                        release = game.goal.release
+                    # Bootstrap/resume the persistent editor from the last
+                    # approved target, never from live Game readiness. The
+                    # running Game is only a legacy fallback for targets
+                    # recorded before release validation existed.
+                    target = self.approved_target()
+                    release = target["release"] if target is not None else None
+                    if release is None:
+                        if game is not None and game.ready:
+                            release = game.goal.release
+                        elif goal is not None:
+                            release = goal.release
                     if release is None:
                         self._export(state)
                         return state
@@ -1157,53 +1165,9 @@ class Controller:
                     raise RuntimeError(
                         "Workshop selection is missing or invalid; explicit recovery required"
                     )
-                if (
-                    current is not None
-                    and current.ready
-                    and game is not None
-                    and game.ready
-                    and state["phase"] in {"STARTING", "workshop"}
-                    and goal.profile == current.goal.profile == "workshop"
-                    and current.goal.release == game.goal.release
-                    and replace(current.goal, release=goal.release) == goal
-                    and current.goal.release != goal.release
-                ):
-                    # Game may advance between preflight and start; readiness still binds the exact editor session.
-                    goal = current.goal
-                    state["desired"] = asdict(goal)
-                    self._write(state)
-                if (
-                    current is not None
-                    and game is not None
-                    and game.ready
-                    and state["phase"] == "workshop"
-                    and current.goal == goal
-                    and current.ready
-                    and game.goal.release != goal.release
-                ):
-                    session = self.session()
-                    if session is None or session.get("id") != goal.session:
-                        raise ValueError(
-                            "selected workshop session is missing or invalid"
-                        )
-                    follow = {
-                        "previous": asdict(goal),
-                        "sessionDigest": self._session_digest(),
-                    }
-                    goal = replace(goal, release=game.goal.release)
-                    state.update(
-                        revision=state["revision"] + 1,
-                        phase="REQUESTED",
-                        gate="closed",
-                        operation=str(uuid4()),
-                        desired=asdict(goal),
-                        since=self._now_ms(),
-                        rollback=None,
-                        releaseFollow=follow,
-                    )
-                    self._write(state)
-                    self.backend.preflight(goal)
-                    previous_phase = "REQUESTED"
+                # Workshop never follows the live Game release: a Game
+                # rollout, stop or absence leaves the approved target alone.
+                # Selecting another release is an explicit new operation.
                 if current is not None and current.goal == goal:
                     if current.ready:
                         if self._maybe_sleep(state, goal, current):

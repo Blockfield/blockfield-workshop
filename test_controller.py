@@ -6,6 +6,7 @@ from unittest import mock
 from pathlib import Path
 from uuid import uuid4
 from controller import Controller, Goal, Process
+from releases import validate_release_record
 
 
 class FakeBackend:
@@ -88,10 +89,13 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.status()["phase"], "workshop")
         self.assertEqual(self.backend.events, ["start"])
 
-    def test_game_release_deploy_updates_only_the_editor(self):
+    def test_game_release_change_does_not_retarget_workshop(self):
+        # Selection never follows live Game: a Game rollout leaves the
+        # approved Workshop target alone (retires automatic live-Game image following).
         self.start_workshop()
         game = Process(Goal("game", "v2"), True)
         self.backend.processes[0] = game
+        events = list(self.backend.events)
         state = self.controller.step()
         self.assertEqual(
             (
@@ -100,13 +104,13 @@ class ControllerTests(unittest.TestCase):
                 state["error"],
                 state["desired"]["release"],
             ),
-            ("STARTING", "closed", None, "v2"),
+            ("workshop", "builders", None, "v1"),
         )
-        self.assertEqual(self.backend.events, ["start", "save", "stop", "start"])
+        self.assertIsNone(state.get("releaseFollow"))
+        self.assertEqual(self.backend.events, events)
         self.assertIn(game, self.backend.processes)
-        self.backend.ready(Goal("workshop", "v2", self.goal.session))
         restarted = Controller(Path(self.temp.name), self.backend)
-        self.assertEqual(restarted.step()["desired"]["release"], "v2")
+        self.assertEqual(restarted.step()["desired"]["release"], "v1")
 
     def test_game_campaign_does_not_delay_workshop_start(self):
         self.request()
@@ -319,21 +323,32 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.backend.events, events)
 
     def test_release_preflight_failure_preserves_editor_and_game(self):
+        # A Game rollout alone never stages: preflight failure only surfaces
+        # on the explicit new-release request, leaving the stable editor alone.
         self.start_workshop()
         self.backend.processes[0] = Process(Goal("game", "v2"), True)
         processes, events = list(self.backend.processes), list(self.backend.events)
+        state = self.controller.step()
+        self.assertEqual(state["phase"], "workshop")
+        self.assertEqual(self.backend.events, events)
 
         def unavailable(goal):
             raise OSError("image unavailable")
 
         self.backend.preflight = unavailable
-        state = self.controller.step()
-        self.assertEqual(state["phase"], "ERROR")
+        with self.assertRaises(OSError):
+            self.controller.request(
+                str(uuid4()),
+                Goal("workshop", "v2", self.goal.session),
+                state["revision"],
+            )
+        self.assertEqual(self.controller.status()["phase"], "workshop")
+        self.assertEqual(self.controller.status()["desired"]["release"], "v1")
         self.assertEqual(self.backend.processes, processes)
         self.assertEqual(self.backend.events, events)
         gate = json.loads(self.controller.gate_file.read_bytes())
         self.assertEqual(gate["backends"]["game"]["gate"], "public")
-        self.assertEqual(gate["backends"]["workshop"]["gate"], "closed")
+        self.assertEqual(gate["backends"]["workshop"]["gate"], "builders")
 
     def test_corrupt_state_closes_workshop_without_touching_game(self):
         self.start_workshop()
@@ -379,7 +394,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(gate["backends"]["game"]["gate"], "public")
         self.assertEqual(gate["backends"]["workshop"]["gate"], "closed")
 
-    def test_start_adopts_ready_editor_release_only_from_the_ready_game(self):
+    def test_start_never_adopts_game_release(self):
+        # A ready editor at another release is not adopted from live Game:
+        # the staged target stays until an explicit new operation selects it.
         self.request()
         self.controller.step()
         self.backend.processes[0] = Process(Goal("game", "v2"), True)
@@ -387,9 +404,10 @@ class ControllerTests(unittest.TestCase):
         self.backend.ready(actual)
         state = self.controller.step()
         self.assertEqual(
-            (state["phase"], state["desired"]["release"]), ("workshop", "v2")
+            (state["phase"], state["desired"]["release"]), ("STARTING", "v1")
         )
-        self.assertEqual(self.backend.events, ["start"])
+        # The unexpected ready backend at another release is fenced, never adopted.
+        self.assertEqual(self.backend.events, ["start", "fence"])
 
     def test_start_never_adopts_unbound_editor_readiness(self):
         self.request()
@@ -422,6 +440,143 @@ class ControllerTests(unittest.TestCase):
                 state = self.controller.step()
                 self.assertEqual(state["phase"], "STARTING")
                 self.assertEqual(state["desired"]["release"], "v1")
+
+
+class ReleaseSelectionTests(unittest.TestCase):
+    """Desired release = verified published immutable server release.
+
+    The last approved target persists while Game is off; staging never
+    reads live Game readiness.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.dir = Path(temporary.name)
+        self.backend = FakeBackend()
+        self.catalog = {
+            release: {
+                "schema": 1,
+                "revision": 1,
+                "release": release,
+                "imageDigest": "ghcr.io/blockfield/blockfield-server@sha256:"
+                + digest * 64,
+                "serverRuntime": {"java": "21"},
+                "clientContract": {"pack": "1.0"},
+                "source": {"publishedAt": "2026-10-30", "checksums": {"jar": "ok"}},
+            }
+            for release, digest in (("v1", "a"), ("v2", "b"))
+        }
+        self.controller = Controller(self.dir, self.backend, releases=self.catalog)
+        self.session = str(uuid4())
+
+    def request(self, release="v1"):
+        return self.controller.request(
+            str(uuid4()), Goal("workshop", release, self.session), 0
+        )
+
+    def test_records_reject_floating_or_foreign_images(self):
+        bad = dict(self.catalog["v1"])
+        for digest in (
+            "ghcr.io/blockfield/blockfield-server:latest",
+            "docker.io/library/other@sha256:" + "a" * 64,
+            "sha256:" + "a" * 64,
+            "",
+        ):
+            with self.subTest(digest=digest):
+                with self.assertRaises(ValueError):
+                    validate_release_record({**bad, "imageDigest": digest})
+        with self.assertRaises(ValueError):
+            validate_release_record({**bad, "source": {}})
+
+    def test_unknown_release_is_rejected_before_any_backend_effect(self):
+        with self.assertRaisesRegex(ValueError, "not a verified published release"):
+            self.controller.request(
+                str(uuid4()), Goal("workshop", "v9", self.session), 0
+            )
+        self.assertEqual(self.controller.status()["phase"], "UNINITIALIZED")
+        self.assertIsNone(self.controller.approved_target())
+        self.assertEqual(self.backend.events, [])
+
+    def test_offline_stage_persists_approved_target_without_game(self):
+        self.backend.processes = []
+        state = self.request("v1")
+        self.assertEqual(state["phase"], "REQUESTED")
+        target = self.controller.approved_target()
+        self.assertEqual(
+            (target["release"], target["imageDigest"]),
+            ("v1", self.catalog["v1"]["imageDigest"]),
+        )
+        staged = self.controller.step()
+        self.assertEqual(staged["phase"], "STARTING")
+        self.assertEqual(self.controller.approved_target(), target)
+        restarted = Controller(self.dir, self.backend, releases=self.catalog)
+        self.assertEqual(restarted.status()["desired"]["release"], "v1")
+        self.assertEqual(restarted.approved_target(), target)
+        self.backend.ready(Goal("workshop", "v1", self.session))
+        self.assertEqual(restarted.step()["gate"], "builders")
+
+    def test_duplicate_operation_is_idempotent_changed_intent_rejected(self):
+        operation = str(uuid4())
+        first = self.controller.request(
+            operation, Goal("workshop", "v1", self.session), 0
+        )
+        self.assertEqual(
+            self.controller.request(operation, Goal("workshop", "v1", self.session), 0),
+            first,
+        )
+        with self.assertRaisesRegex(ValueError, "reused with different intent"):
+            self.controller.request(operation, Goal("workshop", "v2", self.session), 0)
+        with self.assertRaisesRegex(ValueError, "stale state revision"):
+            self.controller.request(
+                str(uuid4()), Goal("workshop", "v2", self.session), 0
+            )
+
+    def test_new_target_deferred_while_test_active_and_in_error(self):
+        self.request("v1")
+        self.controller.step()
+        self.backend.ready(Goal("workshop", "v1", self.session))
+        self.assertEqual(self.controller.step()["phase"], "workshop")
+        before = self.controller.approved_target()
+        test_goal = Goal("test", "v1", self.session, "c" * 64)
+        self.controller.request(str(uuid4()), test_goal, 1)
+        with self.assertRaisesRegex(RuntimeError, "operation in progress"):
+            self.controller.request(
+                str(uuid4()),
+                Goal("workshop", "v2", self.session),
+                self.controller.status()["revision"],
+            )
+        self.assertEqual(self.controller.approved_target(), before)
+        self.backend.fail_start = True
+        self.assertEqual(self.controller.step()["phase"], "ERROR")
+        with self.assertRaisesRegex(RuntimeError, "requires recovery"):
+            self.controller.request(
+                str(uuid4()),
+                Goal("workshop", "v2", self.session),
+                self.controller.status()["revision"],
+            )
+        self.assertEqual(self.controller.approved_target(), before)
+
+    def test_explicit_release_change_keeps_session_and_draft(self):
+        self.backend.processes = []
+        self.request("v1")
+        self.controller.step()
+        self.backend.ready(Goal("workshop", "v1", self.session))
+        self.assertEqual(self.controller.step()["phase"], "workshop")
+        session_before = self.controller.session()
+        selected = Goal("workshop", "v2", self.session)
+        self.controller.request(
+            str(uuid4()), selected, self.controller.status()["revision"]
+        )
+        self.assertEqual(self.controller.approved_target()["release"], "v2")
+        self.controller.step()
+        self.backend.ready(selected)
+        state = self.controller.step()
+        self.assertEqual(
+            (state["phase"], state["desired"]["release"]), ("workshop", "v2")
+        )
+        self.assertEqual(self.controller.session()["id"], session_before["id"])
+        self.assertEqual(self.controller.session()["id"], self.session)
 
 
 if __name__ == "__main__":
