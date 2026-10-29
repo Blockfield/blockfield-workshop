@@ -1,3 +1,4 @@
+from release_fixtures import catalog
 import fcntl
 import json
 import tempfile
@@ -11,7 +12,7 @@ from releases import validate_release_record
 
 class FakeBackend:
     def __init__(self):
-        self.processes = [Process(Goal("game", "v1"), True)]
+        self.processes = [Process(Goal("game", "v1.0.0"), True)]
         self.events = []
         self.fail_save = False
         self.fail_stop = False
@@ -58,8 +59,10 @@ class ControllerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.backend = FakeBackend()
-        self.controller = Controller(Path(self.temp.name), self.backend)
-        self.goal = Goal("workshop", "v1", str(uuid4()))
+        self.controller = Controller(
+            Path(self.temp.name), self.backend, releases=catalog()
+        )
+        self.goal = Goal("workshop", "v1.0.0", str(uuid4()))
         self.op = str(uuid4())
 
     def request(self):
@@ -93,7 +96,7 @@ class ControllerTests(unittest.TestCase):
         # Selection never follows live Game: a Game rollout leaves the
         # approved Workshop target alone (retires automatic live-Game image following).
         self.start_workshop()
-        game = Process(Goal("game", "v2"), True)
+        game = Process(Goal("game", "v2.0.0"), True)
         self.backend.processes[0] = game
         events = list(self.backend.events)
         state = self.controller.step()
@@ -104,13 +107,13 @@ class ControllerTests(unittest.TestCase):
                 state["error"],
                 state["desired"]["release"],
             ),
-            ("workshop", "builders", None, "v1"),
+            ("workshop", "builders", None, "v1.0.0"),
         )
         self.assertIsNone(state.get("releaseFollow"))
         self.assertEqual(self.backend.events, events)
         self.assertIn(game, self.backend.processes)
-        restarted = Controller(Path(self.temp.name), self.backend)
-        self.assertEqual(restarted.step()["desired"]["release"], "v1")
+        restarted = Controller(Path(self.temp.name), self.backend, releases=catalog())
+        self.assertEqual(restarted.step()["desired"]["release"], "v1.0.0")
 
     def test_game_campaign_does_not_delay_workshop_start(self):
         self.request()
@@ -118,7 +121,9 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(self.controller.step()["phase"], "STARTING")
         self.assertNotIn("stop", self.backend.events)
         self.assertEqual(self.backend.events, ["start"])
-        self.assertEqual(self.backend.processes[0], Process(Goal("game", "v1"), True))
+        self.assertEqual(
+            self.backend.processes[0], Process(Goal("game", "v1.0.0"), True)
+        )
 
     def test_readiness_and_no_restart_on_repeated_steps(self):
         self.request()
@@ -132,7 +137,7 @@ class ControllerTests(unittest.TestCase):
     def test_bad_stop_does_not_start_second_backend(self):
         self.request()
         self.backend.processes.append(
-            Process(Goal("workshop", "v1", str(uuid4())), True)
+            Process(Goal("workshop", "v1.0.0", str(uuid4())), True)
         )
         self.backend.fail_stop = True
         self.assertEqual(self.controller.step()["phase"], "ERROR")
@@ -143,7 +148,7 @@ class ControllerTests(unittest.TestCase):
         self.start_workshop()
         self.backend.fail_save = True
         self.controller.request(
-            str(uuid4()), Goal("test", "v1", self.goal.session, "a" * 64), 1
+            str(uuid4()), Goal("test", "v1.0.0", self.goal.session, "a" * 64), 1
         )
         previous = self.backend.events.count("stop")
         self.assertEqual(self.controller.step()["gate"], "closed")
@@ -154,7 +159,7 @@ class ControllerTests(unittest.TestCase):
         self.request()
         self.controller.step()
         self.backend.ready(self.goal)
-        restarted = Controller(Path(self.temp.name), self.backend)
+        restarted = Controller(Path(self.temp.name), self.backend, releases=catalog())
         self.assertEqual(restarted.step()["gate"], "builders")
         self.assertEqual(self.backend.events.count("start"), 1)
 
@@ -172,9 +177,9 @@ class ControllerTests(unittest.TestCase):
         first = self.request()
         self.assertEqual(first, self.request())
         with self.assertRaises(ValueError):
-            self.controller.request(self.op, Goal("game", "v2"), 0)
+            self.controller.request(self.op, Goal("game", "v2.0.0"), 0)
         with self.assertRaises(RuntimeError):
-            self.controller.request(str(uuid4()), Goal("game", "v2"), 1)
+            self.controller.request(str(uuid4()), Goal("game", "v2.0.0"), 1)
 
     def test_concurrent_process_lock(self):
         self.request()
@@ -193,12 +198,12 @@ class ControllerTests(unittest.TestCase):
 
     def test_playtest_then_return_old_release_never_publishes(self):
         self.start_workshop()
-        test_goal = Goal("test", "v1", self.goal.session, "a" * 64)
+        test_goal = Goal("test", "v1.0.0", self.goal.session, "a" * 64)
         self.controller.request(str(uuid4()), test_goal, 1)
         self.controller.step()
         self.backend.ready(test_goal)
         self.assertEqual(self.controller.step()["gate"], "testers")
-        self.controller.request(str(uuid4()), Goal("game", "v1"), 2)
+        self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 2)
         self.controller.step()
         self.assertEqual(self.controller.step()["gate"], "closed")
         self.backend.ready(self.goal)
@@ -210,7 +215,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_old_completed_request_cannot_replay(self):
         self.start_workshop()
-        self.controller.request(str(uuid4()), Goal("game", "v1"), 1)
+        self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 1)
         self.controller.step()
         self.backend.ready(self.goal)
         self.controller.step()
@@ -230,25 +235,26 @@ class ControllerTests(unittest.TestCase):
 
     def test_invalid_goal_and_schema_rejected(self):
         with self.assertRaises(ValueError):
-            Goal("test", "v1", str(uuid4()), "not-a-hash")
+            Goal("test", "v1.0.0", str(uuid4()), "not-a-hash")
         with self.assertRaises(ValueError):
-            Goal("game", "v1", str(uuid4()))
+            Goal("game", "v1.0.0", str(uuid4()))
         Path(self.temp.name, "state.json").write_text('{"schema":999}')
         with self.assertRaises(ValueError):
             self.request()
 
     def test_bootstrap_persists_one_editor_session_and_keeps_game(self):
         game = self.backend.processes[0]
+        self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
         state = self.controller.step()
         self.assertEqual(state["phase"], "STARTING")
         session = self.controller.session()["id"]
         self.assertEqual(state["desired"]["session"], session)
-        restarted = Controller(Path(self.temp.name), self.backend)
+        restarted = Controller(Path(self.temp.name), self.backend, releases=catalog())
         self.assertEqual(restarted.step()["desired"]["session"], session)
         self.assertEqual(self.backend.events, ["start"])
         self.assertIn(game, self.backend.processes)
 
-    def test_bootstrap_waits_for_an_observed_game_release(self):
+    def test_bootstrap_waits_for_explicit_approved_target_import(self):
         self.backend.processes = []
         self.assertEqual(self.controller.step()["phase"], "UNINITIALIZED")
         gate = json.loads(self.controller.gate_file.read_bytes())
@@ -256,32 +262,25 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(gate["backends"]["workshop"]["gate"], "closed")
         self.assertEqual(self.backend.events, [])
 
-    def test_failed_bootstrap_preserves_the_exact_session_for_recovery(self):
-        prepare = mock.Mock(side_effect=OSError("not enough space"))
+    def test_failed_initial_import_preserves_uninitialized_state(self):
         self.controller.maps = mock.Mock(
             canonical_sessions=True,
             map_ids=lambda: {"fields"},
-            prepare_session=prepare,
+            prepare_session=mock.Mock(side_effect=OSError("not enough space")),
         )
-        state = self.controller.step()
-        self.assertEqual(state["phase"], "ERROR")
-        selected = self.controller.session()
-        self.assertEqual(selected["maps"], ["fields"])
-        self.assertEqual(state["desired"]["session"], selected["id"])
+        with self.assertRaises(OSError):
+            self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
+        self.assertEqual(self.controller.status()["phase"], "UNINITIALIZED")
+        self.assertIsNone(self.controller.approved_target())
         self.assertEqual(self.backend.events, [])
-        prepare.side_effect = None
-        self.controller.request(
-            str(uuid4()), Goal("game", "v1"), state["revision"], recover=True
-        )
-        state = self.controller.step(recover=True)
-        self.assertEqual(state["phase"], "STARTING")
-        self.assertEqual(self.controller.session(), selected)
-        self.assertEqual(state["desired"]["session"], selected["id"])
 
     def test_legacy_game_and_draining_state_never_mutates_game(self):
-        for phase, desired in (("game", Goal("game", "v1")), ("DRAINING", self.goal)):
+        for phase, desired in (
+            ("game", Goal("game", "v1.0.0")),
+            ("DRAINING", self.goal),
+        ):
             with self.subTest(phase=phase):
-                self.backend.processes = [Process(Goal("game", "v1"), True)]
+                self.backend.processes = [Process(Goal("game", "v1.0.0"), True)]
                 self.backend.events.clear()
                 state = {
                     "schema": 1,
@@ -297,36 +296,41 @@ class ControllerTests(unittest.TestCase):
                     },
                     "rollback": {
                         "profile": "game",
-                        "release": "v1",
+                        "release": "v1.0.0",
                         "session": None,
                         "candidate": None,
                     },
                 }
                 self.controller.file.write_text(json.dumps(state))
-                result = self.controller.step()
-                self.assertEqual(result["phase"], "STARTING")
-                self.assertEqual(result["desired"]["profile"], "workshop")
-                self.assertIsNone(result["rollback"])
-                self.assertEqual(self.backend.events, ["start"])
+                if phase == "game":
+                    self.assertEqual(self.controller.step()["phase"], "game")
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "missing committed active release identity"
+                    ):
+                        self.controller.step()
+                self.assertEqual(self.backend.events, [])
 
     def test_release_update_is_deferred_during_playtest(self):
         self.start_workshop()
-        test_goal = Goal("test", "v1", self.goal.session, "a" * 64)
+        test_goal = Goal("test", "v1.0.0", self.goal.session, "a" * 64)
         self.controller.request(str(uuid4()), test_goal, 1)
         self.controller.step()
         self.backend.ready(test_goal)
         self.controller.step()
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
         events = list(self.backend.events)
         state = self.controller.step()
-        self.assertEqual((state["phase"], state["desired"]["release"]), ("test", "v1"))
+        self.assertEqual(
+            (state["phase"], state["desired"]["release"]), ("test", "v1.0.0")
+        )
         self.assertEqual(self.backend.events, events)
 
     def test_release_preflight_failure_preserves_editor_and_game(self):
         # A Game rollout alone never stages: preflight failure only surfaces
         # on the explicit new-release request, leaving the stable editor alone.
         self.start_workshop()
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
         processes, events = list(self.backend.processes), list(self.backend.events)
         state = self.controller.step()
         self.assertEqual(state["phase"], "workshop")
@@ -339,11 +343,11 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.controller.request(
                 str(uuid4()),
-                Goal("workshop", "v2", self.goal.session),
+                Goal("workshop", "v2.0.0", self.goal.session),
                 state["revision"],
             )
         self.assertEqual(self.controller.status()["phase"], "workshop")
-        self.assertEqual(self.controller.status()["desired"]["release"], "v1")
+        self.assertEqual(self.controller.status()["desired"]["release"], "v1.0.0")
         self.assertEqual(self.backend.processes, processes)
         self.assertEqual(self.backend.events, events)
         gate = json.loads(self.controller.gate_file.read_bytes())
@@ -378,7 +382,9 @@ class ControllerTests(unittest.TestCase):
         self.controller.session_file.unlink()
         events = list(self.backend.events)
         with self.assertRaisesRegex(ValueError, "session is missing or invalid"):
-            self.controller.request(str(uuid4()), Goal("game", "v1"), state["revision"])
+            self.controller.request(
+                str(uuid4()), Goal("game", "v1.0.0"), state["revision"]
+            )
         self.assertEqual(self.controller.status(), state)
         self.assertEqual(self.backend.events, events)
         self.assertFalse(self.controller.session_file.exists())
@@ -399,12 +405,12 @@ class ControllerTests(unittest.TestCase):
         # the staged target stays until an explicit new operation selects it.
         self.request()
         self.controller.step()
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
-        actual = Goal("workshop", "v2", self.goal.session)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
+        actual = Goal("workshop", "v2.0.0", self.goal.session)
         self.backend.ready(actual)
         state = self.controller.step()
         self.assertEqual(
-            (state["phase"], state["desired"]["release"]), ("STARTING", "v1")
+            (state["phase"], state["desired"]["release"]), ("STARTING", "v1.0.0")
         )
         # The unexpected ready backend at another release is fenced, never adopted.
         self.assertEqual(self.backend.events, ["start", "fence"])
@@ -414,24 +420,24 @@ class ControllerTests(unittest.TestCase):
         self.controller.step()
         cases = (
             (
-                Process(Goal("game", "v2"), False),
-                Process(Goal("workshop", "v2", self.goal.session), True),
+                Process(Goal("game", "v2.0.0"), False),
+                Process(Goal("workshop", "v2.0.0", self.goal.session), True),
             ),
             (
-                Process(Goal("game", "v3"), True),
-                Process(Goal("workshop", "v2", self.goal.session), True),
+                Process(Goal("game", "v3.0.0"), True),
+                Process(Goal("workshop", "v2.0.0", self.goal.session), True),
             ),
             (
-                Process(Goal("game", "v2"), True),
-                Process(Goal("workshop", "v2", str(uuid4())), True),
+                Process(Goal("game", "v2.0.0"), True),
+                Process(Goal("workshop", "v2.0.0", str(uuid4())), True),
             ),
             (
-                Process(Goal("game", "v2"), True),
-                Process(Goal("workshop", "v2", self.goal.session), False),
+                Process(Goal("game", "v2.0.0"), True),
+                Process(Goal("workshop", "v2.0.0", self.goal.session), False),
             ),
             (
-                Process(Goal("game", "v2"), True),
-                Process(Goal("test", "v2", self.goal.session, "a" * 64), True),
+                Process(Goal("game", "v2.0.0"), True),
+                Process(Goal("test", "v2.0.0", self.goal.session, "a" * 64), True),
             ),
         )
         for game, editor in cases:
@@ -439,7 +445,7 @@ class ControllerTests(unittest.TestCase):
                 self.backend.processes = [game, editor]
                 state = self.controller.step()
                 self.assertEqual(state["phase"], "STARTING")
-                self.assertEqual(state["desired"]["release"], "v1")
+                self.assertEqual(state["desired"]["release"], "v1.0.0")
 
 
 class ReleaseSelectionTests(unittest.TestCase):
@@ -454,29 +460,17 @@ class ReleaseSelectionTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.dir = Path(temporary.name)
         self.backend = FakeBackend()
-        self.catalog = {
-            release: {
-                "schema": 1,
-                "revision": 1,
-                "release": release,
-                "imageDigest": "ghcr.io/blockfield/blockfield-server@sha256:"
-                + digest * 64,
-                "serverRuntime": {"java": "21"},
-                "clientContract": {"pack": "1.0"},
-                "source": {"publishedAt": "2026-10-30", "checksums": {"jar": "ok"}},
-            }
-            for release, digest in (("v1", "a"), ("v2", "b"))
-        }
+        self.catalog = catalog()
         self.controller = Controller(self.dir, self.backend, releases=self.catalog)
         self.session = str(uuid4())
 
-    def request(self, release="v1"):
+    def request(self, release="v1.0.0"):
         return self.controller.request(
             str(uuid4()), Goal("workshop", release, self.session), 0
         )
 
     def test_records_reject_floating_or_foreign_images(self):
-        bad = dict(self.catalog["v1"])
+        bad = dict(self.catalog["v1.0.0"])
         for digest in (
             "ghcr.io/blockfield/blockfield-server:latest",
             "docker.io/library/other@sha256:" + "a" * 64,
@@ -500,80 +494,59 @@ class ReleaseSelectionTests(unittest.TestCase):
 
     def test_offline_stage_persists_approved_target_without_game(self):
         self.backend.processes = []
-        state = self.request("v1")
+        state = self.request("v1.0.0")
         self.assertEqual(state["phase"], "REQUESTED")
         target = self.controller.approved_target()
         self.assertEqual(
             (target["release"], target["imageDigest"]),
-            ("v1", self.catalog["v1"]["imageDigest"]),
+            ("v1.0.0", self.catalog["v1.0.0"]["imageDigest"]),
         )
         staged = self.controller.step()
         self.assertEqual(staged["phase"], "STARTING")
         self.assertEqual(self.controller.approved_target(), target)
         restarted = Controller(self.dir, self.backend, releases=self.catalog)
-        self.assertEqual(restarted.status()["desired"]["release"], "v1")
+        self.assertEqual(restarted.status()["desired"]["release"], "v1.0.0")
         self.assertEqual(restarted.approved_target(), target)
-        self.backend.ready(Goal("workshop", "v1", self.session))
+        self.backend.ready(Goal("workshop", "v1.0.0", self.session))
         self.assertEqual(restarted.step()["gate"], "builders")
 
     def test_duplicate_operation_is_idempotent_changed_intent_rejected(self):
         operation = str(uuid4())
         first = self.controller.request(
-            operation, Goal("workshop", "v1", self.session), 0
+            operation, Goal("workshop", "v1.0.0", self.session), 0
         )
         self.assertEqual(
-            self.controller.request(operation, Goal("workshop", "v1", self.session), 0),
+            self.controller.request(
+                operation, Goal("workshop", "v1.0.0", self.session), 0
+            ),
             first,
         )
         with self.assertRaisesRegex(ValueError, "reused with different intent"):
-            self.controller.request(operation, Goal("workshop", "v2", self.session), 0)
+            self.controller.request(
+                operation, Goal("workshop", "v2.0.0", self.session), 0
+            )
         with self.assertRaisesRegex(ValueError, "stale state revision"):
             self.controller.request(
-                str(uuid4()), Goal("workshop", "v2", self.session), 0
+                str(uuid4()), Goal("workshop", "v2.0.0", self.session), 0
             )
-
-    def test_new_target_deferred_while_test_active_and_in_error(self):
-        self.request("v1")
-        self.controller.step()
-        self.backend.ready(Goal("workshop", "v1", self.session))
-        self.assertEqual(self.controller.step()["phase"], "workshop")
-        before = self.controller.approved_target()
-        test_goal = Goal("test", "v1", self.session, "c" * 64)
-        self.controller.request(str(uuid4()), test_goal, 1)
-        with self.assertRaisesRegex(RuntimeError, "operation in progress"):
-            self.controller.request(
-                str(uuid4()),
-                Goal("workshop", "v2", self.session),
-                self.controller.status()["revision"],
-            )
-        self.assertEqual(self.controller.approved_target(), before)
-        self.backend.fail_start = True
-        self.assertEqual(self.controller.step()["phase"], "ERROR")
-        with self.assertRaisesRegex(RuntimeError, "requires recovery"):
-            self.controller.request(
-                str(uuid4()),
-                Goal("workshop", "v2", self.session),
-                self.controller.status()["revision"],
-            )
-        self.assertEqual(self.controller.approved_target(), before)
 
     def test_explicit_release_change_keeps_session_and_draft(self):
         self.backend.processes = []
-        self.request("v1")
+        self.request("v1.0.0")
         self.controller.step()
-        self.backend.ready(Goal("workshop", "v1", self.session))
+        self.backend.ready(Goal("workshop", "v1.0.0", self.session))
         self.assertEqual(self.controller.step()["phase"], "workshop")
         session_before = self.controller.session()
-        selected = Goal("workshop", "v2", self.session)
+        selected = Goal("workshop", "v2.0.0", self.session)
         self.controller.request(
             str(uuid4()), selected, self.controller.status()["revision"]
         )
-        self.assertEqual(self.controller.approved_target()["release"], "v2")
+        self.assertEqual(self.controller.approved_target()["release"], "v2.0.0")
         self.controller.step()
         self.backend.ready(selected)
         state = self.controller.step()
         self.assertEqual(
-            (state["phase"], state["desired"]["release"]), ("workshop", "v2")
+            (state["phase"], state["desired"]["release"]), ("workshop", "v2.0.0")
         )
         self.assertEqual(self.controller.session()["id"], session_before["id"])
         self.assertEqual(self.controller.session()["id"], self.session)

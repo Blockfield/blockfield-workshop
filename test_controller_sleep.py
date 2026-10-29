@@ -1,5 +1,7 @@
 """Cold Workshop controller: idle sleep, wake, sleeping exports and refusals."""
 
+from release_fixtures import catalog
+
 import contextlib
 import io
 import json
@@ -55,9 +57,10 @@ class SleepTests(unittest.TestCase):
             idle_sleep_s=60.0,
             workshop_data_dir=self.data,
             now=lambda: self.clock[0],
+            releases=catalog(),
         )
         (self.dir / "inbox").mkdir()
-        self.goal = Goal("workshop", "v1", str(uuid4()))
+        self.goal = Goal("workshop", "v1.0.0", str(uuid4()))
         self.controller.request(str(uuid4()), self.goal, 0)
         self.controller.step()
         self.backend.ready(self.goal)
@@ -145,7 +148,7 @@ class SleepTests(unittest.TestCase):
             state["desired"],
             {
                 "profile": "workshop",
-                "release": "v1",
+                "release": "v1.0.0",
                 "session": self.goal.session,
                 "candidate": None,
                 "modeId": None,
@@ -154,7 +157,9 @@ class SleepTests(unittest.TestCase):
         self.assertIsNone(state["idleSince"])
         # The existing graceful path, nothing else.
         self.assertEqual(self.backend.events, ["save", "stop"])
-        self.assertEqual(self.backend.processes, [Process(Goal("game", "v1"), True)])
+        self.assertEqual(
+            self.backend.processes, [Process(Goal("game", "v1.0.0"), True)]
+        )
         gate = json.loads((self.dir / "gate.json").read_text())
         self.assertEqual(gate["backends"]["workshop"]["gate"], "sleeping")
         public = json.loads((self.dir / "public.json").read_text())
@@ -264,8 +269,9 @@ class SleepTests(unittest.TestCase):
             idle_sleep_s=0,
             workshop_data_dir=self.data,
             now=lambda: self.clock[0],
+            releases=catalog(),
         )
-        goal = Goal("workshop", "v1", str(uuid4()))
+        goal = Goal("workshop", "v1.0.0", str(uuid4()))
         controller.request(str(uuid4()), goal, 0)
         controller.step()
         backend.ready(goal)
@@ -292,7 +298,7 @@ class SleepTests(unittest.TestCase):
         self.assertEqual(state["phase"], "sleeping")
 
     def test_no_sleep_while_error_or_transition(self):
-        broken = Goal("workshop", "v1", str(uuid4()))
+        broken = Goal("workshop", "v1.0.0", str(uuid4()))
         self.controller.request(str(uuid4()), broken, 1)
         self.backend.fail_start = True
         self.assertEqual(self.controller.step()["phase"], "ERROR")
@@ -308,7 +314,7 @@ class SleepTests(unittest.TestCase):
         self.assertIn("start", self.backend.events)
 
     def test_no_sleep_for_test_profile(self):
-        testing = Goal("test", "v1", self.goal.session, "a" * 64)
+        testing = Goal("test", "v1.0.0", self.goal.session, "a" * 64)
         self.controller.request(str(uuid4()), testing, 1)
         self.controller.step()
         self.backend.ready(testing)
@@ -329,8 +335,8 @@ class SleepTests(unittest.TestCase):
             self.advance(61)
             self.assertEqual(self.controller.step()["phase"], "sleeping")
         self.assertEqual(self.backend.events, ["save", "stop"])
-        # Game rolled on while asleep: wake follows the current digest.
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
+        # Game rolled on while asleep: wake keeps the approved digest.
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
         request_id = self.put("wake")
         self.assertEqual(self.process(), 1)
         result = self.result(request_id)
@@ -355,7 +361,7 @@ class SleepTests(unittest.TestCase):
             woken["desired"],
             {
                 "profile": "workshop",
-                "release": "v2",
+                "release": "v1.0.0",
                 "session": self.goal.session,
                 "candidate": None,
                 "modeId": None,
@@ -371,7 +377,7 @@ class SleepTests(unittest.TestCase):
             (workshop["gate"], [m["name"] for m in workshop["allowed"]]),
             ("starting", ["Nether"]),
         )
-        self.backend.ready(Goal("workshop", "v2", self.goal.session))
+        self.backend.ready(Goal("workshop", "v1.0.0", self.goal.session))
         self.backend.generation = GENERATION
         restarted = self.controller.step()
         self.assertEqual(
@@ -390,7 +396,7 @@ class SleepTests(unittest.TestCase):
         self.assertEqual(self.controller.status()["revision"], revision)
         self.assertEqual(self.backend.events, [])
         # While STARTING a wake also reports ok without a second start.
-        switching = Goal("workshop", "v1", str(uuid4()))
+        switching = Goal("workshop", "v1.0.0", str(uuid4()))
         self.controller.request(str(uuid4()), switching, revision)
         self.controller.step()
         self.assertEqual(self.controller.status()["phase"], "STARTING")
@@ -513,6 +519,8 @@ class CliWakeTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.backend = SleepBackend()
+        (self.root / "controller").mkdir()
+        (self.root / "controller/releases.json").write_text(json.dumps(catalog()))
         self.data = self.root / "workshop-data"
         self.data.mkdir()
         (self.root / "inbox").mkdir()
@@ -567,7 +575,7 @@ class CliWakeTests(unittest.TestCase):
         )
 
     def test_wake_starts_the_same_sleeping_session(self):
-        self.assertEqual(self.ctl("request", "game", "--release", "v1")[0], 0)
+        self.assertEqual(self.ctl("request", "game", "--release", "v1.0.0")[0], 0)
         self.assertEqual(self.ctl("step")[1]["phase"], "STARTING")
         state = self.ctl("status")[1]["state"]
         session = state["desired"]["session"]

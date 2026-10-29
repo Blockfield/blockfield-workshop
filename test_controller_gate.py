@@ -1,5 +1,7 @@
 """Gate/public export, no-flap reconciliation and explicit ERROR recovery toward game."""
 
+from release_fixtures import catalog
+
 import json
 import os
 import tempfile
@@ -23,8 +25,9 @@ class GateTests(unittest.TestCase):
             self.backend,
             gate_file=self.dir / "gate.json",
             public_file=self.dir / "public.json",
+            releases=catalog(),
         )
-        self.goal = Goal("workshop", "v1", str(uuid4()))
+        self.goal = Goal("workshop", "v1.0.0", str(uuid4()))
 
     def gate(self, backend="workshop"):
         document = json.loads((self.dir / "gate.json").read_text())
@@ -60,7 +63,7 @@ class GateTests(unittest.TestCase):
         return self.controller.step()
 
     def test_game_adoption_exports_public(self):
-        self.controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
         self.assertEqual(self.controller.step()["gate"], "closed")
         self.assertEqual(
             self.gate("game"),
@@ -230,7 +233,7 @@ class GateTests(unittest.TestCase):
     def test_workshop_message_never_replaces_game_unavailable_message(self):
         self.to_workshop()
         self.controller.set_message("Строим новую карту")
-        self.backend.processes[0] = Process(Goal("game", "v1"), False)
+        self.backend.processes[0] = Process(Goal("game", "v1.0.0"), False)
         self.controller.step()
         self.assertEqual(self.gate("game")["message"], DEFAULT_MESSAGE)
         self.assertEqual(self.public("game")["message"], DEFAULT_MESSAGE)
@@ -242,21 +245,21 @@ class GateTests(unittest.TestCase):
         self.backend.fail_save = True
         self.controller.request(
             str(uuid4()),
-            Goal("test", "v1", self.goal.session, "a" * 64),
+            Goal("test", "v1.0.0", self.goal.session, "a" * 64),
             self.controller.status()["revision"],
         )
         self.assertEqual(self.controller.step()["phase"], "ERROR")
         revision = self.controller.status()["revision"]
         with self.assertRaises(RuntimeError):
-            self.controller.request(str(uuid4()), Goal("game", "v1"), revision)
+            self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), revision)
         with self.assertRaises(RuntimeError):
             self.controller.request(str(uuid4()), self.goal, revision, recover=True)
         state = self.controller.request(
-            str(uuid4()), Goal("game", "v2"), revision, recover=True
+            str(uuid4()), Goal("game", "v2.0.0"), revision, recover=True
         )
         self.assertEqual(
             (state["phase"], state["gate"], state["desired"]["release"]),
-            ("ERROR", "closed", "v2"),
+            ("ERROR", "closed", "v2.0.0"),
         )
         self.backend.fail_save = False
         events = list(self.backend.events)
@@ -265,7 +268,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.controller.step(recover=True)["phase"], "STARTING")
         new = self.backend.events[len(events) :]
         self.assertEqual(new, ["fence", "save", "stop", "start"])
-        self.backend.ready(Goal("workshop", "v2", self.goal.session))
+        self.backend.ready(Goal("workshop", "v2.0.0", self.goal.session))
         self.assertEqual(self.controller.step()["gate"], "builders")
 
 

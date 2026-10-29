@@ -1,5 +1,7 @@
 """Real controller session preparation and offline imports, without starting a backend."""
 
+from release_fixtures import catalog
+
 import json
 import tempfile
 import time
@@ -60,8 +62,9 @@ class WorkshopSessionTests(unittest.TestCase):
             self.backend,
             maps=self.store,
             admin_dir=self.root / "admin",
+            releases=catalog(),
         )
-        self.controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
         self.controller.step()
         self.backend.ready(Goal(**self.controller.status()["desired"]))
         self.controller.step()
@@ -72,7 +75,7 @@ class WorkshopSessionTests(unittest.TestCase):
         session = {"schema": 1, "id": copy_id, "maps": maps}
         self.controller.request(
             str(uuid4()),
-            Goal("workshop", "v1", copy_id),
+            Goal("workshop", "v1.0.0", copy_id),
             self.controller.status()["revision"],
             session=session,
         )
@@ -99,7 +102,7 @@ class WorkshopSessionTests(unittest.TestCase):
         region.write_bytes(b"draft edit")
         self.make_ready()
         self.controller.request(
-            str(uuid4()), Goal("game", "v1"), self.controller.status()["revision"]
+            str(uuid4()), Goal("game", "v1.0.0"), self.controller.status()["revision"]
         )
         self.make_ready()
         self.request(copy_id=copy_id)
@@ -285,6 +288,7 @@ class GitInboxTests(unittest.TestCase):
             maps=self.store,
             admin_dir=self.root / "admin",
             inbox_dir=self.inbox,
+            releases=catalog(),
         )
         self.builder = {"draslId": "b" * 32, "name": "Builder"}
         self.admin = {"draslId": "a" * 32, "name": "Admin"}
@@ -616,7 +620,9 @@ class GitInboxTests(unittest.TestCase):
         self.assertEqual(
             self.store.versions.branch("arena", self.branch)["versionDigest"], head
         )
-        other = Controller(self.root / "state", self.backend, maps=self.store)
+        other = Controller(
+            self.root / "state", self.backend, maps=self.store, releases=catalog()
+        )
 
         @contextmanager
         def concurrent():
@@ -777,7 +783,7 @@ class GitInboxTests(unittest.TestCase):
         )
         self.controller.request(
             str(uuid4()),
-            Goal("workshop", "v1", selected["id"]),
+            Goal("workshop", "v1.0.0", selected["id"]),
             state["revision"],
             session=selected,
         )
@@ -791,14 +797,14 @@ class GitInboxTests(unittest.TestCase):
         # survive; only an explicit operation selects another release.
         original = self.controller.session_file.read_bytes()
         self.region.write_bytes(b"preserved draft")
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
         self.backend.fail_start = True
         state = self.controller.step()
         self.assertEqual(state["phase"], "workshop")
         self.assertIsNone(state.get("releaseFollow"))
         self.assertEqual(self.controller.session_file.read_bytes(), original)
         self.assertEqual(self.region.read_bytes(), b"preserved draft")
-        self.assertIn(Process(Goal("game", "v2"), True), self.backend.processes)
+        self.assertIn(Process(Goal("game", "v2.0.0"), True), self.backend.processes)
         self.backend.fail_start = False
         self.make_ready()
         self.assertEqual(self.controller.status()["gate"], "builders")
@@ -807,7 +813,7 @@ class GitInboxTests(unittest.TestCase):
         self.backend.fail_start = True
         self.controller.request(
             str(uuid4()),
-            Goal("workshop", "v2", self.session["id"]),
+            Goal("workshop", "v2.0.0", self.session["id"]),
             self.controller.status()["revision"],
         )
         self.assertEqual(self.controller.step()["phase"], "ERROR")
@@ -824,7 +830,7 @@ class GitInboxTests(unittest.TestCase):
         )
         self.controller.request(
             str(uuid4()),
-            Goal("workshop", "v1", selected["id"]),
+            Goal("workshop", "v1.0.0", selected["id"]),
             self.controller.status()["revision"],
             session=selected,
         )
@@ -913,7 +919,7 @@ class GitInboxTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already bound"):
             self.controller.request(
                 str(uuid4()),
-                Goal("workshop", "v1", self.session["id"]),
+                Goal("workshop", "v1.0.0", self.session["id"]),
                 before["revision"],
                 session={
                     "schema": 1,

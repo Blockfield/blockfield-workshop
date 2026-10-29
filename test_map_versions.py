@@ -1,5 +1,7 @@
 """Map history, coherent SSD activation and isolated editable copies; no live backend."""
 
+from release_fixtures import catalog as release_catalog_fixture
+
 import json
 import os
 import shutil
@@ -223,7 +225,10 @@ class MapVersionTests(unittest.TestCase):
             self.assertTrue((Path(head["bundle"]) / "world/region/r.0.0.mca").is_file())
             self.assertFalse(any(name.endswith(".schem") for name in manifest["files"]))
         controller = Controller(
-            self.root / "catalog-state", FakeBackend(), maps=self.store
+            self.root / "catalog-state",
+            FakeBackend(),
+            maps=self.store,
+            releases=release_catalog_fixture(),
         )
         controller.set_members(
             [
@@ -341,9 +346,10 @@ class MapVersionTests(unittest.TestCase):
             admin_dir=admin,
             inbox_dir=inbox,
             maps=self.store,
+            releases=release_catalog_fixture(),
         )
         controller.set_members([{**ACTOR, "role": "admin"}])
-        controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
         controller.step()
         controller.backend.ready(Goal(**controller.status()["desired"]))
         controller.step()
@@ -408,6 +414,7 @@ class MapVersionTests(unittest.TestCase):
             FakeBackend(),
             admin_dir=self.root / "admin",
             maps=self.store,
+            releases=release_catalog_fixture(),
         )
         first = self.candidate()
         self.store.publish(first["id"], ACTOR)
@@ -448,13 +455,18 @@ class MapVersionTests(unittest.TestCase):
             self.store.checkout("konstaxa", first["versionDigest"], copy_id)["bundle"]
         )
         backend = FakeBackend()
-        controller = Controller(self.root / "state", backend, maps=self.store)
-        controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        controller = Controller(
+            self.root / "state",
+            backend,
+            maps=self.store,
+            releases=release_catalog_fixture(),
+        )
+        controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
         controller.step()
         backend.ready(Goal(**controller.status()["desired"]))
         controller.step()
         self.assertTrue(warm.exists())
-        goal = Goal("workshop", "v1", str(uuid4()))
+        goal = Goal("workshop", "v1.0.0", str(uuid4()))
         controller.request(str(uuid4()), goal, 1)
         with mock.patch.object(
             self.store.versions, "reclaim_unheaded_bundles"
@@ -467,7 +479,7 @@ class MapVersionTests(unittest.TestCase):
         backend.ready(goal)
         controller.step()
         backend.processes = [p for p in backend.processes if p.goal.profile != "game"]
-        controller.request(str(uuid4()), Goal("workshop", "v1", str(uuid4())), 2)
+        controller.request(str(uuid4()), Goal("workshop", "v1.0.0", str(uuid4())), 2)
         reclaim = self.store.versions.reclaim_unheaded_bundles
 
         def after_stop():

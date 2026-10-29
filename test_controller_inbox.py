@@ -1,5 +1,7 @@
 """Site admin inbox: requests, results, status/members export and persisted maintenance message."""
 
+from release_fixtures import catalog
+
 import contextlib
 import fcntl
 import hashlib
@@ -41,8 +43,9 @@ class InboxTests(unittest.TestCase):
             public_file=self.dir / "public.json",
             admin_dir=self.admin,
             inbox_dir=self.inbox,
+            releases=catalog(),
         )
-        self.controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
         self.controller.step()
         self.backend.ready(Goal(**self.controller.status()["desired"]))
         self.controller.step()
@@ -60,6 +63,7 @@ class InboxTests(unittest.TestCase):
             public_file=self.dir / "public.json",
             admin_dir=self.admin,
             inbox_dir=self.inbox,
+            releases=catalog(),
         )
         self.assertEqual(key.read_text(), text, "never rotated by a restart")
 
@@ -106,7 +110,7 @@ class InboxTests(unittest.TestCase):
                 state["desired"]["profile"],
                 state["desired"]["release"],
             ),
-            (request_id, "workshop", "v1"),
+            (request_id, "workshop", "v1.0.0"),
         )
         self.assertIn(
             f"inbox {request_id} kind='mode' actor=Nether ok", self.log.getvalue()
@@ -193,7 +197,9 @@ class InboxTests(unittest.TestCase):
             self.read("public.json")["workshop"]["message"], "Строим новую карту"
         )
         self.assertEqual(self.read("public.json")["message"], "")
-        restarted = Controller(self.dir / "state", self.backend, admin_dir=self.admin)
+        restarted = Controller(
+            self.dir / "state", self.backend, admin_dir=self.admin, releases=catalog()
+        )
         self.assertEqual(restarted.message, "Строим новую карту")
         for bad in ("x" * 201, "line\nbreak", 5):
             self.put("message", message=bad)
@@ -365,6 +371,11 @@ class InboxTests(unittest.TestCase):
             {
                 "schema": 1,
                 "revision": 1,
+                "operation": self.controller.status()["operation"],
+                "selection": {
+                    key: self.controller.status()["selection"][key]
+                    for key in ("operation", "revision", "deferred")
+                },
                 "phase": "workshop",
                 "gate": "builders",
                 "error": None,
@@ -372,13 +383,13 @@ class InboxTests(unittest.TestCase):
                 "deadline": None,
                 "desired": {
                     "profile": "workshop",
-                    "release": "v1",
+                    "release": "v1.0.0",
                     "session": self.controller.session()["id"],
                     "candidate": None,
                     "modeId": None,
                 },
                 "message": DEFAULT_MESSAGE,
-                "game": {"phase": "game", "gate": "public", "release": "v1"},
+                "game": {"phase": "game", "gate": "public", "release": "v1.0.0"},
             },
         )
         inode = (self.admin / "status.json").stat().st_ino
@@ -404,7 +415,7 @@ class InboxTests(unittest.TestCase):
         status = json.loads((self.admin / "status.json").read_bytes())
         self.assertEqual((status["phase"], status["gate"]), ("workshop", "closed"))
         self.assertEqual(
-            status["game"], {"phase": "game", "gate": "public", "release": "v1"}
+            status["game"], {"phase": "game", "gate": "public", "release": "v1.0.0"}
         )
 
     def test_failed_recovery_reports_error(self):

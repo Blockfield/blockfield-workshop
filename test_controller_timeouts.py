@@ -1,5 +1,7 @@
 """Workshop deadlines and rollback leave the independently running Game untouched."""
 
+from release_fixtures import catalog
+
 import json
 import tempfile
 import unittest
@@ -28,10 +30,14 @@ class TimeoutTests(unittest.TestCase):
         self.dir = Path(temporary.name)
         self.backend = FakeBackend()
         self.clock = Clock()
-        self.editor = Goal("workshop", "v1", str(uuid4()))
-        self.test = Goal("test", "v1", self.editor.session, "a" * 64)
+        self.editor = Goal("workshop", "v1.0.0", str(uuid4()))
+        self.test = Goal("test", "v1.0.0", self.editor.session, "a" * 64)
         self.controller = Controller(
-            self.dir, self.backend, now=self.clock, start_timeout=100
+            self.dir,
+            self.backend,
+            now=self.clock,
+            start_timeout=100,
+            releases=catalog(),
         )
 
     def stable_editor(self):
@@ -49,14 +55,18 @@ class TimeoutTests(unittest.TestCase):
     def test_game_restart_is_observed_without_interrupting_editor(self):
         self.stable_editor()
         events = list(self.backend.events)
-        self.backend.processes[0] = Process(Goal("game", "v2"), False)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), False)
         self.assertEqual(self.controller.step()["phase"], "workshop")
         self.clock.advance(101)
         self.backend.processes = [
             p for p in self.backend.processes if p.goal.profile != "game"
         ]
         restarted = Controller(
-            self.dir, self.backend, now=self.clock, start_timeout=100
+            self.dir,
+            self.backend,
+            now=self.clock,
+            start_timeout=100,
+            releases=catalog(),
         )
         self.assertEqual(restarted.step()["phase"], "workshop")
         self.assertEqual(self.backend.events, events)
@@ -89,7 +99,11 @@ class TimeoutTests(unittest.TestCase):
         self.clock.advance(101)
         self.assertEqual(self.controller.step()["phase"], "STARTING")
         restarted = Controller(
-            self.dir, self.backend, now=self.clock, start_timeout=100
+            self.dir,
+            self.backend,
+            now=self.clock,
+            start_timeout=100,
+            releases=catalog(),
         )
         self.assertEqual(restarted.step()["phase"], "STARTING")
         self.assertEqual(self.backend.events, ["start"])
@@ -124,8 +138,8 @@ class TimeoutTests(unittest.TestCase):
         self.start_test()
         self.backend.ready(self.test)
         self.controller.step()
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
-        editor = Goal("workshop", "v2", str(uuid4()))
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
+        editor = Goal("game", "v2.0.0")
         self.controller.request(
             str(uuid4()), editor, self.controller.status()["revision"]
         )
@@ -145,7 +159,7 @@ class TimeoutTests(unittest.TestCase):
 
     def test_duplicate_game_fails_closed_without_stopping_it(self):
         self.stable_editor()
-        self.backend.processes.append(Process(Goal("game", "v1"), True))
+        self.backend.processes.append(Process(Goal("game", "v1.0.0"), True))
         events = list(self.backend.events)
         state = self.controller.step()
         self.assertEqual(state["phase"], "ERROR")
@@ -162,7 +176,7 @@ class TimeoutTests(unittest.TestCase):
         self.assertTrue(state["errorMessage"])
         self.backend.fail_save = False
         self.controller.request(
-            str(uuid4()), Goal("game", "v1"), state["revision"], recover=True
+            str(uuid4()), Goal("game", "v1.0.0"), state["revision"], recover=True
         )
         state = self.controller.step(recover=True)
         self.assertEqual(state["phase"], "workshop")
@@ -175,10 +189,10 @@ class TimeoutTests(unittest.TestCase):
         # creates no follow record.
         self.stable_editor()
         events = list(self.backend.events)
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
         state = self.controller.step()
         self.assertEqual(
-            (state["phase"], state["desired"]["release"]), ("workshop", "v1")
+            (state["phase"], state["desired"]["release"]), ("workshop", "v1.0.0")
         )
         self.assertIsNone(state.get("releaseFollow"))
         self.assertEqual(self.backend.events, events)
@@ -187,7 +201,7 @@ class TimeoutTests(unittest.TestCase):
         ]
         offline = self.controller.step()
         self.assertEqual(
-            (offline["phase"], offline["desired"]["release"]), ("workshop", "v1")
+            (offline["phase"], offline["desired"]["release"]), ("workshop", "v1.0.0")
         )
         self.assertEqual(self.backend.events, events)
 
@@ -198,11 +212,15 @@ class TimeoutTests(unittest.TestCase):
             p for p in self.backend.processes if p.goal.profile != "game"
         ]
         restarted = Controller(
-            self.dir, self.backend, now=self.clock, start_timeout=100
+            self.dir,
+            self.backend,
+            now=self.clock,
+            start_timeout=100,
+            releases=catalog(),
         )
         state = restarted.step()
         self.assertEqual(
-            (state["phase"], state["desired"]["release"]), ("workshop", "v1")
+            (state["phase"], state["desired"]["release"]), ("workshop", "v1.0.0")
         )
         self.assertEqual(self.controller.session_file.read_bytes(), target_before)
 
@@ -212,18 +230,18 @@ class TimeoutTests(unittest.TestCase):
         self.stable_editor()
         self.controller.request(
             str(uuid4()),
-            Goal("workshop", "v2", self.editor.session),
+            Goal("workshop", "v2.0.0", self.editor.session),
             self.controller.status()["revision"],
         )
         state = json.loads(self.controller.file.read_text())
         previous = dict(state["desired"])
-        previous["release"] = "v1"
+        previous["release"] = "v1.0.0"
         state["releaseFollow"] = {"previous": previous, "sessionDigest": "0" * 64}
         self.controller.file.write_text(json.dumps(state))
         stepped = self.controller.step()
-        self.assertEqual(stepped["desired"]["release"], "v2")
+        self.assertEqual(stepped["desired"]["release"], "v2.0.0")
         self.assertEqual(stepped["phase"], "STARTING")
-        self.assertEqual(stepped["releaseFollow"]["previous"]["release"], "v1")
+        self.assertEqual(stepped["releaseFollow"]["previous"]["release"], "v1.0.0")
 
     def test_malformed_follow_fails_closed_without_overwriting_state(self):
         self.stable_editor()

@@ -25,6 +25,9 @@ import unicodedata
 from uuid import UUID, uuid4
 
 import map_package
+import releases as release_catalog
+
+STATE_MAX_BYTES = 262144
 
 
 @dataclass(frozen=True)
@@ -316,10 +319,10 @@ class Controller:
             }
         with os.fdopen(fd, "rb") as handle:
             info = os.fstat(handle.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 16384:
+            if not stat.S_ISREG(info.st_mode) or info.st_size > STATE_MAX_BYTES:
                 raise ValueError("invalid state file")
-            data = handle.read(16385)
-        if len(data) > 16384:
+            data = handle.read(STATE_MAX_BYTES + 1)
+        if len(data) > STATE_MAX_BYTES:
             raise ValueError("invalid state file")
 
         def unique(pairs):
@@ -365,6 +368,11 @@ class Controller:
                 or state.get("operation") is not None
             ):
                 raise ValueError("invalid uninitialized state")
+            if any(
+                state.get(key) is not None
+                for key in ("approvedTarget", "activeTarget", "selection")
+            ):
+                raise ValueError("uninitialized state has a selection")
             return state
         if (
             state["revision"] < 1
@@ -416,15 +424,98 @@ class Controller:
                     raise ValueError("inconsistent release follow")
             except (ValueError, TypeError, KeyError) as error:
                 raise ValueError("invalid release follow") from error
+        self._validate_selection(state)
         return state
 
+    def _validate_selection(self, state: dict) -> None:
+        if state.get("approvedTarget") is None:
+            if (
+                state.get("activeTarget") is not None
+                or state.get("selection") is not None
+            ):
+                raise ValueError("missing approved target in selection journal")
+            return
+        for key in (
+            "approvedTarget",
+            "activeTarget",
+            "rollbackTarget",
+            "previousTarget",
+        ):
+            if state.get(key) is not None:
+                state[key] = release_catalog.validate_release_record(state[key])
+        selection = state.get("selection")
+        try:
+            UUID(selection["operation"])
+            intent = Goal(**selection["intent"])
+            Goal(**selection["request"])
+            if (
+                type(selection["revision"]) is not int
+                or not 1 <= selection["revision"] <= state["revision"]
+                or type(selection["deferred"]) is not bool
+                or type(selection["recover"]) is not bool
+                or type(selection["resumeOnly"]) is not bool
+                or not (
+                    selection["requestSession"] is None
+                    or isinstance(selection["requestSession"], dict)
+                )
+                or intent.release != state["approvedTarget"]["release"]
+                or state["activeTarget"]["release"] != state["desired"]["release"]
+                or (
+                    not selection["deferred"]
+                    and (state["activeTarget"] != state["approvedTarget"])
+                )
+                or (
+                    state.get("rollback") is not None
+                    and (
+                        state.get("rollbackTarget") is None
+                        or state["rollbackTarget"]["release"]
+                        != state["rollback"]["release"]
+                    )
+                )
+            ):
+                raise ValueError("inconsistent selection journal")
+        except (KeyError, TypeError, AttributeError, ValueError) as error:
+            raise ValueError("invalid selection journal") from error
+
+    def _project_target(self, state: dict) -> dict | None:
+        record = state.get("approvedTarget")
+        if record is None:
+            # A standalone file is not a committed approval or an initial import.
+            if release_catalog.load_approved_target(self.target_file) is not None:
+                raise ValueError(
+                    "target has no committed selection journal; import via request"
+                )
+            return None
+        target = {
+            **record,
+            "stateRevision": state["revision"],
+            "operation": state["selection"]["operation"],
+            "runtimeOperation": state["operation"],
+            "selectionRevision": state["selection"]["revision"],
+            "previousTarget": state.get("previousTarget"),
+        }
+        # state.json is the authority. Repair an interrupted/stale/corrupt projection
+        # under the controller lock before any external effect or target read.
+        try:
+            projected = release_catalog.load_approved_target(self.target_file)
+        except ValueError:
+            projected = None
+        if projected != target:
+            atomic_write(
+                self.target_file,
+                json.dumps(target, sort_keys=True, allow_nan=False).encode(),
+            )
+        return target
+
     def _write(self, state: dict) -> None:
-        atomic_write(
-            self.file,
-            json.dumps(
-                state, ensure_ascii=False, sort_keys=True, allow_nan=False
-            ).encode(),
-        )
+        self._validate_selection(state)
+        data = json.dumps(
+            state, ensure_ascii=False, sort_keys=True, allow_nan=False
+        ).encode()
+        if len(data) > STATE_MAX_BYTES:
+            raise ValueError("controller state exceeds its bounded reader")
+        atomic_write(self.file, data)
+        self._project_target(state)
         self._export(state)
 
     def members(self) -> list[dict]:
@@ -485,25 +576,27 @@ class Controller:
             return None
 
     def approved_target(self) -> dict | None:
-        """The last approved Workshop release record, kept while Game is off."""
-        import releases as release_catalog
+        """Validated revision-bound projection of the durable selection journal."""
+        with self._locked():
+            return self._project_target(self._read())
 
-        return release_catalog.load_approved_target(self.target_file)
-
-    def _select_release(self, release: str) -> dict | None:
-        """Validate a pinned release and persist it as the approved target.
-
-        Returns the verified record, or None when no catalog is configured
-        (legacy runs accept any pinned release). Raises on unknown releases,
-        floating tags or foreign registries.
-        """
-        import releases as release_catalog
-
-        if not self.releases:
-            return None
-        record = release_catalog.resolve(self.releases, release)
-        release_catalog.save_approved_target(self.target_file, record)
-        return record
+    def _select_release(self, release: str, state: dict) -> dict:
+        if self.releases and release in self.releases:
+            record = release_catalog.resolve(self.releases, release)
+            for key in ("approvedTarget", "activeTarget", "previousTarget"):
+                known = state.get(key)
+                if (
+                    known is not None
+                    and known["release"] == release
+                    and known != record
+                ):
+                    raise ValueError("published release identity changed")
+            return record
+        # Catalog loss permits only the exact already committed identity.
+        target = state.get("approvedTarget")
+        if target is not None and target["release"] == release:
+            return release_catalog.validate_release_record(target)
+        raise ValueError(f"release {release!r} is not a verified published release")
 
     def _map_ids(self) -> set[str]:
         return self.maps.map_ids() if self.maps is not None else MAP_IDS
@@ -856,6 +949,7 @@ class Controller:
             status = {
                 "schema": 1,
                 "revision": state["revision"],
+                "operation": state.get("operation"),
                 "phase": state["phase"],
                 "gate": workshop_gate["gate"],
                 "error": state.get("error"),
@@ -863,6 +957,12 @@ class Controller:
                 "since": state.get("since"),
                 "deadline": deadline,
                 "desired": state.get("desired"),
+                "selection": {
+                    key: state["selection"][key]
+                    for key in ("operation", "revision", "deferred")
+                }
+                if state.get("selection")
+                else None,
                 "game": game_status,
                 "message": self.message,
                 "updatedAt": int(time.time() * 1000),
@@ -926,20 +1026,92 @@ class Controller:
         recover: bool = False,
         session: dict | None = None,
         resume_only: bool = False,
+        activate: bool = False,
     ) -> dict:
         """request() body under the controller lock, shared with wake()."""
         UUID(operation)
         state = self._read()
+        self._project_target(state)
+        request_intent = asdict(goal)
+        request_session = json.loads(json.dumps(session, allow_nan=False))
         returning = goal.profile == "game"
+        if recover and not returning:
+            raise RuntimeError("explicit recovery must resume the editor")
         if returning:
-            goal, session = self._editor_goal(goal.release, state)
-        if state.get("operation") == operation:
-            if state.get("desired") != asdict(goal):
-                raise ValueError("operation ID reused with different intent")
+            release = (
+                state["approvedTarget"]["release"]
+                if state.get("selection", {}).get("deferred")
+                else goal.release
+            )
+            goal, session = self._editor_goal(release, state)
+        record = self._select_release(goal.release, state)
+        selection = state.get("selection") or {}
+        if (
+            selection.get("operation") == operation
+            or state.get("operation") == operation
+        ):
+            if (
+                selection.get("request") != request_intent
+                or selection.get("requestSession") != request_session
+                or selection.get("recover") != recover
+                or selection.get("resumeOnly") != resume_only
+                or selection.get("intent") != asdict(goal)
+                or state.get("approvedTarget") != record
+            ):
+                raise ValueError(
+                    "operation ID reused with different intent or release evidence"
+                )
             return state
         if type(expected_revision) is not int or expected_revision != state["revision"]:
             raise ValueError("stale state revision")
         recovering = recover and state.get("phase") == "ERROR" and returning
+        unknown_runtime = False
+        if state.get("phase") in {"workshop", "test"} and not (activate or returning):
+            try:
+                current = self._observe()[2]
+                unknown_runtime = (
+                    current is None
+                    or not current.ready
+                    or asdict(current.goal) != state["desired"]
+                )
+            except Exception:
+                unknown_runtime = True
+        deferred = not (activate or recovering or returning) and state.get(
+            "phase"
+        ) not in {"UNINITIALIZED", "game", "workshop"}
+        deferred = deferred or unknown_runtime
+        if deferred:
+            if goal.profile != "workshop" or goal.session != (
+                state.get("desired") or {}
+            ).get("session"):
+                raise RuntimeError(
+                    "operation in progress or requires recovery; only release staging allowed"
+                )
+            if unknown_runtime:
+                state.update(
+                    phase="ERROR",
+                    gate="closed",
+                    error="UncertainRuntime",
+                    errorMessage="runtime does not match the committed goal; explicit recovery required",
+                    since=self._now_ms(),
+                )
+            state.update(
+                revision=state["revision"] + 1,
+                previousTarget=state.get("approvedTarget"),
+                approvedTarget=record,
+                selection={
+                    "operation": operation,
+                    "revision": state["revision"] + 1,
+                    "request": request_intent,
+                    "requestSession": request_session,
+                    "recover": recover,
+                    "resumeOnly": resume_only,
+                    "intent": asdict(goal),
+                    "deferred": True,
+                },
+            )
+            self._write(state)
+            return state
         if (
             state.get("phase")
             not in {"UNINITIALIZED", "game", "workshop", "test", "sleeping"}
@@ -975,9 +1147,29 @@ class Controller:
         # _read()); remember it now so a later STARTING timeout can roll back to it without
         # relying on backend.observe() still agreeing once things go wrong.
         previous_stable = (
-            state.get("desired") if state.get("phase") in {"workshop", "test"} else None
+            state.get("desired")
+            if state.get("phase") in {"workshop", "test"}
+            and state.get("activeTarget") is not None
+            else None
         )
         state = {
+            "approvedTarget": record,
+            "activeTarget": record,
+            "previousTarget": state.get("previousTarget")
+            if state.get("selection", {}).get("deferred")
+            and state.get("approvedTarget") == record
+            else state.get("approvedTarget"),
+            "rollbackTarget": state.get("activeTarget"),
+            "selection": {
+                "operation": operation,
+                "revision": revision,
+                "request": request_intent,
+                "requestSession": request_session,
+                "recover": recover,
+                "resumeOnly": resume_only,
+                "intent": asdict(goal),
+                "deferred": False,
+            },
             "schema": 1,
             "revision": revision,
             "phase": "ERROR" if recovering else "REQUESTED",
@@ -999,7 +1191,7 @@ class Controller:
                     state, ensure_ascii=False, sort_keys=True, allow_nan=False
                 ).encode()
             )
-            > 16384
+            > STATE_MAX_BYTES
         ):
             raise ValueError("controller state exceeds its bounded reader")
         previous_state = self.file.read_bytes() if self.file.exists() else None
@@ -1043,6 +1235,15 @@ class Controller:
         with self._locked():
             try:
                 state = self._read()
+                self._project_target(state)
+                if (
+                    state.get("desired")
+                    and state["desired"]["profile"] != "game"
+                    and state.get("activeTarget") is None
+                ):
+                    raise ValueError(
+                        "missing committed active release identity; explicit import required"
+                    )
             except (ValueError, OSError) as error:
                 self._export(
                     {
@@ -1101,38 +1302,10 @@ class Controller:
                 elif previous_phase == "sleeping":
                     return self._sleeping_step(state, goal, current)
                 if goal is None or goal.profile == "game":
-                    # Bootstrap/resume the persistent editor from the last
-                    # approved target, never from live Game readiness. The
-                    # running Game is only a legacy fallback for targets
-                    # recorded before release validation existed.
-                    target = self.approved_target()
-                    release = target["release"] if target is not None else None
-                    if release is None:
-                        if game is not None and game.ready:
-                            release = game.goal.release
-                        elif goal is not None:
-                            release = goal.release
-                    if release is None:
-                        self._export(state)
-                        return state
-                    goal, session = self._editor_goal(release, state)
-                    if getattr(self.maps, "canonical_sessions", False) is True:
-                        session = self._session_selection(goal, session)
-                    self._save_session(session)
-                    state.update(
-                        revision=state["revision"] + 1,
-                        phase="ERROR" if previous_phase == "ERROR" else "REQUESTED",
-                        gate="closed",
-                        operation=state.get("operation") or str(uuid4()),
-                        desired=asdict(goal),
-                        since=self._now_ms(),
-                        rollback=None,
-                    )
-                    self._write(state)
-                    self.backend.preflight(goal)
-                    if getattr(self.maps, "canonical_sessions", False) is True:
-                        self._selected_session(goal, session)
-                    previous_phase = state["phase"]
+                    # Only an explicit request imports an initial validated target.
+                    # Legacy Game goals and running Game are never approval evidence.
+                    self._export({**state, "gate": "closed"})
+                    return state
                 if (state.get("rollback") or {}).get("profile") == "game":
                     # A legacy global switch must never restart or stop the independently running Game.
                     state["rollback"] = None
@@ -1165,6 +1338,20 @@ class Controller:
                     raise RuntimeError(
                         "Workshop selection is missing or invalid; explicit recovery required"
                     )
+                if (
+                    state.get("selection", {}).get("deferred")
+                    and previous_phase == "workshop"
+                    and current is not None
+                    and current.ready
+                    and current.goal == goal
+                ):
+                    self._request_locked(
+                        str(uuid4()),
+                        replace(goal, release=state["approvedTarget"]["release"]),
+                        state["revision"],
+                        activate=True,
+                    )
+                    return self._read()
                 # Workshop never follows the live Game release: a Game
                 # rollout, stop or absence leaves the approved target alone.
                 # Selecting another release is an explicit new operation.
@@ -1330,9 +1517,47 @@ class Controller:
         stable = Goal(**state["rollback"])
         if stable.profile == "game":
             raise RuntimeError("legacy Game rollback must be migrated before recovery")
-        if state["phase"] == "STARTING":
+        target = state.get("rollbackTarget")
+        if target is None or target["release"] != stable.release:
+            raise ValueError(
+                "rollback requires its committed previous release identity"
+            )
+        restarting = state["phase"] == "STARTING"
+        pending = state["selection"]["deferred"]
+        state.update(
+            revision=state["revision"] + 1,
+            operation=str(uuid4()),
+            phase="STARTING" if restarting else stable.profile,
+            gate="closed" if restarting else OPEN_GATES[stable.profile],
+            desired=asdict(stable),
+            previousTarget=state.get("previousTarget")
+            if pending
+            else state["approvedTarget"],
+            approvedTarget=state["approvedTarget"] if pending else target,
+            activeTarget=target,
+            rollbackTarget=None,
+            error=None,
+            errorMessage=reason,
+            since=self._now_ms(),
+            rollback=None,
+        )
+        if not pending:
+            state["selection"] = {
+                "operation": state["operation"],
+                "revision": state["revision"],
+                "request": asdict(stable),
+                "requestSession": None,
+                "recover": False,
+                "resumeOnly": False,
+                "intent": asdict(stable),
+                "deferred": False,
+            }
+        # Journal the single compensation attempt before fencing/stopping/starting.
+        self._write(state)
+        if restarting:
             try:
                 self.backend.preflight(stable)
+                self.backend.fence_pending_starts()
                 if state.get("rollbackSession") is not None:
                     self._save_session(state["rollbackSession"])
                 self.backend.stop(Process(goal, False))
@@ -1347,27 +1572,6 @@ class Controller:
                     errorMessage=f"{reason}; rollback to {stable.profile} also failed: {error}",
                 )
                 self._write(state)
-                return state
-            state.update(
-                phase="STARTING",
-                gate="closed",
-                desired=asdict(stable),
-                error=None,
-                errorMessage=reason,
-                since=self._now_ms(),
-                rollback=None,
-            )
-        else:
-            state.update(
-                phase=stable.profile,
-                gate=OPEN_GATES[stable.profile],
-                desired=asdict(stable),
-                error=None,
-                errorMessage=reason,
-                since=self._now_ms(),
-                rollback=None,
-            )
-        self._write(state)
         return state
 
     def cancel(self) -> dict:
@@ -1387,8 +1591,8 @@ class Controller:
         """Idempotent wake of a sleeping editor (site/proxy inbox "wake", workshopctl wake).
 
         Sleeping restarts the same goal through the ordinary request path, so the next
-        step starts it like any other switch (STARTING -> workshop) at the then-current
-        Game digest; the session, maps and drafts are unchanged. Any other phase is
+        step starts it like any other switch (STARTING -> workshop) at the exact
+        approved digest; the session, maps and drafts are unchanged. Any other phase is
         already awake or starting and reports ok without side effects. A member actor
         (draslId/name) must belong to the workshop ACL; None is the root operator
         (workshopctl) and skips that check.
@@ -1404,14 +1608,13 @@ class Controller:
                     "phase": state.get("phase"),
                     "revision": state.get("revision"),
                 }
-            goal = Goal(**state["desired"])
-            try:
-                _, game, _ = self._observe()
-            except Exception:
-                game = None
-            if game is not None and game.ready:
-                goal = replace(goal, release=game.goal.release)
-            state = self._request_locked(operation, goal, state["revision"])
+            target = self._project_target(state)
+            if target is None:
+                raise ValueError("wake requires a committed approved target")
+            goal = replace(Goal(**state["desired"]), release=target["release"])
+            state = self._request_locked(
+                operation, goal, state["revision"], activate=True
+            )
             return {
                 "kind": "wake",
                 "phase": state["phase"],
@@ -1897,6 +2100,7 @@ class Controller:
                 errorMessage="map change did not finish; recover before reopening",
                 since=self._now_ms(),
                 rollback=asdict(current.goal),
+                rollbackTarget=state.get("activeTarget"),
                 rollbackSession=previous,
                 releaseFollow=None,
             )
@@ -2218,7 +2422,10 @@ class Controller:
         if "modeId" in document and profile != "test":
             raise ValueError("modeId is only allowed for a candidate test")
         state, session = self.status(), None
-        if state.get("operation") == request_id:
+        if (state.get("selection") or {}).get("operation") == request_id:
+            goal = Goal(**state["selection"]["request"])
+            session = state["selection"]["requestSession"]
+        elif state.get("operation") == request_id:
             goal = Goal(**state["desired"])
         else:
             release = (state.get("desired") or {}).get("release")

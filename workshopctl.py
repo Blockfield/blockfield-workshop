@@ -203,7 +203,7 @@ def main(argv=None, backend_factory=None) -> int:
         "--releases-file",
         default=env.get("BF_RELEASES_FILE"),
         help="verified published server releases catalog (JSON); "
-        "defaults to <state-dir>/releases.json when present",
+        "defaults to <state-dir>/releases.json; missing catalog blocks new selections",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     request = commands.add_parser("request").add_subparsers(

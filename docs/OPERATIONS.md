@@ -22,17 +22,15 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
   the new Game process. Workshop does not take that legacy mutex.
 - The host controller runs from one systemd timer every 15 s and immediately when the site writes its inbox.
   Transitional steps recheck every 2 s for up to 12 s (`BF_STEP_POLL_S`, `BF_STEP_FOLLOW_S`). It starts, saves, stops,
-  fences and updates only Workshop. Game is observed for actual readiness and compatible release selection.
+  fences and updates only Workshop. Game is observed for status only; Workshop release selection uses the verified publication catalog.
 - Proxy gates are independent: ready Game stays public while Workshop starts, snapshots, tests or needs recovery.
   Workshop entry requires the exact selected session/release readiness and authenticated builder/tester ACL.
   Public status retains the Game mode; the additive Workshop status does not replace it.
-- Before each Workshop start the adapter selects the exact immutable image currently used by Game. A new ready Game
-  release refreshes a stable editor through save/stop/start while preserving its session and drafts; playtests and
-  unresolved operations defer that refresh. A client release must wait for compatible readiness of both backends.
-  Dokploy may retain a mutable tag in its service specification; the adapter resolves the sole running Game
-  container's image ID to exactly one server repository digest and refuses missing or ambiguous observations.
-  A Workshop start or refresh that lands while Game is restarting, stopped, or mid-rollout (zero or two Game
-  containers) therefore fails preflight into ERROR and needs explicit recovery once exactly one Game runs again.
+- Workshop release selection is independent of the running Game. An operator imports a verified published
+  immutable release from the catalog; Game rollout, restart or absence never approves or retargets it.
+  The controller stages sleeping/test/transition/ERROR selections without runtime changes. The existing Docker
+  adapter still selects its image from Game; offline digest application requires the independent lifecycle adapter
+  before production use. Controller fixture success alone does not establish offline runtime acceptance.
 
 ### Contracts
 
@@ -48,7 +46,7 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 | `/srv/minecraft/workshop/admin/` (0755, files0644)  | controller                   | site and Workshop, read-only   | `members.json`, `status.json`, `session.json`, `candidates.json`, `maps.json`, `results/<id>.json`; `workshop.key` alone is0640 root:1000 |
 | `/srv/minecraft/workshop/inbox/` (root:1000 0770)   | authenticated site (UID1000) | controller                     | `<id>.json`: `{schema:1,id,kind,actor:{draslId,name},createdAt,...}`; write temp then rename                                              |
 
-Admin status contains `{schema:1,revision,phase,gate,error,errorMessage,since,deadline,desired,message,updatedAt,game:{phase,gate,release}}`.
+Admin status contains `{schema:1,revision,operation,phase,gate,error,errorMessage,since,deadline,desired,message,updatedAt,game:{phase,gate,release}}`.
 Session contains `{schema:1,id,maps,branches?,startedAt,startedBy}`; the mod offers only the selected maps.
 Results contain `{id,ok,error,revision,doneAt,payload?}`; newest200 are kept.
 
@@ -64,9 +62,10 @@ and a single-file bind mount would keep showing the old inode.
 
 `request()` durably stores intent with CAS revisions; `step()` reconciles once under a non-blocking lock.
 
-- A fresh timer step waits for an observed ready Game release, prepares and durably records one Workshop session,
-  and starts its editor. Later steps and controller restarts reuse that session. Existing legacy Game intent migrates
-  to a resumed persistent editor; a legacy DRAINING state never drains or stops Game.
+- A fresh timer step stays uninitialized until an explicit catalog-backed request imports the initial target.
+  Missing/corrupt approval or legacy state never selects the live Game. Legacy Workshop intent without a committed
+  release identity requires an explicit validated import; a legacy Game goal remains passive. Later starts and
+  controller restarts reuse the selected session.
 - Stable phases are `workshop` and `test`. Only Workshop/test is managed: save and flush, stop, prove its Java/tasks
   have exited, write `workshop/profile.json`, delete its readiness, and start it. The other app stays running.
   Stable exports keep their inode and timestamp until content changes; the timer restores deleted exports.
@@ -82,15 +81,14 @@ and a single-file bind mount would keep showing the old inode.
   automatically. `workshopctl request game --recover` retains its legacy command spelling but fences only Workshop,
   saves/stops it when needed and resumes the same editor session. Ordinary `request game` also means resume editor;
   it never switches off Workshop or starts Game. A missing selected session is an error, not permission to invent one.
-- Once a stable editor and Game are both ready, a changed Game release causes a preflight-checked Workshop-only
-  save/stop/start on that exact image. It retains the editor session and region files. Playtest, STARTING and ERROR
-  defer release following. The controller reports the actual Workshop phase; it never claims `phase:game` to bypass
-  release checks. Game's passive `{phase,gate,release}` export reflects observation, not a requested intent.
-- Automatic release refresh records the exact previous editor goal and a digest of the complete selected session.
-  If the refresh fails or remains STARTING and Game becomes independently ready at that previous release, the
-  controller attempts one Workshop-only restoration. It verifies the unchanged session/copies and old-release
-  preflight before fencing Workshop, then waits for exact readiness. A changed/corrupt session, unrelated error or
-  failed restoration requires manual recovery. Success and explicit session/test requests clear the marker.
+- A validated selection changes only Workshop. Stable editor activation uses save/stop/start with the same
+  session. During a test, transition, ERROR or unknown runtime, selection updates the approved target and selection journal only;
+  the current operation, desired runtime, session and error remain intact. A test returns through explicit
+  `request game` (legacy spelling); a completed editor transition activates its staged target on a later step.
+  ERROR activation still requires explicit recovery and fencing. Sleeping selection remains asleep until wake.
+- Timeout/cancel compensation commits the previous exact release identity in a new revision/operation before
+  fencing and starting it. The journal permits one compensation attempt; failure remains ERROR. No Game rollback
+  or observation of a Game rollback is involved. Legacy `releaseFollow` fields are never used for selection.
 - A snapshot never closes entry or restarts Workshop. A running editor uses `save-off`, confirmed `save-all flush`,
   then copies immutable world/config blobs and restores `save-on` in `finally`, including on copy/RCON failures.
   A sleeping editor copies its already-saved drafts without starting. Refs are published only after confirmed
@@ -101,6 +99,58 @@ and a single-file bind mount would keep showing the old inode.
 The Docker adapter's command allowlist permits only the configured Workshop service's scale/image update and trusted
 Workshop save/export RCON commands, plus read-only service/container/process observations of Game and Workshop.
 Game drain, scale, restart and RCON mutation are outside the controller contract.
+
+## Verified release selection and durable target
+
+`--releases-file` / `BF_RELEASES_FILE` defaults to `<state-dir>/releases.json`, an operator-owned
+`{release: record}` export. Each key must equal its `vX.Y.Z` record release. Missing/empty catalogs grant
+no new release. A missing catalog may reuse only the exact already committed validated target; a changed
+record under the same immutable tag is refused. Initial import uses an explicit authenticated operator request:
+
+```sh
+just python workshopctl.py --releases-file /secure/verified-releases.json request workshop --release v2.68.0 --session <canonical-session-uuid>
+just python workshopctl.py target
+```
+
+Records contain `{schema:1,revision:<positive int>,release,imageDigest,serverRuntime,clientContract,source}`.
+`imageDigest` must be the full `ghcr.io/blockfield/blockfield-server@sha256:<64 lowercase hex>` reference.
+The trusted operator export must include original publication/registry bytes; it is not an API for callers to
+assert that an arbitrary digest was verified. Obtain the publication, checksums and provenance from trusted
+release/registry sources without running the image. The parser validates consistency, not remote signatures or
+operator authorization. Keep this file writable only by the trusted operator, outside game/site writable mounts.
+
+- `serverRuntime`: `{fingerprint,serverDigest,minecraft,fabric}` equals `build.json` fields
+  `server_runtime`, `server_digest`, `minecraft`, `fabric`; fingerprints are nonzero SHA256.
+- `clientContract`: `{digest,version,compatibility}` equals published `client`, `client_version`,
+  `compatibility`; digests are nonzero SHA256 and client version is `vX.Y.Z`.
+- `source`: `{repository:"Blockfield/blockfield-server",tag,commit,publishedAt,draft:false,prerelease:false,
+buildJson,checksums,imageManifest,imageConfig,provenance}`. `commit` is the full source SHA and must equal
+  `buildJson.sources.server`; `publishedAt` is an ISO timestamp with timezone. `buildJson`, `checksums`,
+  `imageManifest` and `imageConfig` are original UTF-8 strings, not reserialized dictionaries. SHA256SUMS must
+  bind the exact `build.json` bytes; the published build tag must equal the selection. The selected image digest
+  hashes the exact manifest bytes, whose config digest hashes the exact config bytes. Config labels must bind
+  the allowlisted source and `io.blockfield.server-digest` release tag. For an OCI index, also export
+  `platformManifest`; it must hash to its unique linux/amd64 descriptor.
+- `source.provenance`: the operator-verified `{imageDigest,sourceCommit,buildSha256}` binding must equal the
+  selected digest, publication commit and checked build checksum. Missing, placeholder, contradictory or
+  duplicate metadata/checksums fail before any selection is committed. See `release_fixtures.py` for the schema
+  with synthetic test data; those records are not production approvals.
+
+`state.json` is the only authority. Under the controller lock it commits `approvedTarget`, `activeTarget`,
+`previousTarget`, `rollbackTarget` and `selection:{operation,revision,request,requestSession,recover,resumeOnly,intent,deferred}` together with
+runtime intent. `activeTarget` is the identity of `desired`; it can differ from the approved pending target only
+while deferred. The bounded state reader allows 256 KiB to include full publication evidence and previous tuples.
+
+`target.json` is a recoverable projection: the approved record plus `{stateRevision,operation,runtimeOperation,
+selectionRevision,previousTarget}`. `operation`/`selectionRevision` refer to the selection journal;
+`runtimeOperation` and `stateRevision` match current state/status. Admin status also exports the journal's
+`selection:{operation,revision,deferred}`. A reader must compare both revisions and operations with a stable
+status reread; a standalone projection cannot approve a release. The controller repairs missing, corrupt or stale
+projections from validated durable state under its lock before effects or `target` reads. Without that state,
+a corrupt/unreadable projection fails closed. Preflight/session/state-write failures preserve the previous tuple;
+a crash after state commit may leave a stale projection which is repaired on restart. Retrying the same selection
+operation is idempotent; changed intent/evidence or stale new revisions are rejected. A target acknowledgement is
+not configured-image or READY evidence; the runtime adapter/verifier must prove those separately.
 
 ## Cold Workshop sleep and wake
 
@@ -122,7 +172,7 @@ at most 120 s old -- with `players == 0` and `busy == false`. The file is read b
 regular-file only, no symlinks; any missing/stale/foreign/unreadable report means not idle
 (fail-safe = stay awake). Continuous idleness is tracked as `idleSince` (epoch ms) in
 `state.json`; any activity clears it. After `BF_WORKSHOP_IDLE_SLEEP_S` seconds idle, and only
-with no phase transition, ERROR, test profile, pending release follow or unanswered inbox
+with no phase transition, ERROR, test profile or unanswered inbox
 request, the controller saves/stops the Workshop app and records phase `sleeping` with the
 desired Workshop goal (session, maps, drafts) unchanged.
 
@@ -136,7 +186,7 @@ exported values, read by the proxy and the site:
 Wake sources share one transition: inbox `wake`
 `{schema:1,id,kind:"wake",actor:{draslId,name},createdAt}` from any workshop member (the proxy
 sends at most one per 60 s, the site behind its Workshop button), or `workshopctl wake` by the
-root operator. A sleeping editor restarts the same goal at the then-current Game digest
+root operator. A sleeping editor restarts the same session at its exact committed approved digest
 (`STARTING` -> `workshop`); any other phase reports ok without side effects, including a wake
 while `STARTING`, and repeated wakes never issue a second start. Result payload is
 `{kind:"wake",phase,revision}`. `commit` and `candidate` work while sleeping: sleep already saved
@@ -753,7 +803,7 @@ its environment, mounts, controller state and enabled units; this bootstrap is n
    install -d -m 0770 -o root -g 1000 /srv/minecraft/workshop/inbox   # site container uid/gid 1000 writes requests
    install -d -o 1000 -g 1000 /srv/minecraft/workshop/data
    install -d /opt/blockfield-workshop/scripts /etc/blockfield
-   install -m 0644 controller.py docker_backend.py workshopctl.py journal.py candidates.py map_package.py limbo.py map_ids.json /opt/blockfield-workshop/
+   install -m 0644 controller.py releases.py docker_backend.py workshopctl.py journal.py candidates.py map_package.py limbo.py map_ids.json /opt/blockfield-workshop/
    install -m 0644 scripts/toolchain.py scripts/quality.py /opt/blockfield-workshop/scripts/
    install -m 0644 justfile /opt/blockfield-workshop/
    python3 /opt/blockfield-workshop/scripts/toolchain.py -c 'import sys,zlib; print(sys.version, zlib.ZLIB_RUNTIME_VERSION)'
@@ -785,7 +835,7 @@ its environment, mounts, controller state and enabled units; this bootstrap is n
 5. Initialise before deploying the proxy/site with the env (with the env set and no file both fail closed):
    ```sh
    cd /opt/blockfield-workshop && set -a && . /etc/blockfield/workshop.env && set +a
-   just python workshopctl.py request game --release v2.27.0   # = build in /opt/blockfield-build.json of the running game
+   just python workshopctl.py request game --release v2.27.0   # explicit initial import from the verified release catalog
    just python workshopctl.py step                              # editor STARTING, Game public; no Game restart
    systemctl enable --now blockfield-workshop.timer
    ```

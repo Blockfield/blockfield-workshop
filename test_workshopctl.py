@@ -11,6 +11,7 @@ from unittest import mock
 from uuid import uuid4
 from controller import Goal
 from test_controller import FakeBackend
+from release_fixtures import release_record
 import workshopctl
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
@@ -22,6 +23,7 @@ class WorkshopctlTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.backend = FakeBackend()
+        self.write_catalog("v1.0.0", "v2.0.0", "v3.0.0")
         # The fake backend never becomes ready by itself: following a switch would only burn the real-time budget.
         os.environ["BF_STEP_FOLLOW_S"] = "0"
         self.addCleanup(os.environ.pop, "BF_STEP_FOLLOW_S", None)
@@ -96,7 +98,7 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual((code, state["state"]["phase"]), (0, "UNINITIALIZED"))
         self.assertEqual(self.ctl("request", "game")[0], 1)
         self.assertEqual(
-            self.ctl("request", "game", "--release", "v1")[1]["phase"], "REQUESTED"
+            self.ctl("request", "game", "--release", "v1.0.0")[1]["phase"], "REQUESTED"
         )
         self.assertEqual(self.ctl("step")[1]["gate"], "closed")
         self.assertEqual(self.ready_editor()[1]["gate"], "builders")
@@ -114,14 +116,14 @@ class WorkshopctlTests(unittest.TestCase):
             state["desired"],
             {
                 "profile": "workshop",
-                "release": "v1",
+                "release": "v1.0.0",
                 "session": session,
                 "candidate": None,
                 "modeId": None,
             },
         )
         self.assertEqual(self.ctl("step")[1]["phase"], "STARTING")
-        self.backend.ready(Goal("workshop", "v1", session))
+        self.backend.ready(Goal("workshop", "v1.0.0", session))
         self.assertEqual(self.ctl("step")[1]["gate"], "builders")
         gate = json.loads((self.root / "gate" / "gate.json").read_text())
         self.assertEqual(
@@ -152,7 +154,8 @@ class WorkshopctlTests(unittest.TestCase):
         )
 
     def test_recover_runs_explicit_step(self):
-        self.ctl("request", "game", "--release", "v1")
+        self.ctl("request", "game", "--release", "v1.0.0")
+        self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
         self.ctl("request", "workshop", "--session", str(uuid4()))
@@ -166,7 +169,8 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertIn("fence", self.backend.events)
 
     def test_step_applies_inbox_before_reconcile(self):
-        self.ctl("request", "game", "--release", "v1")
+        self.ctl("request", "game", "--release", "v1.0.0")
+        self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
         request_id = str(uuid4())
@@ -199,7 +203,7 @@ class WorkshopctlTests(unittest.TestCase):
         )
 
     def test_inbox_failure_does_not_block_reconcile(self):
-        self.ctl("request", "game", "--release", "v1")
+        self.ctl("request", "game", "--release", "v1.0.0")
         original = workshopctl.Controller.process_inbox
 
         def broken(controller):
@@ -212,7 +216,10 @@ class WorkshopctlTests(unittest.TestCase):
         gate = json.loads((self.root / "gate/gate.json").read_bytes())
         self.assertEqual(gate["backends"]["game"]["gate"], "public")
 
-    def test_step_bootstraps_the_persistent_editor(self):
+    def test_step_requires_explicit_initial_target_import(self):
+        self.assertEqual(self.ctl("step")[1]["phase"], "UNINITIALIZED")
+        self.assertEqual(self.backend.events, [])
+        self.ctl("request", "game", "--release", "v1.0.0")
         code, state = self.ctl("step")
         self.assertEqual((code, state["phase"]), (0, "STARTING"))
         self.assertEqual(state["desired"]["profile"], "workshop")
@@ -238,7 +245,7 @@ class WorkshopctlTests(unittest.TestCase):
             "request",
             "workshop",
             "--release",
-            "v1",
+            "v1.0.0",
             "--session",
             copy_id,
             "--maps",
@@ -249,6 +256,7 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual(code, 0, state)
         selected = json.loads((self.root / "controller/session.json").read_text())
         self.assertEqual(selected["branches"], {"konstaxa": "editing"})
+        self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
         region = (
@@ -299,6 +307,7 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual(preview["targetVersion"], before)
 
     def test_branch_selection_validation_preserves_existing_editor(self):
+        self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
         previous = (self.root / "controller/session.json").read_bytes()
@@ -326,6 +335,7 @@ class WorkshopctlTests(unittest.TestCase):
             self.assertEqual(self.backend.events, events)
 
     def test_request_old_session_uuid_resumes_its_frozen_selection(self):
+        self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
         original = json.loads((self.root / "controller/session.json").read_text())
@@ -336,6 +346,7 @@ class WorkshopctlTests(unittest.TestCase):
         )
         old_region.write_bytes(b"old CLI draft")
         self.ctl("request", "workshop", "--session", str(uuid4()), "--maps", "fields")
+        self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
         game = self.backend.processes[0]
@@ -344,6 +355,7 @@ class WorkshopctlTests(unittest.TestCase):
         selected = json.loads((self.root / "controller/session.json").read_text())
         self.assertEqual(selected["maps"], original["maps"])
         self.assertEqual(selected["branches"], original["branches"])
+        self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
         self.assertEqual(old_region.read_bytes(), b"old CLI draft")
@@ -368,7 +380,7 @@ class WorkshopctlTests(unittest.TestCase):
         with open(self.root / "controller" / "controller.lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertEqual(
-                self.ctl("request", "game", "--release", "v1")[0], workshopctl.BUSY
+                self.ctl("request", "game", "--release", "v1.0.0")[0], workshopctl.BUSY
             )
 
     def test_offline_import_is_staged_and_activation_requires_exact_head(self):
@@ -494,51 +506,50 @@ class WorkshopctlTests(unittest.TestCase):
     def write_catalog(self, *releases):
         (self.root / "controller").mkdir(parents=True, exist_ok=True)
         catalog = {
-            release: {
-                "schema": 1,
-                "revision": 1,
-                "release": release,
-                "imageDigest": "ghcr.io/blockfield/blockfield-server@sha256:"
-                + chr(ord("a") + index) * 64,
-                "serverRuntime": {"java": "21"},
-                "clientContract": {"pack": "1.0"},
-                "source": {"publishedAt": "2026-10-30", "checksums": {"jar": "ok"}},
-            }
+            release: release_record(release, chr(ord("a") + index))
             for index, release in enumerate(releases)
         }
         (self.root / "controller/releases.json").write_text(json.dumps(catalog))
         return catalog
 
     def test_verified_release_catalog_gates_offline_staging(self):
-        catalog = self.write_catalog("v1", "v2")
+        catalog = self.write_catalog("v1.0.0", "v2.0.0")
         session = str(uuid4())
         self.backend.processes = []
         code, state = self.ctl(
-            "request", "workshop", "--session", session, "--release", "v1"
+            "request", "workshop", "--session", session, "--release", "v1.0.0"
         )
         self.assertEqual(code, 0, state)
-        self.assertEqual(state["desired"]["release"], "v1")
+        self.assertEqual(state["desired"]["release"], "v1.0.0")
         code, target = self.ctl("target")
         self.assertEqual(code, 0, target)
-        self.assertEqual(target["target"], catalog["v1"])
+        self.assertEqual(
+            {key: target["target"][key] for key in catalog["v1.0.0"]}, catalog["v1.0.0"]
+        )
         code, state = self.ctl("step")
         self.assertEqual((code, state["phase"]), (0, "STARTING"))
-        self.assertEqual(self.ctl("target")[1]["target"], catalog["v1"])
-        self.backend.ready(Goal("workshop", "v1", session))
+        self.assertEqual(
+            self.ctl("target")[1]["target"]["imageDigest"],
+            catalog["v1.0.0"]["imageDigest"],
+        )
+        self.backend.ready(Goal("workshop", "v1.0.0", session))
         self.assertEqual(self.ctl("step")[1]["gate"], "builders")
         code, error = self.ctl(
             "request", "workshop", "--session", str(uuid4()), "--release", "v9"
         )
         self.assertEqual(code, 1)
         self.assertIn("verified published", error)
-        self.assertEqual(self.ctl("target")[1]["target"], catalog["v1"])
+        self.assertEqual(
+            self.ctl("target")[1]["target"]["imageDigest"],
+            catalog["v1.0.0"]["imageDigest"],
+        )
 
     def test_catalog_rejects_floating_or_foreign_digest(self):
-        catalog = self.write_catalog("v1")
-        catalog["v1"]["imageDigest"] = "ghcr.io/blockfield/blockfield-server:latest"
+        catalog = self.write_catalog("v1.0.0")
+        catalog["v1.0.0"]["imageDigest"] = "ghcr.io/blockfield/blockfield-server:latest"
         (self.root / "controller/releases.json").write_text(json.dumps(catalog))
         code, error = self.ctl(
-            "request", "workshop", "--session", str(uuid4()), "--release", "v1"
+            "request", "workshop", "--session", str(uuid4()), "--release", "v1.0.0"
         )
         self.assertEqual(code, 1)
         self.assertIn("immutable server imageDigest", error)
