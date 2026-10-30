@@ -893,6 +893,15 @@ CP; the single-writer rule and the timer/path retirement below do not change.
 4. No in-flight Workshop transition: `status` phase is stable (`workshop`,
    `test` settled, or `sleeping`), no unanswered inbox request, no compensation
    pending. Finish or cancel (`workshopctl cancel`) first.
+5. The controller image contains the 2026-10-30 cut-over fixes (an
+   ERROR/never-ready controller preserves the Game entry of the shared
+   gate/public exports instead of closing Game entry; import of a legacy
+   host state — desired without a selection journal — commits the running
+   release instead of failing `invalid selection journal`). Provenance: a
+   merged workshop commit, CI green — never the pre-fix digest.
+6. The step-4b import dry-run against the copied real state passes (import
+   commits the running release, revision +1, phase unchanged; a sleeping
+   step leaves Game entry public). Fence (step 5) only after it is green.
 
 ### Step 0 — read-only inspection (no approval needed)
 
@@ -1001,6 +1010,24 @@ selected release. Keep the data-interface RO inputs (`workshop-templates`,
 `workshop-published`) exactly as the separately approved provisioning left
 them — do not copy host templates over them.
 
+### Step 4b — import dry-run against the copied real state (no approval; before fencing)
+
+Do this before step 5, never after it. Copy the step-1 snapshot's
+`controller/state.json` plus `releases.json` and the admin `session.json`
+into a scratch dir and run the candidate controller build's import offline:
+
+```sh
+workshopctl --backend dokploy request workshop --release <running-release> --session <running-session>
+# expect: revision +1, approvedTarget == activeTarget == running release,
+# selection deferred, phase unchanged; then a sleeping step must keep the
+# phase and must NOT change the Game entry of the copied gate/public exports
+```
+
+Only when this is green proceed to step 5. Rationale (2026-10-30
+cut-over, rolled back): the live import failed with `invalid selection
+journal` on the legacy host state, and the ERROR export closed Game entry
+for ~40 min — both are only diagnosable/fixable before fencing.
+
 ### Step 5 — fence the old writer, enable the new one (root + Dokploy write)
 
 Single-writer rule: at most one controller may hold the lock. Order matters.
@@ -1025,6 +1052,9 @@ downtime.
    operation match the host snapshot.
 2. Wake path: `workshopctl wake` (or inbox `wake` from a builder account)
    starts the same session at the committed digest; `STARTING` → `workshop`.
+   Allow the full modpack boot before any verdict (prod 2026-10-30: deploy →
+   `Readiness written` in the mod log took ~4 min); confirm via the mod log
+   line, not just the controller's view.
 3. Save path: a builder edit + snapshot/export round-trips; session/draft
    checksums survive wake and (if exercised) release change.
 4. Game independence: the Game app task is untouched (same task identity in
