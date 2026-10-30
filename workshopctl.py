@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Host CLI for the persistent Workshop controller (root: needs the Docker socket).
 
+Backend: --backend docker (host default, needs the Docker socket) or dokploy
+(BF_WORKSHOP_BACKEND; approved-tag mechanism, used by the container entry
+point and needing no Dokploy token). Container paths come from BF_* env with
+host defaults; the deployment/ examples set the container values.
+
 workshopctl request workshop --session <uuid> [--release vX.Y.Z]
 workshopctl request game [--release vX.Y.Z] [--recover]
 workshopctl target       # last approved release target (kept while Game is off)
@@ -25,12 +30,98 @@ import sys
 import time
 from uuid import uuid4
 
-from controller import DEFAULT_MESSAGE, Controller, Goal
+# Container runs this file directly under -I (no implicit cwd on sys.path):
+# resolve sibling modules from this file's own directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from controller import DEFAULT_MESSAGE, Controller, Goal  # noqa: E402
 
 # Transitional phases worth re-checking right away; stable phases and ERROR wait for the next tick.
 FOLLOWED_PHASES = {"REQUESTED", "DRAINING", "SAVING", "STARTING"}
 
 BUSY = 75
+
+BACKENDS = ("docker", "dokploy")
+
+
+def backend_factory_from_name(name: str | None = None, env=os.environ):
+    """Backend factory for ``--backend`` / BF_WORKSHOP_BACKEND (default docker).
+
+    The container entrypoint passes dokploy; the host CLI keeps docker unless
+    asked. An unknown name fails before any backend is constructed.
+    """
+    which = name or env.get("BF_WORKSHOP_BACKEND", "docker")
+    if which == "dokploy":
+        from dokploy_backend import DokployBackend
+
+        return DokployBackend.from_env
+    if which == "docker":
+        from docker_backend import DockerBackend
+
+        return DockerBackend.from_env
+    raise ValueError(f"unknown workshop backend {which!r} (want one of {BACKENDS})")
+
+
+def build_controller(
+    env=os.environ,
+    backend_factory=None,
+    *,
+    state_dir=None,
+    gate_file=None,
+    public_file=None,
+    admin_dir=None,
+    inbox_dir=None,
+    releases_file=None,
+):
+    """Shared construction for the CLI and the container entry point."""
+    if backend_factory is None:
+        backend_factory = backend_factory_from_name(env=env)
+    directory = Path(
+        state_dir or env.get("BF_STATE_DIR", "/srv/minecraft/workshop/controller")
+    )
+    gate = Path(
+        gate_file or env.get("BF_GATE_FILE", "/srv/minecraft/workshop/gate/gate.json")
+    )
+    public = Path(
+        public_file
+        or env.get("BF_PUBLIC_FILE", "/srv/minecraft/workshop/public/public.json")
+    )
+    for path in (gate, public):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    backend = backend_factory()
+    import releases as release_catalog
+
+    releases_path = (
+        Path(releases_file)
+        if releases_file
+        else Path(env.get("BF_RELEASES_FILE", ""))
+        if env.get("BF_RELEASES_FILE", "")
+        else directory / "releases.json"
+    )
+    controller = Controller(
+        directory,
+        backend,
+        gate_file=gate,
+        public_file=public,
+        message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE),
+        admin_dir=Path(
+            admin_dir or env.get("BF_ADMIN_DIR", "/srv/minecraft/workshop/admin")
+        ),
+        inbox_dir=Path(
+            inbox_dir or env.get("BF_INBOX_DIR", "/srv/minecraft/workshop/inbox")
+        ),
+        start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
+        idle_sleep_s=float(env.get("BF_WORKSHOP_IDLE_SLEEP_S", 900)),
+        maps=_map_store(env, backend),
+        workshop_data_dir=Path(
+            env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")
+        ),
+        releases=release_catalog.load_catalog(releases_path),
+    )
+    if hasattr(backend, "maps"):
+        backend.maps = controller.maps
+    os.chmod(directory, 0o700)
+    return controller, backend
 
 
 def parse_member(text: str) -> dict:
@@ -205,6 +296,13 @@ def main(argv=None, backend_factory=None) -> int:
         help="verified published server releases catalog (JSON); "
         "defaults to <state-dir>/releases.json; missing catalog blocks new selections",
     )
+    parser.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default=env.get("BF_WORKSHOP_BACKEND", "docker"),
+        help="lifecycle backend: docker (host default) or dokploy "
+        "(approved-tag mechanism, used by the container entry point)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     request = commands.add_parser("request").add_subparsers(
         dest="profile", required=True
@@ -299,39 +397,17 @@ def main(argv=None, backend_factory=None) -> int:
 
     try:
         if backend_factory is None:
-            from docker_backend import DockerBackend
-
-            backend_factory = DockerBackend.from_env
-        state_dir = Path(args.state_dir)
-        for path in (Path(args.gate_file), Path(args.public_file)):
-            path.parent.mkdir(parents=True, exist_ok=True)
-        backend = backend_factory()
-        import releases as release_catalog
-
-        releases_path = (
-            Path(args.releases_file)
-            if args.releases_file
-            else state_dir / "releases.json"
+            backend_factory = backend_factory_from_name(args.backend, env)
+        controller, backend = build_controller(
+            env,
+            backend_factory,
+            state_dir=args.state_dir,
+            gate_file=args.gate_file,
+            public_file=args.public_file,
+            admin_dir=args.admin_dir,
+            inbox_dir=args.inbox_dir,
+            releases_file=args.releases_file,
         )
-        controller = Controller(
-            state_dir,
-            backend,
-            gate_file=Path(args.gate_file),
-            public_file=Path(args.public_file),
-            message=env.get("BF_MAINTENANCE_MESSAGE", DEFAULT_MESSAGE),
-            admin_dir=Path(args.admin_dir),
-            inbox_dir=Path(args.inbox_dir),
-            start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
-            idle_sleep_s=float(env.get("BF_WORKSHOP_IDLE_SLEEP_S", 900)),
-            maps=_map_store(env, backend),
-            workshop_data_dir=Path(
-                env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")
-            ),
-            releases=release_catalog.load_catalog(releases_path),
-        )
-        if hasattr(backend, "maps"):
-            backend.maps = controller.maps
-        os.chmod(state_dir, 0o700)
         if args.command == "status":
             result = {"state": controller.status(), "members": controller.members()}
         elif args.command == "target":
