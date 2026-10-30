@@ -1012,15 +1012,25 @@ them — do not copy host templates over them.
 
 ### Step 4b — import dry-run against the copied real state (no approval; before fencing)
 
-Do this before step 5, never after it. Copy the step-1 snapshot's
-`controller/state.json` plus `releases.json` and the admin `session.json`
-into a scratch dir and run the candidate controller build's import offline:
+Do this before step 5, never after it, and never against live paths: every
+path the controller resolves must point into a scratch copy. Copy the step-1
+snapshot's `controller/` (incl. `state.json`), `gate/gate.json`,
+`public/public.json`, the admin dir (incl. `session.json`), `inbox/` and the
+verified `releases.json` into a fresh scratch dir, then run the candidate
+controller build's import with explicit overrides:
 
 ```sh
-workshopctl --backend dokploy request workshop --release <running-release> --session <running-session>
+S=$(mktemp -d /srv/minecraft/workshop-dryrun.XXXXXX)   # scratch copy, removed afterwards
+# ... copy the snapshot files listed above into "$S" ...
+env BF_STATE_DIR="$S/controller" BF_GATE_FILE="$S/gate/gate.json" \
+    BF_PUBLIC_FILE="$S/public/public.json" BF_ADMIN_DIR="$S/admin" \
+    BF_INBOX_DIR="$S/inbox" BF_RELEASES_FILE="$S/releases.json" \
+  workshopctl --backend dokploy request workshop --release <running-release> --session <running-session>
 # expect: revision +1, approvedTarget == activeTarget == running release,
-# selection deferred, phase unchanged; then a sleeping step must keep the
-# phase and must NOT change the Game entry of the copied gate/public exports
+# selection deferred, phase unchanged; then a sleeping step (same env) must keep
+# the phase and must NOT change the Game entry in "$S/gate" / "$S/public".
+# Afterwards confirm the LIVE gate/public/state files are byte-identical to
+# before (sha256), then rm -rf "$S".
 ```
 
 Only when this is green proceed to step 5. Rationale (2026-10-30
