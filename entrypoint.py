@@ -40,6 +40,17 @@ def _positive_float(env, name, default):
     return value
 
 
+def _non_negative_float(env, name, default):
+    """Follow window; 0 disables following, garbage or negative fails fast."""
+    try:
+        value = float(env.get(name, default))
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number of seconds")
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative number of seconds")
+    return value
+
+
 def make_handler(controller_getter, tick_getter):
     class HealthHandler(BaseHTTPRequestHandler):
         server_version = "WorkshopController/1"
@@ -81,7 +92,7 @@ def make_handler(controller_getter, tick_getter):
 def run_loop(controller, stop, env=os.environ):
     """One reconcile pass, then bounded following; returns when stop is set."""
     interval = _positive_float(env, "BF_STEP_INTERVAL_S", 15)
-    follow = _positive_float(env, "BF_STEP_FOLLOW_S", 12)
+    follow = _non_negative_float(env, "BF_STEP_FOLLOW_S", 12)
     poll = _positive_float(env, "BF_STEP_POLL_S", 2)
     while not stop.is_set():
         tick = time.time()

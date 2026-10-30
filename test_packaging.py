@@ -152,13 +152,18 @@ class EntrypointIntervalTests(unittest.TestCase):
             {"BF_STEP_INTERVAL_S": "0"},
             {"BF_STEP_INTERVAL_S": "-5"},
             {"BF_STEP_INTERVAL_S": "soon"},
-            {"BF_STEP_FOLLOW_S": "0"},
+            {"BF_STEP_POLL_S": "0"},
             {"BF_STEP_POLL_S": "-1"},
+            {"BF_STEP_FOLLOW_S": "-1"},
+            {"BF_STEP_FOLLOW_S": "soon"},
         ):
             with self.subTest(env=env):
                 with self.assertRaises(ValueError):
                     entrypoint.run_loop(mock.Mock(), stop, env)
         self.assertIsNone(entrypoint.run_loop(mock.Mock(), stop, {}))
+        self.assertIsNone(
+            entrypoint.run_loop(mock.Mock(), stop, {"BF_STEP_FOLLOW_S": "0"})
+        )
 
 
 class BackendWiringTests(unittest.TestCase):
