@@ -1,16 +1,15 @@
 """Workshop lifecycle without docker.sock or a Dokploy API token.
 
-Mechanism (owner decision 2026-10-30): the Workshop Dokploy app points at a
-fixed GHCR tag (``<repository>:approved``). After the controller verifies a
-published immutable release (see releases.py), this backend triggers a
-workflow_dispatch in the repository that owns the image package, passing the
-verified manifest digest; that workflow retags ``:approved`` with its own
-GITHUB_TOKEN, and the controller polls the workflow run to success before
-triggering the Workshop app's deploy webhook with bounded retry. Start/stop/
-save/status go through direct private-network RCON plus the mod's READY
-file. No docker CLI, no Dokploy API token, no package-scoped registry token:
-the controller holds only a single-repository fine-grained PAT (Actions
-scope) that cannot touch any package directly.
+Mechanism (owner decision 2026-10-30): the server release CI owns the fixed
+GHCR tag (``<repository>:approved``) — it moves the tag to the verified
+release with its own GITHUB_TOKEN after release verification passes, then
+triggers the Workshop app redeploy through the app's Dokploy webhook. This
+backend never moves tags and never calls webhooks: start() only persists the
+verified selection (profile.json) and clears the READY file, while
+save/stop/status go through direct private-network RCON plus the mod's READY
+file. The approved release is read back from the running Workshop (READY +
+selection) for reporting only. No docker CLI, no Dokploy API token, no
+GitHub credentials at all: only the Workshop's own RCON password.
 
 The old DockerBackend stays authoritative (see docs/OPERATIONS.md); this
 module is staged beside it and shares the controller Backend protocol, the
@@ -19,10 +18,8 @@ profile.json selection schema and the READY-file contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
-import re
 import shutil
 import socket
 import struct
@@ -36,14 +33,6 @@ READY_FILE = ".blockfield-ready.json"
 UNKNOWN_SESSION = "00000000-0000-0000-0000-000000000000"
 
 
-class RegistryError(RuntimeError):
-    """Approved-tag move failed; the message never carries a credential."""
-
-
-class WebhookError(RuntimeError):
-    """Deploy webhook trigger failed; the message never carries the URL."""
-
-
 class RconError(RuntimeError):
     """Private-network RCON command failed; never carries the password."""
 
@@ -54,7 +43,7 @@ def read_secret(
     env: str,
     file_env: str,
     what: str,
-    error: type = RegistryError,
+    error: type = RconError,
 ) -> str:
     """Credential from an explicit value, env var or secret file (first line)."""
     if value:
@@ -72,285 +61,6 @@ def read_secret(
         if secret:
             return secret
     raise error(f"{what} credential is not configured")
-
-
-@dataclass
-class HttpResponse:
-    status: int
-    headers: dict
-    body: bytes
-
-
-def http_request(
-    method: str, url: str, headers: dict, body: bytes | None, timeout: float
-) -> HttpResponse:
-    """Default HTTPS transport (stdlib urllib); tests inject a fake."""
-    import urllib.error
-    import urllib.request
-
-    request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as reply:
-            return HttpResponse(
-                reply.status,
-                {k.lower(): v for k, v in reply.headers.items()},
-                reply.read(8 << 20),
-            )
-    except urllib.error.HTTPError as error:
-        return HttpResponse(
-            error.code,
-            {k.lower(): v for k, v in (error.headers or {}).items()},
-            error.read(65536),
-        )
-
-
-def _registry_base(repository: str) -> tuple[str, str]:
-    """Split ghcr.io/<owner>/<image> into (manifest URL base, repository)."""
-    parts = repository.split("/")
-    if (
-        len(parts) == 3
-        and parts[0] == "ghcr.io"
-        and all(part and part not in (".", "..") for part in parts[1:])
-    ):
-        return f"https://ghcr.io/v2/{parts[1]}/{parts[2]}", repository
-    raise ValueError("repository must be ghcr.io/<owner>/<image>")
-
-
-class WorkflowTagMover:
-    """Move a fixed :approved tag via a workflow_dispatch in the image's repo.
-
-    The credential (``token`` / ``BF_WORKSHOP_TAG_TOKEN`` /
-    ``BF_WORKSHOP_TAG_TOKEN_FILE``) is a fine-grained PAT restricted to the
-    single repository that owns the image package, with Actions read/write
-    only (no package, org or other repo scope). move() validates the digest,
-    dispatches the retag workflow with it, then polls the workflow run to
-    success; the workflow itself verifies the digest belongs to a published
-    verified release, retags :approved with its own GITHUB_TOKEN and reads
-    the tag back. Direct registry reads are impossible here (the package is
-    private and fine-grained PATs carry no package scope), so a successful
-    run conclusion is the confirmation. The token travels in one
-    Authorization header per call and never appears in errors or logs.
-    """
-
-    API = "https://api.github.com"
-
-    def __init__(
-        self,
-        repository: str,
-        *,
-        owner_repo: str = "Blockfield/blockfield-server",
-        workflow: str = "move-approved-tag.yml",
-        ref: str = "main",
-        token: str | None = None,
-        http=http_request,
-        timeout: float = 15.0,
-        poll_interval: float = 10.0,
-        confirm_timeout: float = 600.0,
-        dispatch_attempts: int = 3,
-        dispatch_delay: float = 1.0,
-        sleep=time.sleep,
-        clock=time.monotonic,
-    ):
-        _registry_base(repository)  # allowlist shape for digest validation
-        parts = owner_repo.split("/")
-        if len(parts) != 2 or not all(
-            part and part not in (".", "..") for part in parts
-        ):
-            raise ValueError("tag workflow needs <owner>/<repo>")
-        if dispatch_attempts < 1:
-            raise ValueError("dispatch needs at least one attempt")
-        self.repository = repository
-        self.owner_repo = owner_repo
-        self.workflow = workflow
-        self.ref = ref
-        self._token = read_secret(
-            value=token,
-            env="BF_WORKSHOP_TAG_TOKEN",
-            file_env="BF_WORKSHOP_TAG_TOKEN_FILE",
-            what="tag workflow",
-        )
-        self._http = http
-        self.timeout = timeout
-        self.poll_interval = poll_interval
-        self.confirm_timeout = confirm_timeout
-        self.dispatch_attempts = dispatch_attempts
-        self.dispatch_delay = dispatch_delay
-        self._sleep = sleep
-        self._clock = clock
-
-    def _call(self, method: str, path: str, body: bytes | None = None) -> HttpResponse:
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {self._token}",
-        }
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-        try:
-            return self._http(
-                method,
-                f"{self.API}/repos/{self.owner_repo}{path}",
-                headers,
-                body,
-                self.timeout,
-            )
-        except Exception as error:
-            raise RegistryError(
-                f"tag workflow {method} failed: {type(error).__name__}"
-            ) from error
-
-    def _dispatch(self, digest: str, nonce: str) -> None:
-        """POST the dispatch; retry transport errors/5xx, fail fast on 4xx."""
-        body = json.dumps(
-            {"ref": self.ref, "inputs": {"digest": digest, "nonce": nonce}}
-        ).encode()
-        last: Exception | None = None
-        path = f"/actions/workflows/{self.workflow}/dispatches"
-        for attempt in range(self.dispatch_attempts):
-            try:
-                reply = self._call("POST", path, body)
-            except RegistryError as error:
-                last = error
-                reply = None
-            else:
-                if reply.status == 204:
-                    return
-                if 400 <= reply.status < 500:
-                    raise RegistryError(
-                        f"tag workflow dispatch rejected ({reply.status})"
-                    )
-                last = RegistryError(f"tag workflow dispatch answered ({reply.status})")
-            if attempt + 1 < self.dispatch_attempts:
-                self._sleep(self.dispatch_delay * 2**attempt)
-        raise RegistryError(
-            "tag workflow dispatch failed after "
-            f"{self.dispatch_attempts} attempts: "
-            f"{type(last).__name__ if last else 'unknown'}"
-        ) from last
-
-    def _find_run(self, nonce: str) -> dict | None:
-        """Newest dispatch run carrying our nonce, or None while queued."""
-        reply = self._call(
-            "GET",
-            f"/actions/workflows/{self.workflow}/runs"
-            "?event=workflow_dispatch&per_page=20",
-        )
-        if reply.status != 200:
-            raise RegistryError(f"tag workflow poll failed ({reply.status})")
-        try:
-            runs = json.loads(reply.body).get("workflow_runs", [])
-        except ValueError as error:
-            raise RegistryError("tag workflow status unreadable") from error
-        for run in runs:
-            # The nonce is a fresh uuid4 per move(), so a name match is
-            # unambiguous without comparing clocks.
-            if nonce in str(run.get("name", "")):
-                return run
-        return None
-
-    def move(self, digest: str) -> str:
-        """Point :approved at ``digest`` (``<repo>@sha256:<64hex>``).
-
-        Dispatches the retag workflow and waits for its successful run; the
-        workflow does the actual retag and read-back verification. A
-        re-dispatch of the same digest converges on the same tag. Returns
-        the confirmed ``sha256:<hex>`` digest.
-        """
-        match = re.fullmatch(
-            re.escape(self.repository) + r"@sha256:([0-9a-f]{64})", digest
-        )
-        if match is None:
-            # Never accept :latest, a foreign registry or a bare image ID here.
-            raise ValueError("approved target needs this repository's digest")
-        want = f"sha256:{match.group(1)}"
-        nonce = uuid4().hex
-        self._dispatch(digest, nonce)
-        deadline = self._clock() + self.confirm_timeout
-        while True:
-            run = self._find_run(nonce)
-            if run is not None and run.get("status") == "completed":
-                if run.get("conclusion") == "success":
-                    return want
-                raise RegistryError(f"tag workflow ended: {run.get('conclusion')}")
-            if self._clock() >= deadline:
-                raise RegistryError("tag workflow did not confirm the tag move in time")
-            self._sleep(self.poll_interval)
-
-
-class DeployWebhook:
-    """Trigger the Workshop app's deploy webhook (redeploy only, bounded retry).
-
-    The URL (``url`` / ``BF_WORKSHOP_DEPLOY_WEBHOOK_URL`` /
-    ``BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE``) is a Dokploy-held secret and
-    never appears in errors or logs. Every attempt carries
-    ``Idempotency-Key: <operation id>`` so a retried trigger cannot queue a
-    second deploy.
-    """
-
-    def __init__(
-        self,
-        *,
-        url: str | None = None,
-        http=http_request,
-        attempts: int = 5,
-        delay: float = 1.0,
-        timeout: float = 15.0,
-        sleep=time.sleep,
-    ):
-        if attempts < 1:
-            raise ValueError("webhook needs at least one attempt")
-        self._url = read_secret(
-            value=url,
-            env="BF_WORKSHOP_DEPLOY_WEBHOOK_URL",
-            file_env="BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE",
-            what="deploy webhook",
-            error=WebhookError,
-        )
-        from urllib.parse import urlsplit
-
-        parts = urlsplit(self._url)
-        host = parts.hostname or ""
-        loopback = host == "localhost" or host == "::1" or host.startswith("127.")
-        if parts.scheme != "https" and not (parts.scheme == "http" and loopback):
-            # The secret URL must not cross the wire in cleartext; plain http
-            # is only acceptable for loopback test doubles.
-            raise ValueError("deploy webhook URL must be https")
-        self._http = http
-        self.attempts = attempts
-        self.delay = delay
-        self.timeout = timeout
-        self._sleep = sleep
-
-    def trigger(self, operation_id: str) -> None:
-        """POST the redeploy hook; retry timeouts/5xx, fail fast on 4xx."""
-        body = json.dumps({"operation": operation_id}).encode()
-        last: Exception | None = None
-        for attempt in range(self.attempts):
-            try:
-                reply = self._http(
-                    "POST",
-                    self._url,
-                    {
-                        "Content-Type": "application/json",
-                        "Idempotency-Key": operation_id,
-                    },
-                    body,
-                    self.timeout,
-                )
-            except Exception as error:
-                last = error
-                reply = None
-            else:
-                if 200 <= reply.status < 300:
-                    return
-                if 400 <= reply.status < 500:
-                    raise WebhookError(f"deploy webhook rejected ({reply.status})")
-                last = WebhookError(f"deploy webhook answered ({reply.status})")
-            if attempt + 1 < self.attempts:
-                self._sleep(self.delay * 2**attempt)
-        raise WebhookError(
-            "deploy webhook failed after "
-            f"{self.attempts} attempts: {type(last).__name__ if last else 'unknown'}"
-        ) from last
 
 
 class RconClient:
@@ -475,12 +185,15 @@ class RconClient:
 
 
 class DokployBackend:
-    """Workshop-only lifecycle on the approved-tag mechanism.
+    """Workshop-only lifecycle beside the release-owned approved tag.
 
     Observes the mod's READY file plus an RCON liveness probe (TCP connect,
-    no auth), saves through ``save-all flush``, stops through RCON ``stop``,
-    and (re)starts through tag move + deploy webhook. Never touches Game:
-    observe() reports Workshop/test only, so Game reads as unavailable.
+    no auth), saves through ``save-all flush`` and stops through RCON
+    ``stop``. start() only persists the verified selection and clears the
+    READY file — the :approved rollout itself is the server release CI's
+    job; the approved release is read back from the running Workshop for
+    reporting only. Never touches Game: observe() reports Workshop/test
+    only, so Game reads as unavailable.
     """
 
     def __init__(
@@ -488,8 +201,6 @@ class DokployBackend:
         *,
         data: Path,
         lock_dir: Path,
-        mover: WorkflowTagMover,
-        webhook: DeployWebhook,
         rcon_host: str,
         rcon_port: int,
         rcon_password: str | None = None,
@@ -503,8 +214,6 @@ class DokployBackend:
     ):
         self.data = Path(data)
         self.lock_dir = Path(lock_dir)
-        self.mover = mover
-        self.webhook = webhook
         self.rcon_host = rcon_host
         self.rcon_port = rcon_port
         self.rcon_password = rcon_password
@@ -515,28 +224,16 @@ class DokployBackend:
         self.min_free_bytes = min_free_bytes
         self._sleep = sleep
         self._clock = clock
-        self._webhook_inflight = 0
 
     @classmethod
     def from_env(cls, env=os.environ, **overrides) -> "DokployBackend":
-        """Build from BF_ env; secrets stay in env vars or secret files."""
+        """Build from BF_ env; the secret stays in env vars or secret files."""
         import releases as release_catalog
 
         releases_path = env.get("BF_RELEASES_FILE")
         return cls(
             data=Path(env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")),
             lock_dir=Path(env.get("BF_LOCK_DIR", "/srv/minecraft/backend-lock")),
-            mover=WorkflowTagMover(
-                env.get(
-                    "BF_WORKSHOP_APPROVED_REPOSITORY",
-                    release_catalog.SERVER_REPOSITORY,
-                ),
-                owner_repo=env.get(
-                    "BF_WORKSHOP_TAG_REPO", "Blockfield/blockfield-server"
-                ),
-                workflow=env.get("BF_WORKSHOP_TAG_WORKFLOW", "move-approved-tag.yml"),
-            ),
-            webhook=DeployWebhook(),
             rcon_host=env.get("BF_WORKSHOP_RCON_HOST", "blockfield-workshop"),
             rcon_port=int(env.get("BF_WORKSHOP_RCON_PORT", "25575")),
             releases=release_catalog.load_catalog(
@@ -706,20 +403,16 @@ class DokployBackend:
     def fence_pending_starts(self) -> None:
         """No delayed old request may later start a backend when this returns.
 
-        Webhook triggers complete (bounded retry) before start() returns, so
-        none of ours is in flight here; stop anything still alive and wait
-        until the liveness probe goes quiet. Unknown states raise.
+        Stop anything still alive and wait until the liveness probe goes
+        quiet. Unknown states raise. (A delayed queued Workshop deploy
+        landing after the fence still resurrects java; it then reads as
+        alive-but-unselected and fails closed.)
         """
-        if self._webhook_inflight:
-            raise RuntimeError("a deploy trigger is still in flight")
         if self._alive():
             self._stop_and_wait("cannot fence the workshop backend")
 
     def _operation_id(self, goal: Goal) -> str:
         """Generation for this start; a retry reuses the persisted intent's."""
-        # A retry with a rotated candidate/modeId mints a fresh generation:
-        # safe, the tag move is to the same approved release digest and the
-        # webhook dedupes each generation key convergently.
         try:
             selected = self.selection()
         except (ValueError, TypeError, AttributeError, OSError):
@@ -743,8 +436,14 @@ class DokployBackend:
         return str(uuid4())
 
     def start(self, goal: Goal) -> None:
+        """Persist the verified selection; the :approved rollout is CI's job.
+
+        Only a verified catalog release is accepted (fail-closed selection);
+        the approved release itself is read back from the running Workshop
+        for reporting only (observe()/readiness()).
+        """
         self.preflight(goal)
-        digest = self._digest(goal.release)
+        self._digest(goal.release)
         if goal.profile == "test" and self.maps is not None:
             self.maps.extract(goal.candidate, self.data / "test-candidate")
         document = {
@@ -766,12 +465,5 @@ class DokployBackend:
             0o644,
         )
         (self.data / READY_FILE).unlink(missing_ok=True)
-        # Idempotent rollout: the generation persists in profile.json before
-        # the tag move, so a retried start() reuses it and the webhook dedupes
-        # on the same key across retries, not just within one trigger() call.
-        self.mover.move(digest)
-        self._webhook_inflight += 1
-        try:
-            self.webhook.trigger(document["generation"])
-        finally:
-            self._webhook_inflight -= 1
+        # The generation persists in profile.json first, so a retried
+        # start() for the same goal reuses it instead of minting a new one.
