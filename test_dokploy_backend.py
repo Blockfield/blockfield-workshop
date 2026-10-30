@@ -663,5 +663,65 @@ class LifecycleIntegrationTests(unittest.TestCase):
         self.assertEqual(self.registry.tag, self.digest)
 
 
+class ShadowRunTests(unittest.TestCase):
+    """Read-only shadow: ticks against a sanitized state export with Game off
+    and no java make no registry/webhook call and leave the exported gate and
+    public projections byte-identical once converged; no secret lands on disk."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.data, self.lock = root / "data", root / "lock"
+        self.data.mkdir()
+        (self.lock / "workshop").mkdir(parents=True)
+        self.registry = FakeRegistry()
+        self.webhook = FakeWebhook([200])
+        self.backend = DokployBackend(
+            data=self.data,
+            lock_dir=self.lock,
+            mover=GhcrTagMover(REPO, token=TOKEN, http=self.registry),
+            webhook=DeployWebhook(
+                url=WEBHOOK_URL, http=self.webhook, sleep=lambda s: None
+            ),
+            rcon_host="127.0.0.1",
+            rcon_port=1,  # nothing listens: TCP probe refuses, no auth sent
+            rcon_password=RCON_PASSWORD,
+            releases={RELEASE: release_record()},
+            stop_timeout=1.0,
+            poll=0.01,
+            min_free_bytes=0,
+        )
+        self.controller = Controller(
+            root / "state",
+            self.backend,
+            gate_file=root / "gate.json",
+            public_file=root / "public.json",
+            inbox_dir=root / "inbox",
+            releases={RELEASE: release_record()},
+        )
+
+    def test_shadow_ticks_make_no_external_call(self):
+        (self.controller.inbox_dir).mkdir(parents=True, exist_ok=True)
+        self.controller.process_inbox()
+        first = self.controller.step()
+        gate_once = (self.controller.gate_file).read_bytes()
+        public_once = (self.controller.public_file).read_bytes()
+        for _ in range(3):
+            self.controller.process_inbox()
+            self.controller.step()
+            self.controller.status()
+        self.assertEqual((self.controller.gate_file).read_bytes(), gate_once)
+        self.assertEqual((self.controller.public_file).read_bytes(), public_once)
+        self.assertEqual(self.registry.calls, [])
+        self.assertEqual(self.webhook.calls, [])
+        self.assertEqual(first["phase"], "UNINITIALIZED")
+        for path in (self.controller.directory).rglob("*"):
+            if path.is_file():
+                self.assertNotIn(
+                    RCON_PASSWORD, path.read_text(encoding="utf-8", errors="replace")
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
