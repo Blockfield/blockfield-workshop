@@ -811,10 +811,36 @@ HTTP and a loopback RCON server (tag move, idempotent retry, partial failure, ti
    RCON or reuse the Game password.
 4. Deploy the staged module beside the host controller (`dokploy_backend.py`, `releases.py`) and set
    `BF_WORKSHOP_DATA`, `BF_LOCK_DIR` to the controller's mounted workshop data and lock directories.
-5. Verify on an isolated stand first: approved target from a verified published release only, first contact
+5. Controller application (needs the same owner approval; documented only, NOT created): create a Dokploy
+   application `blockfield-workshop-controller` from the `Dockerfile` in this repository, exactly as
+   `deployment/workshop-controller.compose.example.yaml` describes — fixed `:approved` controller image,
+   managed named volumes only (`controller-state`, `workshop-data`, `controller-locks`, read-only
+   `workshop-templates`/`workshop-published`), no published port, read-only root with `/tmp` tmpfs,
+   dropped capabilities and `no-new-privileges`. Mount the three secret files from step 1–3 into
+   `/run/secrets/` (read-only, 0400) as `deployment/workshop-controller.env.example` maps them. Fresh named
+   volumes inherit the image's UID 1000-owned `/state /data /locks` tree; volumes that already exist must be
+   chowned to 1000:1000 once before the first start. Until the
+   separately approved Workshop data interface (MapStore directories, inbox, projections) is supplied and
+   verified behind those named volumes, keep production on the host controller: packaging evidence alone
+   does not authorize the handover.
+6. Verify on an isolated stand first: approved target from a verified published release only, first contact
    with a live unselected Java fails closed and needs explicit recovery, tag-moved-but-webhook-failed
    continues from the moved tag, and rollback is reverting to the Docker adapter (it remains authoritative;
    no automatic production fallback).
+
+### Container packaging (staged; host controller stays authoritative)
+
+`Dockerfile` pins `python:3.12.14-slim-bookworm` by digest, asserts the exact interpreter plus working
+standard zlib at build time, and runs as UID/GID 1000 with a read-only root. `entrypoint.py` is the
+container's own event loop (inbox polling plus a reconcile step every `BF_STEP_INTERVAL_S`, default 15 s)
+and serves `GET /healthz` on loopback `BF_HEALTH_PORT` (default 8080) with the controller's own state and
+loop tick; a sleeping or absent Game never fails it. `workshopctl.py --backend dokploy`
+(`BF_WORKSHOP_BACKEND`) selects the approved-tag backend; the host default stays `docker`.
+`test_packaging.py` scans the `Dockerfile` and `deployment/workshop-controller.compose.example.yaml` for
+forbidden capabilities (socket, privilege, extra capabilities, host namespaces/binds), and covers backend
+selection, the single-writer lock (`BUSY`) and the Game-off health endpoint. `deployment/docker-verify.sh`
+runs the daemon checks on Boat against synthetic named volumes: non-root state writes, read-only refusal,
+read-only rootfs health, restart preservation and a second writer failing closed.
 
 ## New installation (requires owner approval)
 
