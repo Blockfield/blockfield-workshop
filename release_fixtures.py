@@ -4,7 +4,7 @@ import hashlib
 import json
 
 
-def release_record(release="v1.0.0", digest="a"):
+def release_record(release="v1.0.0", digest="a", client_version="v1.0.0"):
     commit = "1" * 40
     build = {
         "build": release,
@@ -13,7 +13,7 @@ def release_record(release="v1.0.0", digest="a"):
         "minecraft": "1.21.1",
         "fabric": "0.16.14",
         "client": "4" * 64,
-        "client_version": "v1.0.0",
+        "client_version": client_version,
         "compatibility": "5" * 64,
         "sources": {"server": commit},
     }
