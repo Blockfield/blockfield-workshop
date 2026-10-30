@@ -230,6 +230,108 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.gate("game")["gate"], "public")
         self.assertEqual(self.public("game")["mode"], "game")
 
+    def test_error_without_observed_game_preserves_game_entry(self):
+        # Cut-over failure: a container backend never observes the host Game,
+        # so an ERROR export must leave the shared Game entry untouched.
+        self.backend.processes = []
+        self.controller.gate_file.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "revision": 77,
+                    "gate": "public",
+                    "message": "",
+                    "backend": "game",
+                    "allowed": [],
+                    "backends": {
+                        "game": {"gate": "public", "message": "", "allowed": []},
+                        "workshop": {
+                            "gate": "sleeping",
+                            "message": "m",
+                            "allowed": [],
+                        },
+                    },
+                }
+            )
+        )
+        self.controller.public_file.write_text(
+            json.dumps(
+                {
+                    "mode": "game",
+                    "message": "",
+                    "since": 1,
+                    "workshop": {"mode": "sleeping", "message": "m"},
+                }
+            )
+        )
+        self.controller.request(str(uuid4()), self.goal, 0)
+        self.backend.fail_start = True
+        self.assertEqual(self.controller.step()["phase"], "ERROR")
+        self.assertEqual(self.gate("game")["gate"], "public")
+        self.assertEqual(self.public("game")["mode"], "game")
+        self.assertEqual(self.gate()["gate"], "closed")
+
+    def test_legacy_sleeping_error_preserves_game_entry(self):
+        # Prod rev77 shape: sleeping state with desired but no selection
+        # journal; the missing-identity ERROR must not close Game entry.
+        self.backend.processes = []
+        self.controller.gate_file.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "revision": 77,
+                    "gate": "public",
+                    "message": "",
+                    "backend": "game",
+                    "allowed": [],
+                    "backends": {
+                        "game": {"gate": "public", "message": "", "allowed": []},
+                        "workshop": {
+                            "gate": "sleeping",
+                            "message": "m",
+                            "allowed": [],
+                        },
+                    },
+                }
+            )
+        )
+        self.controller.public_file.write_text(
+            json.dumps(
+                {
+                    "mode": "game",
+                    "message": "",
+                    "since": 1,
+                    "workshop": {"mode": "sleeping", "message": "m"},
+                }
+            )
+        )
+        self.controller.file.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "phase": "sleeping",
+                    "gate": "closed",
+                    "operation": str(uuid4()),
+                    "revision": 77,
+                    "desired": {
+                        "profile": "workshop",
+                        "release": "v1.0.0",
+                        "session": self.goal.session,
+                        "candidate": None,
+                    },
+                    "error": None,
+                    "errorMessage": None,
+                    "rollback": None,
+                }
+            )
+        )
+        with self.assertRaisesRegex(
+            ValueError, "missing committed active release identity"
+        ):
+            self.controller.step()
+        self.assertEqual(self.gate("game")["gate"], "public")
+        self.assertEqual(self.public("game")["mode"], "game")
+
     def test_workshop_message_never_replaces_game_unavailable_message(self):
         self.to_workshop()
         self.controller.set_message("Строим новую карту")

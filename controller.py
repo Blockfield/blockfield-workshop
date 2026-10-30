@@ -860,6 +860,30 @@ class Controller:
             raise RuntimeError("multiple full backends of the same app observed")
         return processes, game[0] if game else None, workshop[0] if workshop else None
 
+    def _last_game_entry(self) -> tuple | None:
+        """Game entry of the current gate/public exports; None when missing/invalid."""
+        try:
+            game_gate = json.loads(self.gate_file.read_bytes()[:65536])["backends"][
+                "game"
+            ]
+            public = json.loads(self.public_file.read_bytes()[:65536])
+            if (
+                not isinstance(game_gate, dict)
+                or game_gate.get("gate") not in {"public", "closed"}
+                or public.get("mode") not in {"game", "maintenance"}
+            ):
+                return None
+            return (
+                {
+                    "gate": game_gate["gate"],
+                    "message": game_gate.get("message", ""),
+                    "allowed": game_gate.get("allowed", []),
+                },
+                public["mode"],
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+
     def _export(self, state: dict, *, deadline: int | None = None) -> None:
         """Proxy gate (private ACL) and public site status. Rewritten only when content changes.
 
@@ -872,9 +896,11 @@ class Controller:
             else "closed"
         )
         game_status = {"phase": "UNAVAILABLE", "gate": "closed", "release": None}
+        game_observed = False
         try:
             _, game, workshop = self._observe()
             if game is not None:
+                game_observed = True
                 game_status = {
                     "phase": "game" if game.ready else "STARTING",
                     "gate": "public" if game.ready else "closed",
@@ -914,6 +940,15 @@ class Controller:
             "message": "" if game_status["gate"] == "public" else self.default_message,
             "allowed": [],
         }
+        mode = "game" if game_status["gate"] == "public" else "maintenance"
+        if not game_observed:
+            # Game independence: never close Game entry on the basis of not
+            # seeing Game (container backends do not observe the host Game).
+            # Absence preserves the last export; only a missing or invalid
+            # export fails closed.
+            preserved = self._last_game_entry()
+            if preserved is not None:
+                game_gate, mode = preserved
         gate_doc = {
             "schema": 1,
             "revision": state["revision"],
@@ -922,7 +957,6 @@ class Controller:
             "backends": {"game": game_gate, "workshop": workshop_gate},
         }
         self._replace_if_changed(self.gate_file, gate_doc, keep=())
-        mode = "game" if game_status["gate"] == "public" else "maintenance"
         public = {
             "mode": mode,
             "message": "" if mode == "game" else self.default_message,
@@ -1099,6 +1133,14 @@ class Controller:
                 revision=state["revision"] + 1,
                 previousTarget=state.get("approvedTarget"),
                 approvedTarget=record,
+                # Legacy import: the durable desired goal is the running
+                # selection, so commit its verified identity as active too.
+                activeTarget=(
+                    record
+                    if state.get("activeTarget") is None
+                    and record["release"] == (state.get("desired") or {}).get("release")
+                    else state.get("activeTarget")
+                ),
                 selection={
                     "operation": operation,
                     "revision": state["revision"] + 1,

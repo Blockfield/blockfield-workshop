@@ -296,6 +296,44 @@ class ReleaseSafetyTests(unittest.TestCase):
         self.backend.events.clear()
         return state
 
+    def test_legacy_sleeping_import_commits_running_selection(self):
+        # Failed cut-over shape: a sleeping host state carries desired but no
+        # selection journal. Importing the running release must stage and
+        # commit its verified identity, not fail journal validation.
+        self.backend.processes = []
+        self.controller.file.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "phase": "sleeping",
+                    "gate": "closed",
+                    "operation": str(uuid4()),
+                    "revision": 77,
+                    "desired": {
+                        "profile": "workshop",
+                        "release": "v2.0.0",
+                        "session": self.session,
+                        "candidate": None,
+                    },
+                    "error": None,
+                    "errorMessage": None,
+                    "rollback": None,
+                }
+            )
+        )
+        staged = self.controller.request(
+            str(uuid4()),
+            self.goal("v2.0.0"),
+            77,
+            session={"schema": 1, "id": self.session, "maps": None},
+        )
+        self.assertEqual(staged["revision"], 78)
+        self.assertEqual(staged["approvedTarget"]["release"], "v2.0.0")
+        self.assertEqual(staged["activeTarget"]["release"], "v2.0.0")
+        self.assertTrue(staged["selection"]["deferred"])
+        self.assertEqual(self.controller.step()["phase"], "sleeping")
+        self.assertEqual(self.target()["release"], "v2.0.0")
+
     def test_sleeping_selection_stages_without_waking_or_preflight(self):
         before = self.sleeping()
         session = self.controller.session_file.read_bytes()

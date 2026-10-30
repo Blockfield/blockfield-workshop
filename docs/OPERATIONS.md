@@ -893,6 +893,15 @@ CP; the single-writer rule and the timer/path retirement below do not change.
 4. No in-flight Workshop transition: `status` phase is stable (`workshop`,
    `test` settled, or `sleeping`), no unanswered inbox request, no compensation
    pending. Finish or cancel (`workshopctl cancel`) first.
+5. The controller image contains the 2026-10-30 cut-over fixes (an
+   ERROR/never-ready controller preserves the Game entry of the shared
+   gate/public exports instead of closing Game entry; import of a legacy
+   host state — desired without a selection journal — commits the running
+   release instead of failing `invalid selection journal`). Provenance: a
+   merged workshop commit, CI green — never the pre-fix digest.
+6. The step-4b import dry-run against the copied real state passes (import
+   commits the running release, revision +1, phase unchanged; a sleeping
+   step leaves Game entry public). Fence (step 5) only after it is green.
 
 ### Step 0 — read-only inspection (no approval needed)
 
@@ -1001,6 +1010,34 @@ selected release. Keep the data-interface RO inputs (`workshop-templates`,
 `workshop-published`) exactly as the separately approved provisioning left
 them — do not copy host templates over them.
 
+### Step 4b — import dry-run against the copied real state (no approval; before fencing)
+
+Do this before step 5, never after it, and never against live paths: every
+path the controller resolves must point into a scratch copy. Copy the step-1
+snapshot's `controller/` (incl. `state.json`), `gate/gate.json`,
+`public/public.json`, the admin dir (incl. `session.json`), `inbox/` and the
+verified `releases.json` into a fresh scratch dir, then run the candidate
+controller build's import with explicit overrides:
+
+```sh
+S=$(mktemp -d /srv/minecraft/workshop-dryrun.XXXXXX)   # scratch copy, removed afterwards
+# ... copy the snapshot files listed above into "$S" ...
+env BF_STATE_DIR="$S/controller" BF_GATE_FILE="$S/gate/gate.json" \
+    BF_PUBLIC_FILE="$S/public/public.json" BF_ADMIN_DIR="$S/admin" \
+    BF_INBOX_DIR="$S/inbox" BF_RELEASES_FILE="$S/releases.json" \
+  workshopctl --backend dokploy request workshop --release <running-release> --session <running-session>
+# expect: revision +1, approvedTarget == activeTarget == running release,
+# selection deferred, phase unchanged; then a sleeping step (same env) must keep
+# the phase and must NOT change the Game entry in "$S/gate" / "$S/public".
+# Afterwards confirm the LIVE gate/public/state files are byte-identical to
+# before (sha256), then rm -rf "$S".
+```
+
+Only when this is green proceed to step 5. Rationale (2026-10-30
+cut-over, rolled back): the live import failed with `invalid selection
+journal` on the legacy host state, and the ERROR export closed Game entry
+for ~40 min — both are only diagnosable/fixable before fencing.
+
 ### Step 5 — fence the old writer, enable the new one (root + Dokploy write)
 
 Single-writer rule: at most one controller may hold the lock. Order matters.
@@ -1025,6 +1062,9 @@ downtime.
    operation match the host snapshot.
 2. Wake path: `workshopctl wake` (or inbox `wake` from a builder account)
    starts the same session at the committed digest; `STARTING` → `workshop`.
+   Allow the full modpack boot before any verdict (prod 2026-10-30: deploy →
+   `Readiness written` in the mod log took ~4 min); confirm via the mod log
+   line, not just the controller's view.
 3. Save path: a builder edit + snapshot/export round-trips; session/draft
    checksums survive wake and (if exercised) release change.
 4. Game independence: the Game app task is untouched (same task identity in
