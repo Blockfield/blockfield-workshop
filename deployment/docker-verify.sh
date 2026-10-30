@@ -74,7 +74,7 @@ sleep 10
 docker exec w04ro python3 -I -c 'import urllib.request; assert urllib.request.urlopen("http://127.0.0.1:8081/healthz",timeout=10).status==200; print("ro-rootfs health ok")'
 docker rm -f w04ro >/dev/null
 
-echo "== restart preserves state, second writer fails closed =="
+echo "== restart preserves state, lock held by a sleeper fails the second writer closed =="
 before=$(docker exec w04ctl stat -c %Y /state/admin/members.json)
 docker stop w04ctl >/dev/null
 docker start w04ctl >/dev/null
@@ -83,6 +83,10 @@ after=$(docker exec w04ctl stat -c %Y /state/admin/members.json)
 echo "mtime $before -> $after"
 test "$before" = "$after"
 docker exec w04ctl python3 -I -c 'import urllib.request; assert urllib.request.urlopen("http://127.0.0.1:8080/healthz",timeout=10).status==200; print("post-restart health ok")'
+# Hold /state/controller.lock so the second writer is deterministically
+# contended: it must exit BUSY (75), never silently succeed (0).
+docker exec -d w04ctl python3 -I -c 'import fcntl,time; fd=open("/state/controller.lock","w"); fcntl.flock(fd, fcntl.LOCK_EX); time.sleep(60)' >/dev/null
+sleep 2
 code=0
 docker run --rm -v w04state:/state -v w04data:/data -v w04locks:/locks \
     -v "$SECRETS/ghcr-package-token:/run/secrets/ghcr-package-token:ro" \
@@ -95,7 +99,7 @@ docker run --rm -v w04state:/state -v w04data:/data -v w04locks:/locks \
     --entrypoint python3 "$IMAGE" -I /app/workshopctl.py \
     --backend dokploy --state-dir /state step >/dev/null 2>/tmp/w04-second-writer.err || code=$?
 echo "second-writer exit=$code"
-test "$code" = "0" || test "$code" = "75"
+test "$code" = "75"
 
 echo "== cleanup =="
 docker rm -f w04ctl >/dev/null

@@ -86,6 +86,8 @@ volumes:
   workshop-published: {}
 
 secrets:
+  # Compose-client-side file resolution is docs-only here: verify at W07
+  # creation time that Dokploy actually supports secret-file mounts.
   ghcr-package-token:
     file: /etc/blockfield/ghcr-package-token
   workshop-deploy-webhook-url:

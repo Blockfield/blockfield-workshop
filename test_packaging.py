@@ -22,12 +22,16 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent
 DOCKERFILE = ROOT / "Dockerfile"
 COMPOSE = ROOT / "deployment" / "workshop-controller.compose.example.yaml"
+ENV_EXAMPLE = ROOT / "deployment" / "workshop-controller.env.example"
+VERIFY_SCRIPT = ROOT / "deployment" / "docker-verify.sh"
 
 # Forbidden on any effective (non full-line comment) line of the packaging
 # files: no socket, privilege, extra capability, host namespace or host path.
+# YAML 1.1 also accepts True/YES/on as true, so the privilege match is
+# case-insensitive (compiled with IGNORECASE at the use site).
 FORBIDDEN = (
     r"docker\.sock",
-    r"privileged\s*:\s*true",
+    r"privileged\s*:\s*(true|yes|on)\b",
     r"cap_add",
     r"network_mode\s*:\s*[\"']?host",
     r"\bpid\s*:\s*[\"']?host",
@@ -51,14 +55,39 @@ def effective_lines(path):
 
 class PackagingScanTests(unittest.TestCase):
     def test_no_forbidden_capability(self):
-        for path in (DOCKERFILE, COMPOSE):
+        for path in (DOCKERFILE, COMPOSE, ENV_EXAMPLE):
             with self.subTest(path=path.name):
                 for lineno, line in enumerate(effective_lines(path), 1):
                     for pattern in FORBIDDEN:
                         self.assertIsNone(
-                            re.search(pattern, line),
+                            re.search(pattern, line, re.IGNORECASE),
                             f"{path.name}:{lineno}: forbidden {pattern!r}: {line!r}",
                         )
+
+    def test_boat_verify_script_has_no_host_escape(self):
+        """docker-verify.sh runs docker on Boat: no socket, privilege, host
+        net/pid, or host-path bind beyond the temp secrets dir. Named data
+        volumes must stay synthetic (w04*); the $SECRETS binds are the only
+        client-side paths and carry dummy values."""
+        text = VERIFY_SCRIPT.read_text(encoding="utf-8")
+        for pattern in (
+            r"docker\.sock",
+            r"privileged",
+            r"--cap-add",
+            r"--network\s+host",
+            r"--pid\s+host",
+            r"--ipc\s+host",
+            r"/proc",
+            r"/sys",
+        ):
+            self.assertIsNone(
+                re.search(pattern, text), f"docker-verify.sh: {pattern!r}"
+            )
+        for source in re.findall(r'-v\s+"?([^"\s:]+):', text):
+            self.assertTrue(
+                re.fullmatch(r"w04[a-z]*", source) or source.startswith("$SECRETS/"),
+                f"docker-verify.sh binds a non-synthetic volume: {source!r}",
+            )
 
     def test_volumes_are_named_only(self):
         entries = [
@@ -110,6 +139,31 @@ class PackagingScanTests(unittest.TestCase):
             self.assertIsNone(
                 re.search(pattern, text, re.M), f"entrypoint.py: {pattern!r}"
             )
+
+
+class EntrypointIntervalTests(unittest.TestCase):
+    def test_bad_step_interval_fails_fast(self):
+        """Zero/garbage step tuning must fail at startup, never hot-loop."""
+        import entrypoint
+
+        stop = threading.Event()
+        stop.set()
+        for env in (
+            {"BF_STEP_INTERVAL_S": "0"},
+            {"BF_STEP_INTERVAL_S": "-5"},
+            {"BF_STEP_INTERVAL_S": "soon"},
+            {"BF_STEP_POLL_S": "0"},
+            {"BF_STEP_POLL_S": "-1"},
+            {"BF_STEP_FOLLOW_S": "-1"},
+            {"BF_STEP_FOLLOW_S": "soon"},
+        ):
+            with self.subTest(env=env):
+                with self.assertRaises(ValueError):
+                    entrypoint.run_loop(mock.Mock(), stop, env)
+        self.assertIsNone(entrypoint.run_loop(mock.Mock(), stop, {}))
+        self.assertIsNone(
+            entrypoint.run_loop(mock.Mock(), stop, {"BF_STEP_FOLLOW_S": "0"})
+        )
 
 
 class BackendWiringTests(unittest.TestCase):

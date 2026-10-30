@@ -795,9 +795,15 @@ the tag already moved and the webhook dedupes on the generation key; verificatio
 a mismatch. Credentials travel in single headers and never appear in errors or logs. Game is never managed:
 with this backend Game reads as unavailable. Covered by `test_dokploy_backend.py` against fake registry/webhook
 HTTP and a loopback RCON server (tag move, idempotent retry, partial failure, timeouts, wrong digest).
-Follow-ups before handover: prove RCON framing against a real Java on the isolated Workshop stand (W06), not just
-the fake server. Fencing cannot cancel a deploy already queued in Dokploy: a delayed queued deploy landing after
-the RCON fence resurrects java, which then reads as alive-but-unselected and fails closed (explicit recovery).
+
+RCON framing is proven against a real Java on the isolated stand (W06): vanilla answers every command packet
+under its id and the empty drain marker with error text under its own id, never an empty echo, so the client
+terminates a command on a re-auth fence reply (id 2, no game effect) instead of an empty body, and `stop()` /
+`fence_pending_starts()` treat a dying reply path as success once liveness goes dark (a mid-shutdown
+`ConnectionResetError` no longer fails the stop). `test_dokploy_backend.py` FakeRconServer emulates this
+vanilla behavior. Fencing cannot cancel a deploy already queued in Dokploy: a delayed queued deploy landing
+after the RCON fence resurrects java, which then reads as alive-but-unselected and fails closed
+(explicit recovery).
 
 ### One-time production setup (requires explicit owner approval — NOT performed)
 
