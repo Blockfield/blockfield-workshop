@@ -117,7 +117,11 @@ class FakeWebhook:
 
 
 class FakeRconServer(threading.Thread):
-    """Loopback Source RCON server: canned outputs, optional stop-to-dark."""
+    """Loopback Source RCON server with vanilla framing: canned outputs,
+    optional stop-to-dark, and an error-text reply (never an empty echo)
+    to the empty drain marker."""
+
+    VANILLA_DRAIN_ERROR = b"Unknown or incomplete command, see below for error<--[HERE]"
 
     def __init__(
         self,
@@ -211,16 +215,25 @@ class FakeRconServer(threading.Thread):
                 while True:
                     (size,) = struct.unpack("<i", self.read_exact(conn, 4))
                     payload = self.read_exact(conn, size)
-                    _rid, _kind = struct.unpack("<ii", payload[:8])
+                    rid, kind = struct.unpack("<ii", payload[:8])
+                    if kind == 3:
+                        # Re-auth fence: always answered, no game effect.
+                        if payload[8:-2].decode() != self.password:
+                            conn.sendall(self.packet(-1, b""))
+                        else:
+                            conn.sendall(self.packet(rid, b""))
+                        continue
                     words = payload[8:-2].decode()
                     if words == "":
-                        continue  # trailing drain marker, not a command
+                        # Vanilla answers the empty drain marker with error
+                        # text under its own id, never an empty echo.
+                        conn.sendall(self.packet(rid, self.VANILLA_DRAIN_ERROR))
+                        continue
                     self.commands.append(words)
                     if words in self.mute_commands:
                         threading.Event().wait(30)
                         return
-                    conn.sendall(self.packet(1, self.outputs.get(words, b"")))
-                    conn.sendall(self.packet(1, b""))
+                    conn.sendall(self.packet(rid, self.outputs.get(words, b"")))
                     if words == "stop" and self.stop_closes:
                         self.go_dark()
                         return

@@ -319,8 +319,12 @@ class RconClient:
         self.timeout = timeout
         self._socket: socket.socket | None = None
 
-    def _packet(self, kind: int, body: bytes) -> bytes:
-        return struct.pack("<iii", 4 + 4 + len(body) + 2, 1, kind) + body + b"\x00\x00"
+    def _packet(self, request_id: int, kind: int, body: bytes) -> bytes:
+        return (
+            struct.pack("<iii", 4 + 4 + len(body) + 2, request_id, kind)
+            + body
+            + b"\x00\x00"
+        )
 
     def _read_exact(self, count: int) -> bytes:
         assert self._socket is not None
@@ -347,7 +351,7 @@ class RconClient:
                 (self.host, self.port), timeout=self.timeout
             )
             self._socket.settimeout(self.timeout)
-            self._socket.sendall(self._packet(3, self._password.encode()))
+            self._socket.sendall(self._packet(1, 3, self._password.encode()))
             request_id, _ = self._read_packet()
         except RconError:
             self.close()
@@ -360,21 +364,30 @@ class RconClient:
             raise RconError("RCON rejected the password")
 
     def command(self, *words: str) -> str:
-        """Run one trusted console command; at most 64 response packets."""
+        """Run one trusted console command; at most 64 response packets.
+
+        The command goes out under request id 1, followed by a re-auth
+        fence under id 2. A real Java answers every command packet under
+        its own id and the fence with an empty body, but never echoes an
+        empty drain marker (it answers the empty command with error text
+        instead), so the fence reply marks the end of the output.
+        """
         if self._socket is None:
             self.connect()
         try:
             assert self._socket is not None
-            self._socket.sendall(self._packet(2, " ".join(words).encode()))
-            self._socket.sendall(self._packet(2, b""))
+            self._socket.sendall(self._packet(1, 2, " ".join(words).encode()))
+            self._socket.sendall(self._packet(2, 3, self._password.encode()))
             parts = []
             for _ in range(64):
                 request_id, body = self._read_packet()
                 if request_id == -1:
                     raise RconError("RCON session was refused mid-command")
-                if body == b"":
-                    # The trailing empty packet echoes back once output drained.
+                if request_id == 2:
+                    # Fence reply: output drained, fence itself has no output.
                     break
+                if request_id != 1:
+                    raise RconError("RCON answered with an unknown request id")
                 parts.append(body)
             else:
                 raise RconError("RCON flooded the response budget")
@@ -606,17 +619,27 @@ class DokployBackend:
         if "Saved the game" not in result:
             raise RuntimeError(f"save-all did not confirm success: {result[:300]}")
 
+    def _stop_and_wait(self, timeout_message: str) -> None:
+        """RCON stop, then wait dark. Shutdown tears down the reply path, so
+        a mid-command RCON error only matters if the backend stays alive;
+        connect/auth errors still raise immediately."""
+        error: RconError | None = None
+        with self._rcon() as rcon:
+            try:
+                rcon.command("stop")
+            except RconError as exc:
+                error = exc
+        deadline = self._clock() + self.stop_timeout
+        while self._alive():
+            if self._clock() >= deadline:
+                raise TimeoutError(timeout_message) from error
+            self._sleep(self.poll)
+
     def stop(self, process: Process) -> None:
         if process.goal.profile == "game":
             raise ValueError("Workshop controller cannot save or stop Game")
         self.save_and_freeze(process)
-        with self._rcon() as rcon:
-            rcon.command("stop")
-        deadline = self._clock() + self.stop_timeout
-        while self._alive():
-            if self._clock() >= deadline:
-                raise TimeoutError("workshop still running after RCON stop")
-            self._sleep(self.poll)
+        self._stop_and_wait("workshop still running after RCON stop")
 
     def fence_pending_starts(self) -> None:
         """No delayed old request may later start a backend when this returns.
@@ -628,13 +651,7 @@ class DokployBackend:
         if self._webhook_inflight:
             raise RuntimeError("a deploy trigger is still in flight")
         if self._alive():
-            with self._rcon() as rcon:
-                rcon.command("stop")
-        deadline = self._clock() + self.stop_timeout
-        while self._alive():
-            if self._clock() >= deadline:
-                raise TimeoutError("cannot fence the workshop backend")
-            self._sleep(self.poll)
+            self._stop_and_wait("cannot fence the workshop backend")
 
     def _operation_id(self, goal: Goal) -> str:
         """Generation for this start; a retry reuses the persisted intent's."""
