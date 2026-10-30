@@ -1,5 +1,7 @@
 """Real controller session preparation and offline imports, without starting a backend."""
 
+from release_fixtures import catalog
+
 import json
 import tempfile
 import time
@@ -60,8 +62,9 @@ class WorkshopSessionTests(unittest.TestCase):
             self.backend,
             maps=self.store,
             admin_dir=self.root / "admin",
+            releases=catalog(),
         )
-        self.controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
         self.controller.step()
         self.backend.ready(Goal(**self.controller.status()["desired"]))
         self.controller.step()
@@ -72,7 +75,7 @@ class WorkshopSessionTests(unittest.TestCase):
         session = {"schema": 1, "id": copy_id, "maps": maps}
         self.controller.request(
             str(uuid4()),
-            Goal("workshop", "v1", copy_id),
+            Goal("workshop", "v1.0.0", copy_id),
             self.controller.status()["revision"],
             session=session,
         )
@@ -99,7 +102,7 @@ class WorkshopSessionTests(unittest.TestCase):
         region.write_bytes(b"draft edit")
         self.make_ready()
         self.controller.request(
-            str(uuid4()), Goal("game", "v1"), self.controller.status()["revision"]
+            str(uuid4()), Goal("game", "v1.0.0"), self.controller.status()["revision"]
         )
         self.make_ready()
         self.request(copy_id=copy_id)
@@ -285,6 +288,7 @@ class GitInboxTests(unittest.TestCase):
             maps=self.store,
             admin_dir=self.root / "admin",
             inbox_dir=self.inbox,
+            releases=catalog(),
         )
         self.builder = {"draslId": "b" * 32, "name": "Builder"}
         self.admin = {"draslId": "a" * 32, "name": "Admin"}
@@ -616,7 +620,9 @@ class GitInboxTests(unittest.TestCase):
         self.assertEqual(
             self.store.versions.branch("arena", self.branch)["versionDigest"], head
         )
-        other = Controller(self.root / "state", self.backend, maps=self.store)
+        other = Controller(
+            self.root / "state", self.backend, maps=self.store, releases=catalog()
+        )
 
         @contextmanager
         def concurrent():
@@ -777,7 +783,7 @@ class GitInboxTests(unittest.TestCase):
         )
         self.controller.request(
             str(uuid4()),
-            Goal("workshop", "v1", selected["id"]),
+            Goal("workshop", "v1.0.0", selected["id"]),
             state["revision"],
             session=selected,
         )
@@ -786,34 +792,36 @@ class GitInboxTests(unittest.TestCase):
         self.assertEqual((next_copy / "world/region/r.0.0.mca").read_bytes(), b"arena")
         self.assertEqual(self.controller.session()["branches"], {"arena": "other"})
 
-    def test_failed_release_follow_restores_original_branches_and_edited_bytes(self):
+    def test_game_release_change_preserves_branches_and_draft_bytes(self):
+        # Game rollouts never retarget Workshop: branches and unsaved drafts
+        # survive; only an explicit operation selects another release.
         original = self.controller.session_file.read_bytes()
         self.region.write_bytes(b"preserved draft")
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
         self.backend.fail_start = True
-        self.assertEqual(self.controller.step()["phase"], "ERROR")
-        self.backend.fail_start = False
-        old_game = Process(Goal("game", "v1"), True)
-        self.backend.processes[0] = old_game
         state = self.controller.step()
-        self.assertEqual(state["phase"], "STARTING")
-        self.assertEqual(state["desired"]["release"], "v1")
+        self.assertEqual(state["phase"], "workshop")
+        self.assertIsNone(state.get("releaseFollow"))
         self.assertEqual(self.controller.session_file.read_bytes(), original)
         self.assertEqual(self.region.read_bytes(), b"preserved draft")
-        self.assertIn(old_game, self.backend.processes)
+        self.assertIn(Process(Goal("game", "v2.0.0"), True), self.backend.processes)
+        self.backend.fail_start = False
         self.make_ready()
         self.assertEqual(self.controller.status()["gate"], "builders")
 
-    def test_corrupt_copy_prevents_release_rollback_before_fence_or_start(self):
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
+    def test_explicit_release_change_needs_recovery_after_failed_start(self):
         self.backend.fail_start = True
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v2.0.0", self.session["id"]),
+            self.controller.status()["revision"],
+        )
         self.assertEqual(self.controller.step()["phase"], "ERROR")
-        (self.copy / "manifest.json").write_text("{}")
-        self.backend.processes[0] = Process(Goal("game", "v1"), True)
+        self.backend.fail_start = False
         events = list(self.backend.events)
         state = self.controller.step()
         self.assertEqual(state["phase"], "ERROR")
-        self.assertIsNone(state["releaseFollow"])
+        self.assertIsNone(state.get("releaseFollow"))
         self.assertEqual(self.backend.events, events)
 
     def new_session(self):
@@ -822,7 +830,7 @@ class GitInboxTests(unittest.TestCase):
         )
         self.controller.request(
             str(uuid4()),
-            Goal("workshop", "v1", selected["id"]),
+            Goal("workshop", "v1.0.0", selected["id"]),
             self.controller.status()["revision"],
             session=selected,
         )
@@ -911,7 +919,7 @@ class GitInboxTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already bound"):
             self.controller.request(
                 str(uuid4()),
-                Goal("workshop", "v1", self.session["id"]),
+                Goal("workshop", "v1.0.0", self.session["id"]),
                 before["revision"],
                 session={
                     "schema": 1,

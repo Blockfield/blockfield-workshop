@@ -1,9 +1,10 @@
 """Workshop deadlines and rollback leave the independently running Game untouched."""
 
+from release_fixtures import catalog
+
 import json
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
 from uuid import uuid4
 
@@ -29,10 +30,14 @@ class TimeoutTests(unittest.TestCase):
         self.dir = Path(temporary.name)
         self.backend = FakeBackend()
         self.clock = Clock()
-        self.editor = Goal("workshop", "v1", str(uuid4()))
-        self.test = Goal("test", "v1", self.editor.session, "a" * 64)
+        self.editor = Goal("workshop", "v1.0.0", str(uuid4()))
+        self.test = Goal("test", "v1.0.0", self.editor.session, "a" * 64)
         self.controller = Controller(
-            self.dir, self.backend, now=self.clock, start_timeout=100
+            self.dir,
+            self.backend,
+            now=self.clock,
+            start_timeout=100,
+            releases=catalog(),
         )
 
     def stable_editor(self):
@@ -50,14 +55,18 @@ class TimeoutTests(unittest.TestCase):
     def test_game_restart_is_observed_without_interrupting_editor(self):
         self.stable_editor()
         events = list(self.backend.events)
-        self.backend.processes[0] = Process(Goal("game", "v2"), False)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), False)
         self.assertEqual(self.controller.step()["phase"], "workshop")
         self.clock.advance(101)
         self.backend.processes = [
             p for p in self.backend.processes if p.goal.profile != "game"
         ]
         restarted = Controller(
-            self.dir, self.backend, now=self.clock, start_timeout=100
+            self.dir,
+            self.backend,
+            now=self.clock,
+            start_timeout=100,
+            releases=catalog(),
         )
         self.assertEqual(restarted.step()["phase"], "workshop")
         self.assertEqual(self.backend.events, events)
@@ -90,7 +99,11 @@ class TimeoutTests(unittest.TestCase):
         self.clock.advance(101)
         self.assertEqual(self.controller.step()["phase"], "STARTING")
         restarted = Controller(
-            self.dir, self.backend, now=self.clock, start_timeout=100
+            self.dir,
+            self.backend,
+            now=self.clock,
+            start_timeout=100,
+            releases=catalog(),
         )
         self.assertEqual(restarted.step()["phase"], "STARTING")
         self.assertEqual(self.backend.events, ["start"])
@@ -125,8 +138,8 @@ class TimeoutTests(unittest.TestCase):
         self.start_test()
         self.backend.ready(self.test)
         self.controller.step()
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
-        editor = Goal("workshop", "v2", str(uuid4()))
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
+        editor = Goal("game", "v2.0.0")
         self.controller.request(
             str(uuid4()), editor, self.controller.status()["revision"]
         )
@@ -146,7 +159,7 @@ class TimeoutTests(unittest.TestCase):
 
     def test_duplicate_game_fails_closed_without_stopping_it(self):
         self.stable_editor()
-        self.backend.processes.append(Process(Goal("game", "v1"), True))
+        self.backend.processes.append(Process(Goal("game", "v1.0.0"), True))
         events = list(self.backend.events)
         state = self.controller.step()
         self.assertEqual(state["phase"], "ERROR")
@@ -163,130 +176,77 @@ class TimeoutTests(unittest.TestCase):
         self.assertTrue(state["errorMessage"])
         self.backend.fail_save = False
         self.controller.request(
-            str(uuid4()), Goal("game", "v1"), state["revision"], recover=True
+            str(uuid4()), Goal("game", "v1.0.0"), state["revision"], recover=True
         )
         state = self.controller.step(recover=True)
         self.assertEqual(state["phase"], "workshop")
         self.assertIsNone(state["errorMessage"])
         self.assertEqual(self.backend.processes[0].goal.profile, "game")
 
-    def follow_release(self, *, fail_start=False):
+    def test_game_release_change_never_stages_fences_or_follows(self):
+        # Retired: Workshop selection never tracks the running Game. A Game
+        # rollout, stop or absence leaves the approved target alone and
+        # creates no follow record.
         self.stable_editor()
-        self.session_bytes = self.controller.session_file.read_bytes()
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
-        self.backend.fail_start = fail_start
-        return self.controller.step()
-
-    def fence_workshop(self):
-        self.backend.events.append("fence")
+        events = list(self.backend.events)
+        self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
+        state = self.controller.step()
+        self.assertEqual(
+            (state["phase"], state["desired"]["release"]), ("workshop", "v1.0.0")
+        )
+        self.assertIsNone(state.get("releaseFollow"))
+        self.assertEqual(self.backend.events, events)
         self.backend.processes = [
-            p for p in self.backend.processes if p.goal.profile == "game"
+            p for p in self.backend.processes if p.goal.profile != "game"
         ]
+        offline = self.controller.step()
+        self.assertEqual(
+            (offline["phase"], offline["desired"]["release"]), ("workshop", "v1.0.0")
+        )
+        self.assertEqual(self.backend.events, events)
 
-    def test_failed_automatic_follow_restores_exact_session_after_game_rollback(self):
-        failed = self.follow_release(fail_start=True)
-        self.assertEqual(failed["phase"], "ERROR")
-        self.assertEqual(failed["releaseFollow"]["previous"]["release"], "v1")
-        self.backend.fail_start = False
-        old_game = Process(Goal("game", "v1"), True)
-        self.backend.processes[0] = old_game
-        self.backend.fence_pending_starts = self.fence_workshop
-        restarted = Controller(self.dir, self.backend, now=self.clock)
+    def test_staged_target_survives_restart_while_game_is_off(self):
+        self.stable_editor()
+        target_before = self.controller.session_file.read_bytes()
+        self.backend.processes = [
+            p for p in self.backend.processes if p.goal.profile != "game"
+        ]
+        restarted = Controller(
+            self.dir,
+            self.backend,
+            now=self.clock,
+            start_timeout=100,
+            releases=catalog(),
+        )
         state = restarted.step()
-        self.assertEqual(state["phase"], "STARTING")
-        self.assertEqual(state["desired"], failed["releaseFollow"]["previous"])
-        self.assertIsNone(state["releaseFollow"])
-        self.assertIn(old_game, self.backend.processes)
-        self.assertEqual(self.controller.session_file.read_bytes(), self.session_bytes)
-        self.assertEqual(restarted.step()["gate"], "closed")
-        self.backend.ready(self.editor)
-        self.assertEqual(restarted.step()["gate"], "builders")
+        self.assertEqual(
+            (state["phase"], state["desired"]["release"]), ("workshop", "v1.0.0")
+        )
+        self.assertEqual(self.controller.session_file.read_bytes(), target_before)
 
-    def test_pending_automatic_follow_is_fenced_before_rollback_start(self):
-        self.assertEqual(self.follow_release()["phase"], "STARTING")
-        self.backend.processes[0] = Process(Goal("game", "v1"), True)
-        self.backend.fence_pending_starts = self.fence_workshop
-        state = self.controller.step()
-        self.assertEqual(state["phase"], "STARTING")
-        self.assertEqual(state["desired"]["release"], "v1")
-        self.assertEqual(self.backend.events[-2:], ["fence", "start"])
-        self.assertEqual(len(self.backend.processes), 2)
-
-    def test_follow_preflight_failure_is_restorable_without_losing_editor(self):
+    def test_legacy_follow_record_is_ignored_and_never_consumed(self):
+        # States written before live-Game following was retired keep their
+        # releaseFollow bytes, but no step consumes them anymore.
         self.stable_editor()
-        self.backend.processes[0] = Process(Goal("game", "v2"), True)
-        with mock.patch.object(self.backend, "preflight", side_effect=OSError("image")):
-            state = self.controller.step()
-        self.assertEqual(state["phase"], "ERROR")
-        self.assertIsNotNone(state["releaseFollow"])
-        self.assertEqual(self.backend.events, ["start"])
-        self.backend.processes[0] = Process(Goal("game", "v1"), True)
-        self.backend.fence_pending_starts = self.fence_workshop
-        self.assertEqual(self.controller.step()["desired"]["release"], "v1")
-
-    def test_rollback_requires_ready_game_at_exact_previous_release(self):
-        self.follow_release(fail_start=True)
-        events = list(self.backend.events)
-        for game in (
-            Process(Goal("game", "v1"), False),
-            Process(Goal("game", "v3"), True),
-        ):
-            self.backend.processes[0] = game
-            self.assertEqual(self.controller.step()["phase"], "ERROR")
-            self.assertEqual(self.backend.events, events)
-
-    def test_changed_session_prevents_rollback_and_consumes_automatic_retry(self):
-        self.follow_release(fail_start=True)
-        selected = self.controller.session()
-        selected["maps"] = ["changed"]
-        self.controller._save_session(selected)
-        self.backend.processes[0] = Process(Goal("game", "v1"), True)
-        events = list(self.backend.events)
-        state = self.controller.step()
-        self.assertEqual(state["phase"], "ERROR")
-        self.assertIn("exact original", state["errorMessage"])
-        self.assertIsNone(state["releaseFollow"])
-        self.assertEqual(self.backend.events, events)
-        self.controller.session_file.write_bytes(self.session_bytes)
-        self.assertEqual(self.controller.step()["phase"], "ERROR")
-        self.assertEqual(self.backend.events, events)
-
-    def test_failed_rollback_preflight_requires_manual_recovery(self):
-        self.follow_release(fail_start=True)
-        self.backend.processes[0] = Process(Goal("game", "v1"), True)
-        events = list(self.backend.events)
-        with mock.patch.object(self.backend, "preflight", side_effect=OSError("disk")):
-            state = self.controller.step()
-        self.assertEqual(state["phase"], "ERROR")
-        self.assertIsNone(state["releaseFollow"])
-        self.assertEqual(self.backend.events, events)
-        self.assertEqual(self.controller.step()["phase"], "ERROR")
-        self.assertEqual(self.backend.events, events)
-
-    def test_unrelated_error_is_never_recovered_by_game_rollback(self):
-        self.stable_editor()
-        self.backend.fail_save = True
-        self.start_test()
-        events = list(self.backend.events)
-        self.assertEqual(self.controller.step()["phase"], "ERROR")
-        self.assertEqual(self.backend.events, events)
-
-    def test_corrupt_workshop_selection_prevents_automatic_rollback_fence(self):
-        self.follow_release()
-        self.backend.processes = [
-            Process(Goal("game", "v1"), True),
-            Process(Goal("workshop", "unknown", self.editor.session), False),
-        ]
-        events = list(self.backend.events)
-        state = self.controller.step()
-        self.assertEqual(state["phase"], "ERROR")
-        self.assertIsNone(state["releaseFollow"])
-        self.assertEqual(self.backend.events, events)
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v2.0.0", self.editor.session),
+            self.controller.status()["revision"],
+        )
+        state = json.loads(self.controller.file.read_text())
+        previous = dict(state["desired"])
+        previous["release"] = "v1.0.0"
+        state["releaseFollow"] = {"previous": previous, "sessionDigest": "0" * 64}
+        self.controller.file.write_text(json.dumps(state))
+        stepped = self.controller.step()
+        self.assertEqual(stepped["desired"]["release"], "v2.0.0")
+        self.assertEqual(stepped["phase"], "STARTING")
+        self.assertEqual(stepped["releaseFollow"]["previous"]["release"], "v1.0.0")
 
     def test_malformed_follow_fails_closed_without_overwriting_state(self):
-        self.follow_release(fail_start=True)
+        self.stable_editor()
         state = json.loads(self.controller.file.read_text())
-        state["releaseFollow"]["previous"]["session"] = str(uuid4())
+        state["releaseFollow"] = {"previous": {"profile": "workshop"}}
         self.controller.file.write_text(json.dumps(state))
         original = self.controller.file.read_bytes()
         events = list(self.backend.events)

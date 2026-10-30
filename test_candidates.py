@@ -1,5 +1,7 @@
 """Map candidates: workshop snapshot -> review -> publish/reject -> rollback."""
 
+from release_fixtures import catalog
+
 import json
 import os
 import tempfile
@@ -81,9 +83,11 @@ class CandidateTests(unittest.TestCase):
 
     def test_running_snapshot_keeps_workshop_open_and_holds_saves(self):
         backend = FakeBackend()
-        goal = Goal("workshop", "v1", str(uuid4()))
+        goal = Goal("workshop", "v1.0.0", str(uuid4()))
         backend.ready(goal)
-        control = Controller(self.root / "controller", backend, maps=self.store)
+        control = Controller(
+            self.root / "controller", backend, maps=self.store, releases=catalog()
+        )
         control.request(str(uuid4()), goal, 0)
         self.assertEqual(control.step()["gate"], "builders")
         workshop = backend.processes[-1]
@@ -108,9 +112,11 @@ class CandidateTests(unittest.TestCase):
 
     def test_snapshot_of_a_map_without_draft_does_not_stop_the_workshop(self):
         backend = FakeBackend()
-        goal = Goal("workshop", "v1", str(uuid4()))
+        goal = Goal("workshop", "v1.0.0", str(uuid4()))
         backend.ready(goal)
-        control = Controller(self.root / "controller", backend, maps=self.store)
+        control = Controller(
+            self.root / "controller", backend, maps=self.store, releases=catalog()
+        )
         control.request(str(uuid4()), goal, 0)
         self.assertEqual(control.step()["gate"], "builders")
         for bad in ("dust2", "../konstaxa", None):
@@ -209,9 +215,10 @@ class CandidateTests(unittest.TestCase):
             admin_dir=admin,
             inbox_dir=inbox,
             maps=self.store,
+            releases=catalog(),
         )
         controller.set_members([{**ACTOR, "role": "admin"}])
-        controller.request(str(uuid4()), Goal("game", "v1"), 0)
+        controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
         controller.step()
         controller.backend.ready(Goal(**controller.status()["desired"]))
         controller.step()

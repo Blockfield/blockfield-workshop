@@ -1,5 +1,7 @@
 """Regression tests for uncertain starts and persisted-state validation; no live backend."""
 
+from release_fixtures import catalog
+
 import json
 from pathlib import Path
 import tempfile
@@ -15,8 +17,8 @@ class ReviewTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         self.backend = FakeBackend()
-        self.controller = Controller(self.directory, self.backend)
-        self.goal = Goal("workshop", "v1", str(uuid4()))
+        self.controller = Controller(self.directory, self.backend, releases=catalog())
+        self.goal = Goal("workshop", "v1.0.0", str(uuid4()))
         self.operation = str(uuid4())
         self.controller.request(self.operation, self.goal, 0)
 
@@ -30,7 +32,7 @@ class ReviewTests(unittest.TestCase):
         for _ in range(5):
             self.assertEqual(self.controller.step()["gate"], "closed")
         self.assertEqual(self.backend.events.count("start"), 1)
-        restarted = Controller(self.directory, self.backend)
+        restarted = Controller(self.directory, self.backend, releases=catalog())
         self.assertEqual(restarted.step()["gate"], "closed")
         self.assertEqual(self.backend.events.count("start"), 1)
         self.backend.processes = [Process(self.goal, True)]

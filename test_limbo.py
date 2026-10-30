@@ -1,5 +1,7 @@
 """Limbo derivatives bind one accepted Anvil version; activation never controls the proxy."""
 
+from release_fixtures import catalog
+
 import hashlib
 import json
 import unittest
@@ -240,10 +242,11 @@ class LimboTests(unittest.TestCase):
             maps=self.store,
             admin_dir=self.root / "admin",
             inbox_dir=self.root / "inbox",
+            releases=catalog(),
         )
         with self.assertRaisesRegex(ValueError, "ready workshop"):
             control.export_limbo(version)
-        goal = Goal("workshop", "v1", str(uuid4()))
+        goal = Goal("workshop", "v1.0.0", str(uuid4()))
         backend.processes = [Process(goal, True)]
         control.request(str(uuid4()), goal, 0)
         control.step()

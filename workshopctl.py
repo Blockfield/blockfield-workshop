@@ -3,8 +3,13 @@
 
 workshopctl request workshop --session <uuid> [--release vX.Y.Z]
 workshopctl request game [--release vX.Y.Z] [--recover]
+workshopctl target       # last approved release target (kept while Game is off)
 workshopctl members [draslId:name[:role[:mapId+mapId...]] ...]
 workshopctl step | status | cancel | wake      # step applies the site admin inbox first
+
+
+Workshop --release is a verified published immutable server release from the
+releases catalog (--releases-file, BF_RELEASES_FILE); staging never reads live Game.
 """
 
 from __future__ import annotations
@@ -194,6 +199,12 @@ def main(argv=None, backend_factory=None) -> int:
     parser.add_argument(
         "--inbox-dir", default=env.get("BF_INBOX_DIR", "/srv/minecraft/workshop/inbox")
     )
+    parser.add_argument(
+        "--releases-file",
+        default=env.get("BF_RELEASES_FILE"),
+        help="verified published server releases catalog (JSON); "
+        "defaults to <state-dir>/releases.json; missing catalog blocks new selections",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     request = commands.add_parser("request").add_subparsers(
         dest="profile", required=True
@@ -221,6 +232,7 @@ def main(argv=None, backend_factory=None) -> int:
     )
     commands.add_parser("step")
     commands.add_parser("status")
+    commands.add_parser("target", help="show the last approved Workshop release target")
     commands.add_parser(
         "wake", help="start a sleeping Workshop editor again (idempotent)"
     )
@@ -294,6 +306,13 @@ def main(argv=None, backend_factory=None) -> int:
         for path in (Path(args.gate_file), Path(args.public_file)):
             path.parent.mkdir(parents=True, exist_ok=True)
         backend = backend_factory()
+        import releases as release_catalog
+
+        releases_path = (
+            Path(args.releases_file)
+            if args.releases_file
+            else state_dir / "releases.json"
+        )
         controller = Controller(
             state_dir,
             backend,
@@ -308,12 +327,15 @@ def main(argv=None, backend_factory=None) -> int:
             workshop_data_dir=Path(
                 env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")
             ),
+            releases=release_catalog.load_catalog(releases_path),
         )
         if hasattr(backend, "maps"):
             backend.maps = controller.maps
         os.chmod(state_dir, 0o700)
         if args.command == "status":
             result = {"state": controller.status(), "members": controller.members()}
+        elif args.command == "target":
+            result = {"target": controller.approved_target()}
         elif args.command == "members":
             result = {
                 "members": controller.set_members(
