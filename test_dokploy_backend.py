@@ -1,6 +1,7 @@
-"""DokployBackend against fake GHCR/webhook HTTP and a fake RCON server.
+"""DokployBackend against a fake RCON server.
 
-No docker.sock, no Dokploy API, no network beyond 127.0.0.1 loopback.
+No docker.sock, no Dokploy API, no GitHub credentials, no webhooks:
+no network beyond 127.0.0.1 loopback.
 """
 
 import json
@@ -16,26 +17,8 @@ from uuid import uuid4
 
 from controller import Controller, Goal
 from release_fixtures import release_record as _fixture_record
-from dokploy_backend import (
-    APPROVED_TAG,
-    DeployWebhook,
-    DokployBackend,
-    GhcrTagMover,
-    HttpResponse,
-    RconClient,
-    RconError,
-    RegistryError,
-    WebhookError,
-)
+from dokploy_backend import DokployBackend, RconClient, RconError
 
-REPO = "ghcr.io/blockfield/blockfield-server"
-DIGEST = "sha256:" + "d" * 64
-REF = f"{REPO}@{DIGEST}"
-OTHER_DIGEST = "sha256:" + "e" * 64
-MANIFEST = b'{"schemaVersion":2,"fake":"manifest"}'
-MEDIA = "application/vnd.oci.image.manifest.v1+json"
-TOKEN = "SECRET-PACKAGE-TOKEN"
-WEBHOOK_URL = "https://hooks.example/SEKRIT-hook"
 RCON_PASSWORD = "SECRET-RCON-PASSWORD"
 
 
@@ -46,74 +29,6 @@ def release_record(release=RELEASE, digest="d"):
     # The W02 catalog only resolves fully evidenced published releases;
     # build the record with the shared fixture so preflight accepts it.
     return _fixture_record(release, digest)
-
-
-def seed_registry(registry, record):
-    """Serve the record's real manifest bytes under its verified digest."""
-    digest = record["imageDigest"].split("@", 1)[1]
-    registry.manifests = {digest: (MEDIA, record["source"]["imageManifest"].encode())}
-    return digest
-
-
-class FakeRegistry:
-    """Injectable GHCR transport: manifests by digest, one :approved tag."""
-
-    def __init__(self):
-        self.calls = []
-        self.manifests = {DIGEST: (MEDIA, MANIFEST)}
-        self.tag = None
-        self.sabotage_tag = None
-        self.fail_with = None
-
-    def __call__(self, method, url, headers, body, timeout):
-        self.calls.append((method, url, dict(headers), body))
-        if self.fail_with is not None:
-            raise self.fail_with
-        reference = url.rsplit("/", 1)[-1]
-        if method == "GET" and reference == APPROVED_TAG:
-            if self.tag is None:
-                return HttpResponse(404, {}, b"")
-            _media, content = self.manifests.get(self.tag, (MEDIA, b'{"unknown":true}'))
-            return HttpResponse(
-                200,
-                {"docker-content-digest": self.tag, "content-type": MEDIA},
-                content,
-            )
-        if method == "GET":
-            if reference in self.manifests:
-                media, content = self.manifests[reference]
-                return HttpResponse(
-                    200,
-                    {"docker-content-digest": reference, "content-type": media},
-                    content,
-                )
-            return HttpResponse(404, {}, b"")
-        if method == "PUT" and reference == APPROVED_TAG:
-            for known, (_media, content) in self.manifests.items():
-                if content == body:
-                    self.tag = known
-                    break
-            else:
-                self.tag = "sha256:" + "0" * 64
-            if self.sabotage_tag is not None:
-                self.tag = self.sabotage_tag
-            return HttpResponse(201, {}, b"")
-        raise AssertionError(f"unexpected registry call {method} {url}")
-
-
-class FakeWebhook:
-    """Scripted webhook transport: outcomes are statuses or exceptions."""
-
-    def __init__(self, outcomes=(200,)):
-        self.calls = []
-        self.outcomes = list(outcomes)
-
-    def __call__(self, method, url, headers, body, timeout):
-        self.calls.append((method, url, dict(headers), body))
-        outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
-        if isinstance(outcome, Exception):
-            raise outcome
-        return HttpResponse(outcome, {}, b"{}")
 
 
 class FakeRconServer(threading.Thread):
@@ -261,118 +176,6 @@ class FakeRconServer(threading.Thread):
         self.join(timeout=5)
 
 
-class MoverTests(unittest.TestCase):
-    def setUp(self):
-        self.registry = FakeRegistry()
-
-    def mover(self, **kwargs):
-        return GhcrTagMover(REPO, token=TOKEN, http=self.registry, **kwargs)
-
-    def test_move_verifies_digest_after_put(self):
-        self.assertEqual(self.mover().move(REF), DIGEST)
-        methods = [call[0] for call in self.registry.calls]
-        self.assertEqual(methods, ["GET", "GET", "PUT", "GET"])
-        put = self.registry.calls[2]
-        self.assertEqual(put[3], MANIFEST)
-        # The credential travels in exactly one Authorization header per
-        # call; it must never surface anywhere else (errors, logs).
-        for _method, _url, headers, _body in self.registry.calls:
-            self.assertEqual(headers["Authorization"], f"Bearer {TOKEN}")
-
-    def test_move_is_idempotent_without_extra_put(self):
-        mover = self.mover()
-        mover.move(REF)
-        self.assertEqual(mover.move(REF), DIGEST)
-        puts = [c for c in self.registry.calls if c[0] == "PUT"]
-        self.assertEqual(len(puts), 1)
-
-    def test_wrong_digest_rejected_before_any_call(self):
-        for bad in (
-            "ghcr.io/blockfield/blockfield-server:latest",
-            "ghcr.io/other/server@sha256:" + "f" * 64,
-            "sha256:" + "d" * 64,
-            REF.replace("d", "x"),
-        ):
-            with self.assertRaises(ValueError, msg=bad):
-                self.mover().move(bad)
-        self.assertEqual(self.registry.calls, [])
-
-    def test_tag_moved_but_verification_mismatch_fails(self):
-        self.registry.sabotage_tag = OTHER_DIGEST
-        self.registry.manifests[OTHER_DIGEST] = (MEDIA, b'{"other":true}')
-        with self.assertRaises(RegistryError):
-            self.mover().move(REF)
-
-    def test_registry_timeout_raises_without_credential(self):
-        self.registry.fail_with = TimeoutError("slow")
-        with self.assertRaises(RegistryError) as ctx:
-            self.mover().move(REF)
-        self.assertNotIn(TOKEN, str(ctx.exception))
-
-    def test_missing_credential_lists_no_secret(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(RegistryError) as ctx:
-                GhcrTagMover(REPO, http=self.registry)
-        self.assertNotIn(TOKEN, str(ctx.exception))
-
-
-class WebhookTests(unittest.TestCase):
-    def trigger(self, outcomes, **kwargs):
-        fake = FakeWebhook(outcomes)
-        hook = DeployWebhook(url=WEBHOOK_URL, http=fake, sleep=lambda s: None, **kwargs)
-        return fake, hook
-
-    def test_retry_then_success_sends_idempotency_key(self):
-        fake, hook = self.trigger([TimeoutError("slow"), 500, 200])
-        hook.trigger("op-1")
-        self.assertEqual(len(fake.calls), 3)
-        for _method, _url, headers, body in fake.calls:
-            self.assertEqual(headers["Idempotency-Key"], "op-1")
-            self.assertEqual(json.loads(body), {"operation": "op-1"})
-
-    def test_partial_failure_tag_moved_but_webhook_failed(self):
-        # The rollout leaves :approved moved; the bounded retry gives up here
-        # and the next operation continues from the moved tag (see backend test).
-        _fake, hook = self.trigger([500, 500], attempts=2)
-        with self.assertRaises(WebhookError) as ctx:
-            hook.trigger("op-2")
-        self.assertIn("2 attempts", str(ctx.exception))
-        self.assertNotIn("SEKRIT", str(ctx.exception))
-
-    def test_rejection_fails_fast_without_retry(self):
-        fake, hook = self.trigger([403])
-        with self.assertRaises(WebhookError):
-            hook.trigger("op-3")
-        self.assertEqual(len(fake.calls), 1)
-
-    def test_missing_url_raises_webhook_error(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(WebhookError):
-                DeployWebhook(http=FakeWebhook([200]), sleep=lambda s: None)
-
-    def test_plain_http_url_rejected(self):
-        with self.assertRaises(ValueError):
-            DeployWebhook(
-                url="http://hooks.example/hook",
-                http=FakeWebhook([200]),
-                sleep=lambda s: None,
-            )
-
-    def test_loopback_http_allowed_for_tests(self):
-        DeployWebhook(
-            url="http://127.0.0.1:9/hook", http=FakeWebhook([200]), sleep=lambda s: None
-        )
-
-    def test_backoff_is_bounded(self):
-        delays = []
-        fake = FakeWebhook([500, 500, 200])
-        hook = DeployWebhook(
-            url=WEBHOOK_URL, http=fake, attempts=3, delay=0.5, sleep=delays.append
-        )
-        hook.trigger("op-4")
-        self.assertEqual(delays, [0.5, 1.0])
-
-
 class RconTests(unittest.TestCase):
     def setUp(self):
         self.server = FakeRconServer(outputs={"save-all flush": b"Saved the game"})
@@ -426,20 +229,13 @@ class BackendTests(unittest.TestCase):
         self.data, self.lock = root / "data", root / "lock"
         self.data.mkdir()
         (self.lock / "workshop").mkdir(parents=True)
-        self.registry = FakeRegistry()
         self.record = release_record()
-        self.digest = seed_registry(self.registry, self.record)
-        self.webhook_calls = FakeWebhook([200])
         self.server = FakeRconServer(outputs={"save-all flush": b"Saved the game"})
         self.server.start()
         self.addCleanup(self.server.shutdown)
         self.backend = DokployBackend(
             data=self.data,
             lock_dir=self.lock,
-            mover=GhcrTagMover(REPO, token=TOKEN, http=self.registry),
-            webhook=DeployWebhook(
-                url=WEBHOOK_URL, http=self.webhook_calls, sleep=lambda s: None
-            ),
             rcon_host="127.0.0.1",
             rcon_port=self.server.port,
             rcon_password=RCON_PASSWORD,
@@ -462,20 +258,15 @@ class BackendTests(unittest.TestCase):
             )
         )
 
-    def test_start_moves_tag_triggers_webhook_and_reports_ready(self):
+    def test_start_persists_selection_and_reports_ready(self):
+        # No tag move, no webhook: start() only persists the verified
+        # selection; the approved release is read back from the running
+        # Workshop for reporting.
         self.backend.start(self.goal)
-        puts = [c for c in self.registry.calls if c[0] == "PUT"]
-        self.assertEqual(len(puts), 1)
-        self.assertEqual(self.registry.tag, self.digest)
-        self.assertEqual(len(self.webhook_calls.calls), 1)
         selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
         self.assertEqual(
             (selected["profile"], selected["release"], selected["session"]),
             ("workshop", RELEASE, self.goal.session),
-        )
-        self.assertEqual(
-            self.webhook_calls.calls[0][2]["Idempotency-Key"],
-            selected["generation"],
         )
         self.assertFalse((self.data / ".blockfield-ready.json").exists())
         self.assertEqual(self.backend.observe()[0].ready, False)
@@ -486,45 +277,14 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(observed[0].goal.release, RELEASE)
         self.assertEqual(self.backend.readiness()["generation"], selected["generation"])
 
-    def test_retry_after_webhook_failure_keeps_single_tag_move(self):
-        failing = FakeWebhook([500, 500])
-        self.backend.webhook = DeployWebhook(
-            url=WEBHOOK_URL, http=failing, attempts=2, sleep=lambda s: None
-        )
-        with self.assertRaises(WebhookError):
-            self.backend.start(self.goal)
-        self.assertEqual(self.registry.tag, self.digest)
-        recovered = FakeWebhook([200])
-        self.backend.webhook = DeployWebhook(
-            url=WEBHOOK_URL, http=recovered, sleep=lambda s: None
-        )
+    def test_retry_across_starts_reuses_generation(self):
+        # A retried start() for the same goal reuses the generation
+        # persisted in profile.json, not a fresh uuid4.
         self.backend.start(self.goal)
-        puts = [c for c in self.registry.calls if c[0] == "PUT"]
-        self.assertEqual(len(puts), 1)
-        self.assertEqual(len(recovered.calls), 1)
-
-    def test_retry_across_starts_reuses_idempotency_key(self):
-        # A retried start() for the same goal must POST with the generation
-        # persisted in profile.json before the tag move, not a fresh uuid4.
-        failing = FakeWebhook([TimeoutError("slow")])
-        self.backend.webhook = DeployWebhook(
-            url=WEBHOOK_URL, http=failing, attempts=1, sleep=lambda s: None
-        )
-        with self.assertRaises(WebhookError):
-            self.backend.start(self.goal)
         first = json.loads((self.lock / "workshop/profile.json").read_bytes())
-        recovered = FakeWebhook([200])
-        self.backend.webhook = DeployWebhook(
-            url=WEBHOOK_URL, http=recovered, sleep=lambda s: None
-        )
         self.backend.start(self.goal)
         second = json.loads((self.lock / "workshop/profile.json").read_bytes())
         self.assertEqual(second["generation"], first["generation"])
-        self.assertEqual(
-            recovered.calls[0][2]["Idempotency-Key"],
-            failing.calls[0][2]["Idempotency-Key"],
-        )
-        self.assertEqual(recovered.calls[0][2]["Idempotency-Key"], first["generation"])
 
     def test_new_goal_mints_fresh_generation(self):
         self.backend.start(self.goal)
@@ -534,17 +294,9 @@ class BackendTests(unittest.TestCase):
         second = json.loads((self.lock / "workshop/profile.json").read_bytes())
         self.assertNotEqual(second["generation"], first["generation"])
 
-    def test_wrong_digest_never_reaches_registry_or_webhook(self):
-        with self.assertRaises(ValueError):
-            self.backend.mover.move("ghcr.io/other/x@sha256:" + "f" * 64)
-        self.assertEqual(self.registry.calls, [])
-        self.assertEqual(self.webhook_calls.calls, [])
-
     def test_unknown_release_fails_preflight_before_effects(self):
         with self.assertRaises(ValueError):
             self.backend.start(Goal("workshop", "v-absent", str(uuid4())))
-        self.assertEqual(self.registry.calls, [])
-        self.assertEqual(self.webhook_calls.calls, [])
         self.assertFalse((self.lock / "workshop/profile.json").exists())
 
     def test_save_requires_success_and_stop_goes_dark(self):
@@ -631,8 +383,6 @@ class BackendTests(unittest.TestCase):
         catalog_path = Path(self.temp.name) / "releases.json"
         catalog_path.write_text(json.dumps({RELEASE: self.record}))
         env = {
-            "BF_GHCR_PACKAGE_TOKEN": TOKEN,
-            "BF_WORKSHOP_DEPLOY_WEBHOOK_URL": WEBHOOK_URL,
             "BF_RELEASES_FILE": str(catalog_path),
         }
         with mock.patch.dict(os.environ, env, clear=True):
@@ -656,10 +406,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
         self.data, self.lock = root / "data", root / "lock"
         self.data.mkdir()
         (self.lock / "workshop").mkdir(parents=True)
-        self.registry = FakeRegistry()
         self.record = release_record()
-        self.digest = seed_registry(self.registry, self.record)
-        self.webhook = FakeWebhook([200])
         # The app starts dark: nothing listens yet, as before the first deploy.
         self.server = FakeRconServer(
             outputs={"save-all flush": b"Saved the game"}, paused=True
@@ -669,10 +416,6 @@ class LifecycleIntegrationTests(unittest.TestCase):
         self.backend = DokployBackend(
             data=self.data,
             lock_dir=self.lock,
-            mover=GhcrTagMover(REPO, token=TOKEN, http=self.registry),
-            webhook=DeployWebhook(
-                url=WEBHOOK_URL, http=self.webhook, sleep=lambda s: None
-            ),
             rcon_host="127.0.0.1",
             rcon_port=self.server.port,
             rcon_password=RCON_PASSWORD,
@@ -691,7 +434,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
         state = self.controller.step()
         self.assertEqual(state["phase"], "STARTING")
         selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
-        self.assertEqual(self.registry.tag, self.digest)
+        self.assertEqual(selected["release"], RELEASE)
         # The deploy brings java up; the mod reports READY for this generation.
         self.server.come_back()
         (self.data / ".blockfield-ready.json").write_text(
@@ -720,15 +463,15 @@ class LifecycleIntegrationTests(unittest.TestCase):
         state = self.controller.step()
         self.assertEqual(state["phase"], "ERROR")
         self.assertIn("explicit recovery", state["errorMessage"])
-        self.assertEqual(self.registry.calls, [])
         recovered = self.controller.step(recover=True)
         self.assertEqual(recovered["phase"], "STARTING")
-        self.assertEqual(self.registry.tag, self.digest)
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(selected["release"], RELEASE)
 
 
 class ShadowRunTests(unittest.TestCase):
     """Read-only shadow: ticks against a sanitized state export with Game off
-    and no java make no registry/webhook call and leave the exported gate and
+    and no java make no external call at all and leave the exported gate and
     public projections byte-identical once converged; no secret lands on disk."""
 
     def setUp(self):
@@ -738,15 +481,9 @@ class ShadowRunTests(unittest.TestCase):
         self.data, self.lock = root / "data", root / "lock"
         self.data.mkdir()
         (self.lock / "workshop").mkdir(parents=True)
-        self.registry = FakeRegistry()
-        self.webhook = FakeWebhook([200])
         self.backend = DokployBackend(
             data=self.data,
             lock_dir=self.lock,
-            mover=GhcrTagMover(REPO, token=TOKEN, http=self.registry),
-            webhook=DeployWebhook(
-                url=WEBHOOK_URL, http=self.webhook, sleep=lambda s: None
-            ),
             rcon_host="127.0.0.1",
             rcon_port=1,  # nothing listens: TCP probe refuses, no auth sent
             rcon_password=RCON_PASSWORD,
@@ -776,8 +513,6 @@ class ShadowRunTests(unittest.TestCase):
             self.controller.status()
         self.assertEqual((self.controller.gate_file).read_bytes(), gate_once)
         self.assertEqual((self.controller.public_file).read_bytes(), public_once)
-        self.assertEqual(self.registry.calls, [])
-        self.assertEqual(self.webhook.calls, [])
         self.assertEqual(first["phase"], "UNINITIALIZED")
         for path in (self.controller.directory).rglob("*"):
             if path.is_file():

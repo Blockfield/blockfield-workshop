@@ -786,15 +786,19 @@ Existing backups under `/srv/minecraft/workshop/map-backups` remain preserved un
 
 ## Approved-tag lifecycle (staged; Docker adapter stays authoritative)
 
-`dokploy_backend.py` implements the owner-approved mechanism (2026-10-30) with no docker.sock and no Dokploy API
-token: after release verification (`releases.py`) the controller moves a fixed GHCR tag
-(`<repository>:approved`, default `ghcr.io/blockfield/blockfield-server:approved`) to the verified release digest
-through the registry API, triggers the Workshop app's deploy webhook with bounded retry, and drives
-start/stop/save/status through direct private-network RCON plus the mod's READY file. A retried operation finds
-the tag already moved and the webhook dedupes on the generation key; verification reads the tag back and refuses
-a mismatch. Credentials travel in single headers and never appear in errors or logs. Game is never managed:
-with this backend Game reads as unavailable. Covered by `test_dokploy_backend.py` against fake registry/webhook
-HTTP and a loopback RCON server (tag move, idempotent retry, partial failure, timeouts, wrong digest).
+`dokploy_backend.py` implements the owner-approved mechanism (2026-10-30) with no docker.sock, no Dokploy API
+token and no GitHub credentials at all: the server release CI owns the fixed GHCR tag
+(`ghcr.io/blockfield/blockfield-server:approved`) — after its deploy verification passes it moves the tag to
+the release digest with its own GITHUB_TOKEN and triggers the Workshop app redeploy through the app's Dokploy
+webhook (`DOKPLOY_WORKSHOP_WEBHOOK` repo secret, same kind as the server/proxy webhook secrets; rollback is a
+manual dispatch of that workflow with an older verified release tag). This backend never moves tags and never
+calls webhooks: start() only persists the verified selection (profile.json, release must resolve in the
+`releases.py` catalog) and clears the READY file, while save/stop/status go through direct private-network
+RCON plus the mod's READY file. The approved release is read back from the running Workshop (READY + selection)
+for reporting only. The controller's only credential is the Workshop's own RCON password, in a single header,
+never in errors or logs. Game is never managed: with this backend Game reads as unavailable. Covered by
+`test_dokploy_backend.py` against a loopback RCON server (selection persistence, generation reuse across
+retried starts, unknown release refused before any effect, RCON save/stop/fence, Game never managed).
 
 RCON framing is proven against a real Java on the isolated stand (W06): vanilla answers every command packet
 under its id and the empty drain marker with error text under its own id, never an empty echo, so the client
@@ -807,14 +811,18 @@ after the RCON fence resurrects java, which then reads as alive-but-unselected a
 
 ### One-time production setup (requires explicit owner approval — NOT performed)
 
-1. GitHub: create a fine-grained personal access token with `Packages: write` on **only** the approved-tag
-   image package (no repo, org or other package scope). Store it in `/etc/blockfield/ghcr-package-token`
-   (`root:root` 0600), referenced as `BF_GHCR_PACKAGE_TOKEN_FILE`.
-2. Dokploy: point the Workshop app image at the fixed tag (`ghcr.io/blockfield/blockfield-server:approved`
-   or the configured `BF_WORKSHOP_APPROVED_REPOSITORY`), create the app's deploy webhook, and store its URL in
-   `/etc/blockfield/workshop-webhook-url` (0600, `BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE`). Set the Workshop
-   restart policy so a stopped Java is **not** resurrected automatically: RCON `stop` must stay stopped until
-   the next webhook deploy, otherwise fencing cannot go quiet.
+1. Server release CI (owner, in `Blockfield/blockfield-server`, NOT this repository): point the Workshop app
+   image at the fixed tag (`ghcr.io/blockfield/blockfield-server:approved`), create the app's deploy webhook,
+   and store its URL as the `DOKPLOY_WORKSHOP_WEBHOOK` repository secret (same credential kind as the existing
+   `DOKPLOY_SERVER_WEBHOOK`; no PAT, no Dokploy API token anywhere). Until this is done the release workflow
+   still moves `:approved` but skips the Workshop redeploy with a warning. Rollback is a manual dispatch of
+   `move-approved-tag.yml` with an older verified release tag, from the GitHub UI.
+2. Controller secret files: the controller needs NO GitHub or webhook secret anymore. Delete
+   `ghcr-package-token` (legacy) and `workshop-deploy-webhook-url` from the controller app
+   `blockfield-workshop-controller` (`FZqi5pLyiucGEmoMqvjEm`) once this revision deploys — coordinator note,
+   do not edit Dokploy from an agent session. Set the Workshop restart policy so a stopped Java is **not**
+   resurrected automatically: RCON `stop` must stay stopped until the next release-driven webhook deploy,
+   otherwise fencing cannot go quiet.
 3. Private network only: reachable RCON host/port with the Workshop's own password
    (`BF_WORKSHOP_RCON_HOST`, `BF_WORKSHOP_RCON_PORT`, `BF_WORKSHOP_RCON_PASSWORD_FILE`, 0600). Never publish
    RCON or reuse the Game password.
@@ -833,8 +841,8 @@ after the RCON fence resurrects java, which then reads as alive-but-unselected a
    verified behind those named volumes, keep production on the host controller: packaging evidence alone
    does not authorize the handover.
 6. Verify on an isolated stand first: approved target from a verified published release only, first contact
-   with a live unselected Java fails closed and needs explicit recovery, tag-moved-but-webhook-failed
-   continues from the moved tag, and rollback is reverting to the Docker adapter (it remains authoritative;
+   with a live unselected Java fails closed and needs explicit recovery, a retried start() for the same goal
+   reuses the persisted generation, and rollback is reverting to the Docker adapter (it remains authoritative;
    no automatic production fallback).
 
 ### Container packaging (staged; host controller stays authoritative)
@@ -942,15 +950,14 @@ Create application `blockfield-workshop-controller` exactly as
   `BF_TEMPLATES_DIR=/templates`, `BF_PUBLISHED_MAPS_DIR=/published`,
   `BF_RELEASES_FILE=/state/releases.json`, `BF_STEP_INTERVAL_S=15`,
   `BF_STEP_FOLLOW_S=12`, `BF_STEP_POLL_S=2`, `BF_HEALTH_PORT=8080`,
-  `BF_WORKSHOP_APPROVED_REPOSITORY=ghcr.io/blockfield/blockfield-server`,
   `BF_WORKSHOP_RCON_HOST=blockfield-workshop`,
   `BF_WORKSHOP_RCON_PORT=25575`.
-- Secrets by NAME only (Dokploy-managed secret files, read-only 0400 at
-  `/run/secrets/`, referenced as `BF_GHCR_PACKAGE_TOKEN_FILE`,
-  `BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE`,
-  `BF_WORKSHOP_RCON_PASSWORD_FILE`): the package-scoped GHCR token from
-  step 3, the Workshop app deploy webhook URL from step 3, and the
-  Workshop's own RCON password (never the Game password).
+- Secret by NAME only (one Dokploy-managed secret file, read-only 0400 at
+  `/run/secrets/`, referenced as `BF_WORKSHOP_RCON_PASSWORD_FILE`): the
+  Workshop's own RCON password (never the Game password). No GitHub or
+  webhook secret on the controller: delete `ghcr-package-token` (legacy) and
+  `workshop-deploy-webhook-url` from the controller app once this revision
+  deploys (coordinator note).
 - No `docker.sock`, no `privileged`, no `cap_add`, no host namespaces
   (`network_mode/pid/ipc: host`), no `/proc`, `/sys`, `/var/run` mounts.
   Any host bind proposed for the data interface needs a separate owner
@@ -958,19 +965,17 @@ Create application `blockfield-workshop-controller` exactly as
 
 ### Step 3 — credentials (owner creates; names only, values never in chat)
 
-1. GitHub: fine-grained personal access token with `Packages: write` on
-   **only** the approved-tag image package
-   (`ghcr.io/blockfield/blockfield-server:approved`) — no repo, org or other
-   package scope. Host path `/etc/blockfield/ghcr-package-token`
-   (`root:root` 0600), mounted as `ghcr-package-token`.
-2. Dokploy: create the Workshop app's deploy webhook; store its URL in
-   `/etc/blockfield/workshop-webhook-url` (0600), mounted as
-   `workshop-deploy-webhook-url`.
-3. Workshop RCON password into `/etc/blockfield/workshop-rcon-password`
+1. Server side (in `Blockfield/blockfield-server`, NOT on this host): the `DOKPLOY_WORKSHOP_WEBHOOK` repository
+   secret holding the Workshop app's deploy webhook URL (same credential kind as `DOKPLOY_SERVER_WEBHOOK`; the
+   Workshop app image must point at `:approved`, see the one-time setup §1 above).
+2. Workshop RCON password into `/etc/blockfield/workshop-rcon-password`
    (0600), mounted as `workshop-rcon-password`.
    At W07 creation time verify Dokploy actually mounts these as secret
    files (the compose `secrets:` file resolution is docs-only and was never
    executed offline).
+   The controller holds NO GitHub or webhook secret: after this revision deploys, delete the legacy
+   `ghcr-package-token` and `workshop-deploy-webhook-url` secrets from the controller app
+   `blockfield-workshop-controller` (`FZqi5pLyiucGEmoMqvjEm`) — coordinator note, never from an agent session.
 
 ### Step 4 — import state into the volumes (root; new app still stopped)
 
@@ -1053,15 +1058,15 @@ No promise of zero Workshop interruption.
 
 ### Approval checklist (exact owner-approval items)
 
-| #   | Action                                                                | Needs                                                  |
-| --- | --------------------------------------------------------------------- | ------------------------------------------------------ |
-| 1   | Step 1 host snapshot (`/srv/minecraft/...` read+copy to `/root/...`)  | root (`agent-sudo`)                                    |
-| 2   | Step 2 create `blockfield-workshop-controller` app + volumes + env    | Dokploy write                                          |
-| 3   | Step 3 mint package-scoped GHCR token, webhook URL, RCON secret file  | owner secret handling, then root to install 0600 files |
-| 4   | Step 4 copy state/lock/data into the named volumes + chown 1000:1000  | root (`agent-sudo`)                                    |
-| 5   | Step 5 `disable --now` timer+path, start container app                | root + Dokploy write                                   |
-| 6   | Rollback (if needed): stop container app, restore snapshot, re-enable | root + Dokploy write                                   |
-| 0   | Step 0 inspection and step 6 verification                             | no approval (read-only)                                |
+| #   | Action                                                                                                               | Needs                                                  |
+| --- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| 1   | Step 1 host snapshot (`/srv/minecraft/...` read+copy to `/root/...`)                                                 | root (`agent-sudo`)                                    |
+| 2   | Step 2 create `blockfield-workshop-controller` app + volumes + env                                                   | Dokploy write                                          |
+| 3   | Step 3 server-side `DOKPLOY_WORKSHOP_WEBHOOK` secret + RCON secret file; delete legacy controller secrets afterwards | owner secret handling, then root to install 0600 files |
+| 4   | Step 4 copy state/lock/data into the named volumes + chown 1000:1000                                                 | root (`agent-sudo`)                                    |
+| 5   | Step 5 `disable --now` timer+path, start container app                                                               | root + Dokploy write                                   |
+| 6   | Rollback (if needed): stop container app, restore snapshot, re-enable                                                | root + Dokploy write                                   |
+| 0   | Step 0 inspection and step 6 verification                                                                            | no approval (read-only)                                |
 
 ## New installation (requires owner approval)
 
