@@ -20,6 +20,7 @@ from uuid import UUID
 SERVER_REPOSITORY = "ghcr.io/blockfield/blockfield-server"
 IMAGE_DIGEST = re.compile(re.escape(SERVER_REPOSITORY) + r"@sha256:[0-9a-f]{64}")
 RELEASE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
+CLIENT_VERSION = re.compile(r"v?[0-9]+\.[0-9]+\.[0-9]+")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SCHEMA = 1
 
@@ -158,7 +159,8 @@ def validate_release_record(document: dict) -> dict:
         for key in ("server_runtime", "server_digest", "client", "compatibility"):
             if not _matches(SHA256, build[key]) or build[key] == "0" * 64:
                 raise ValueError("invalid published build fingerprint/contract")
-        if not _matches(RELEASE, build["client_version"]):
+        # Published build.json carries the client version without the tag's "v".
+        if not _matches(CLIENT_VERSION, build["client_version"]):
             raise ValueError("invalid published client version")
         for key in ("minecraft", "fabric"):
             if not _matches(re.compile(r"[0-9]+(?:\.[0-9]+){1,3}"), build[key]):

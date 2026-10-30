@@ -415,3 +415,12 @@ class ReleaseSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishedClientVersionTest(unittest.TestCase):
+    def test_bare_client_version_from_published_build_json(self):
+        validate_release_record(release_record(client_version="1.0.0"))
+
+    def test_garbage_client_version_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_release_record(release_record(client_version="1.0"))
