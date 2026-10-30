@@ -1058,15 +1058,15 @@ No promise of zero Workshop interruption.
 
 ### Approval checklist (exact owner-approval items)
 
-| #   | Action                                                                | Needs                                                  |
-| --- | --------------------------------------------------------------------- | ------------------------------------------------------ |
-| 1   | Step 1 host snapshot (`/srv/minecraft/...` read+copy to `/root/...`)  | root (`agent-sudo`)                                    |
-| 2   | Step 2 create `blockfield-workshop-controller` app + volumes + env    | Dokploy write                                          |
+| #   | Action                                                                                                               | Needs                                                  |
+| --- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| 1   | Step 1 host snapshot (`/srv/minecraft/...` read+copy to `/root/...`)                                                 | root (`agent-sudo`)                                    |
+| 2   | Step 2 create `blockfield-workshop-controller` app + volumes + env                                                   | Dokploy write                                          |
 | 3   | Step 3 server-side `DOKPLOY_WORKSHOP_WEBHOOK` secret + RCON secret file; delete legacy controller secrets afterwards | owner secret handling, then root to install 0600 files |
-| 4   | Step 4 copy state/lock/data into the named volumes + chown 1000:1000  | root (`agent-sudo`)                                    |
-| 5   | Step 5 `disable --now` timer+path, start container app                | root + Dokploy write                                   |
-| 6   | Rollback (if needed): stop container app, restore snapshot, re-enable | root + Dokploy write                                   |
-| 0   | Step 0 inspection and step 6 verification                             | no approval (read-only)                                |
+| 4   | Step 4 copy state/lock/data into the named volumes + chown 1000:1000                                                 | root (`agent-sudo`)                                    |
+| 5   | Step 5 `disable --now` timer+path, start container app                                                               | root + Dokploy write                                   |
+| 6   | Rollback (if needed): stop container app, restore snapshot, re-enable                                                | root + Dokploy write                                   |
+| 0   | Step 0 inspection and step 6 verification                                                                            | no approval (read-only)                                |
 
 ## New installation (requires owner approval)
 
