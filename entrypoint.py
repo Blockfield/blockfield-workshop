@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import math
 import os
 import signal
 import sys
@@ -35,7 +36,7 @@ def _positive_float(env, name, default):
         value = float(env.get(name, default))
     except (TypeError, ValueError):
         raise ValueError(f"{name} must be a number of seconds")
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a positive number of seconds")
     return value
 
@@ -46,7 +47,7 @@ def _non_negative_float(env, name, default):
         value = float(env.get(name, default))
     except (TypeError, ValueError):
         raise ValueError(f"{name} must be a number of seconds")
-    if value < 0:
+    if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a non-negative number of seconds")
     return value
 
