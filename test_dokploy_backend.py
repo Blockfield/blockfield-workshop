@@ -130,11 +130,13 @@ class FakeRconServer(threading.Thread):
         stop_closes=True,
         mute_commands=(),
         paused=False,
+        drop_stop_reply=False,
     ):
         super().__init__(daemon=True)
         self.password = password
         self.outputs = outputs or {}
         self.stop_closes = stop_closes
+        self.drop_stop_reply = drop_stop_reply
         self.mute_commands = set(mute_commands)
         self.commands = []
         self.errors = []
@@ -233,7 +235,20 @@ class FakeRconServer(threading.Thread):
                     if words in self.mute_commands:
                         threading.Event().wait(30)
                         return
-                    conn.sendall(self.packet(rid, self.outputs.get(words, b"")))
+                    body = self.outputs.get(words, b"")
+                    if words == "stop" and self.drop_stop_reply:
+                        # Mid-shutdown reset: the reply path dies with the
+                        # reply unsent. Dark or alive afterwards decides it.
+                        try:
+                            conn.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        if self.stop_closes:
+                            self.go_dark()
+                        return
+                    # Vanilla splits large replies into 4096 B packets.
+                    for offset in range(0, max(len(body), 1), 4096):
+                        conn.sendall(self.packet(rid, body[offset : offset + 4096]))
                     if words == "stop" and self.stop_closes:
                         self.go_dark()
                         return
@@ -384,6 +399,13 @@ class RconTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RconError):
                 RconClient("127.0.0.1", self.server.port)
+
+    def test_multi_packet_output_concatenates(self):
+        big = FakeRconServer(outputs={"help": b"x" * 5000})
+        big.start()
+        self.addCleanup(big.shutdown)
+        with RconClient("127.0.0.1", big.port, password=RCON_PASSWORD) as rcon:
+            self.assertEqual(rcon.command("help"), "x" * 5000)
 
     def test_silent_server_hits_timeout(self):
         quiet = FakeRconServer(mute_commands=("save-all flush",))
@@ -551,6 +573,34 @@ class BackendTests(unittest.TestCase):
         self.backend.start(self.goal)
         with self.assertRaises(TimeoutError):
             self.backend.stop(self.backend.observe()[0])
+
+    def test_stop_reset_then_dark_succeeds(self):
+        resetting = FakeRconServer(
+            outputs={"save-all flush": b"Saved the game"},
+            drop_stop_reply=True,
+            stop_closes=True,
+        )
+        resetting.start()
+        self.addCleanup(resetting.shutdown)
+        self.backend.rcon_port = resetting.port
+        self.backend.start(self.goal)
+        process = self.backend.observe()[0]
+        self.backend.stop(process)
+        self.assertEqual(self.backend.observe(), [])
+
+    def test_stop_reset_while_alive_raises_chained_timeout(self):
+        resetting = FakeRconServer(
+            outputs={"save-all flush": b"Saved the game"},
+            drop_stop_reply=True,
+            stop_closes=False,
+        )
+        resetting.start()
+        self.addCleanup(resetting.shutdown)
+        self.backend.rcon_port = resetting.port
+        self.backend.start(self.goal)
+        with self.assertRaises(TimeoutError) as ctx:
+            self.backend.stop(self.backend.observe()[0])
+        self.assertIsInstance(ctx.exception.__cause__, RconError)
 
     def test_fence_stops_a_lingering_backend(self):
         self.backend.start(self.goal)

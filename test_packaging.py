@@ -152,10 +152,15 @@ class EntrypointIntervalTests(unittest.TestCase):
             {"BF_STEP_INTERVAL_S": "0"},
             {"BF_STEP_INTERVAL_S": "-5"},
             {"BF_STEP_INTERVAL_S": "soon"},
+            {"BF_STEP_INTERVAL_S": "nan"},
+            {"BF_STEP_INTERVAL_S": "inf"},
             {"BF_STEP_POLL_S": "0"},
             {"BF_STEP_POLL_S": "-1"},
+            {"BF_STEP_POLL_S": "nan"},
             {"BF_STEP_FOLLOW_S": "-1"},
             {"BF_STEP_FOLLOW_S": "soon"},
+            {"BF_STEP_FOLLOW_S": "nan"},
+            {"BF_STEP_FOLLOW_S": "inf"},
         ):
             with self.subTest(env=env):
                 with self.assertRaises(ValueError):

@@ -655,6 +655,9 @@ class DokployBackend:
 
     def _operation_id(self, goal: Goal) -> str:
         """Generation for this start; a retry reuses the persisted intent's."""
+        # A retry with a rotated candidate/modeId mints a fresh generation:
+        # safe, the tag move is to the same approved release digest and the
+        # webhook dedupes each generation key convergently.
         try:
             selected = self.selection()
         except (ValueError, TypeError, AttributeError, OSError):

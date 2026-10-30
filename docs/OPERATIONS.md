@@ -851,6 +851,216 @@ selection, the single-writer lock (`BUSY`) and the Game-off health endpoint. `de
 runs the daemon checks on Boat against synthetic named volumes: non-root state writes, read-only refusal,
 read-only rootfs health, restart preservation and a second writer failing closed.
 
+## Cut-over runbook (production Workshop controller → Dokploy container)
+
+Owner-executable migration of the Workshop controller from the host systemd
+timer to the `blockfield-workshop-controller` container app. Prepare only:
+every Dokploy write and every host root step below needs an explicit owner
+OK in the current task (see the approval table at the end). Read-only
+inspection is `ssh homeserver-agent` (never print secrets) plus the Dokploy
+read API. Rehearsed 2026-10-30 on an isolated VM with copied synthetic state
+(13/13: import preserves selection+phase, held lock fails closed BUSY=75,
+corrupt selection refused, fence quiet on dark java, rollback restores
+selection, Game never managed): evidence beside the W07 report, not in this
+file. Control-plane note: per `cp-api-design.md` §5 the controller later
+gains a CP client (receipts + polled requests) and the state import lands in
+CP; the single-writer rule and the timer/path retirement below do not change.
+
+### GO / NO-GO gate (check first, all must hold)
+
+1. The separately approved Workshop data interface (MapStore archive/active/
+   drafts, inbox, gate/public/admin projections) is provisioned behind the
+   named volumes below and verified readable/writable as marked. If obtaining
+   it requires storage work, stop here: packaging/shadow evidence is the
+   deliverable, production stays on the host controller (contract §5).
+2. Exactly one approved immutable controller image digest exists
+   (`ghcr.io/blockfield/blockfield-workshop-controller@sha256:<64 hex>`,
+   built from a merged workshop commit, CI green). Never `:latest`, never a
+   floating tag.
+3. The Workshop app's restart policy does NOT resurrect a stopped Java
+   (RCON `stop` must stay stopped until the next webhook deploy), otherwise
+   fencing cannot go quiet.
+4. No in-flight Workshop transition: `status` phase is stable (`workshop`,
+   `test` settled, or `sleeping`), no unanswered inbox request, no compensation
+   pending. Finish or cancel (`workshopctl cancel`) first.
+
+### Step 0 — read-only inspection (no approval needed)
+
+```sh
+ssh homeserver-agent 'systemctl is-enabled blockfield-workshop.timer blockfield-workshop.service blockfield-workshop.path; systemctl is-active blockfield-workshop.timer; cat /srv/minecraft/backend-lock/workshop/profile.json'
+```
+
+Expect `timer enabled/active`, `service static`, `path enabled`, and the
+committed selection (`profile`, `generation`, `session`, `release`).
+Record `generation`/`session`: the import must reproduce them exactly.
+Prod shape 2026-10-30: selection `workshop`/`v2.77.0`, data ~1.5 GB,
+controller state a few KB.
+
+### Step 1 — snapshot the host (root; Dokploy untouched)
+
+As root on the host, snapshot (never move) the authority and its data:
+
+```sh
+SNAP=/root/w07-cutover-snapshot
+install -d -m 0700 "$SNAP"
+cp -a /srv/minecraft/workshop/controller "$SNAP/controller"
+cp -a /srv/minecraft/backend-lock "$SNAP/backend-lock"
+cp -a /srv/minecraft/workshop/gate "$SNAP/gate"      # projections, read-only copy
+cp -a /srv/minecraft/workshop/public "$SNAP/public"
+cp -a /srv/minecraft/workshop/admin "$SNAP/admin"
+ls "$SNAP"   # controller backend-lock gate public admin, nothing else
+```
+
+The 1.5 GB workshop `data/` tree is NOT snapshotted file-by-file here: it is
+copied once into the `workshop-data` volume in step 4. Verify the copy there.
+
+### Step 2 — create the Dokploy controller app (Dokploy writes; no host change)
+
+Create application `blockfield-workshop-controller` exactly as
+`deployment/workshop-controller.compose.example.yaml` describes:
+
+- Image: the immutable digest from the GO gate
+  (`ghcr.io/blockfield/blockfield-workshop-controller@sha256:<64 hex>`).
+- Managed named volumes only, no host path, no socket, no device:
+  `controller-state:/state`, `workshop-data:/data`,
+  `controller-locks:/locks` (all RW, controller is the single writer),
+  `workshop-templates:/templates:ro`,
+  `workshop-published:/published:ro`. Fresh volumes inherit the image's
+  UID 1000-owned `/state /data /locks` tree; pre-existing volumes must be
+  chowned to `1000:1000` once before the first start.
+- No published port (`/healthz` is loopback-only inside the container),
+  read-only root with `/tmp` tmpfs, dropped capabilities,
+  `no-new-privileges:true`, memory 512M / pids 100.
+- Environment (`deployment/workshop-controller.env.example`, values never
+  secrets): `BF_WORKSHOP_BACKEND=dokploy`, `BF_STATE_DIR=/state`,
+  `BF_GATE_FILE=/state/gate/gate.json`,
+  `BF_PUBLIC_FILE=/state/public/public.json`, `BF_ADMIN_DIR=/state/admin`,
+  `BF_INBOX_DIR=/state/inbox`, `BF_WORKSHOP_DATA=/data`, `BF_LOCK_DIR=/locks`,
+  `BF_MAP_ARCHIVE_DIR=/data/history`, `BF_MAP_ACTIVE_DIR=/data/active`,
+  `BF_TEMPLATES_DIR=/templates`, `BF_PUBLISHED_MAPS_DIR=/published`,
+  `BF_RELEASES_FILE=/state/releases.json`, `BF_STEP_INTERVAL_S=15`,
+  `BF_STEP_FOLLOW_S=12`, `BF_STEP_POLL_S=2`, `BF_HEALTH_PORT=8080`,
+  `BF_WORKSHOP_APPROVED_REPOSITORY=ghcr.io/blockfield/blockfield-server`,
+  `BF_WORKSHOP_RCON_HOST=blockfield-workshop`,
+  `BF_WORKSHOP_RCON_PORT=25575`.
+- Secrets by NAME only (Dokploy-managed secret files, read-only 0400 at
+  `/run/secrets/`, referenced as `BF_GHCR_PACKAGE_TOKEN_FILE`,
+  `BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE`,
+  `BF_WORKSHOP_RCON_PASSWORD_FILE`): the package-scoped GHCR token from
+  step 3, the Workshop app deploy webhook URL from step 3, and the
+  Workshop's own RCON password (never the Game password).
+- No `docker.sock`, no `privileged`, no `cap_add`, no host namespaces
+  (`network_mode/pid/ipc: host`), no `/proc`, `/sys`, `/var/run` mounts.
+  Any host bind proposed for the data interface needs a separate owner
+  decision with a per-path justification; the default is: stop, do not bind.
+
+### Step 3 — credentials (owner creates; names only, values never in chat)
+
+1. GitHub: fine-grained personal access token with `Packages: write` on
+   **only** the approved-tag image package
+   (`ghcr.io/blockfield/blockfield-server:approved`) — no repo, org or other
+   package scope. Host path `/etc/blockfield/ghcr-package-token`
+   (`root:root` 0600), mounted as `ghcr-package-token`.
+2. Dokploy: create the Workshop app's deploy webhook; store its URL in
+   `/etc/blockfield/workshop-webhook-url` (0600), mounted as
+   `workshop-deploy-webhook-url`.
+3. Workshop RCON password into `/etc/blockfield/workshop-rcon-password`
+   (0600), mounted as `workshop-rcon-password`.
+   At W07 creation time verify Dokploy actually mounts these as secret
+   files (the compose `secrets:` file resolution is docs-only and was never
+   executed offline).
+
+### Step 4 — import state into the volumes (root; new app still stopped)
+
+With the new app created but at 0 replicas, copy host authority into the
+volumes (a one-shot helper with the three RW volumes mounted, or
+equivalent owner-approved copy; Workshop entry stays served by the host
+until step 5):
+
+```sh
+# controller state (0700), backend lock + selection, workshop data (~1.5 GB)
+cp -a /srv/minecraft/workshop/controller/. <controller-state vol>/controller
+cp -a /srv/minecraft/backend-lock/. <controller-locks vol>/
+cp -a /srv/minecraft/workshop/data/. <workshop-data vol>/
+chown -R 1000:1000 <controller-state vol> <controller-locks vol> <workshop-data vol>
+chmod 0700 <controller-state vol>/controller
+```
+
+Verify byte-identity of the selection and projections:
+`profile.json` (`generation`, `session`, `release`) and `target.json`
+(if present) read back identical; `releases.json` (verified export,
+`BF_RELEASES_FILE`) is present in `controller-state` and resolves the
+selected release. Keep the data-interface RO inputs (`workshop-templates`,
+`workshop-published`) exactly as the separately approved provisioning left
+them — do not copy host templates over them.
+
+### Step 5 — fence the old writer, enable the new one (root + Dokploy write)
+
+Single-writer rule: at most one controller may hold the lock. Order matters.
+
+```sh
+systemctl disable --now blockfield-workshop.timer blockfield-workshop.path
+# wait for any in-flight step: no python3 workshopctl process remains
+pgrep -af 'workshopctl step' || echo NO_STEP_IN_FLIGHT
+systemctl status blockfield-workshop.service --no-pager | head -5
+```
+
+Only then start the container app (scale to 1 / deploy in Dokploy).
+Expected: its first ticks report the imported phase; `/healthz` is 200 with
+Game off. If the new app reports BUSY (75) or a lock conflict, the old
+writer is still alive: stop, never force — two writers are worse than
+downtime.
+
+### Step 6 — verification (no approval needed, read-only + builder accounts)
+
+1. `workshopctl status` (against the new app's state): phase, `desired`
+   release/session equal the recorded import; `selection` revision and
+   operation match the host snapshot.
+2. Wake path: `workshopctl wake` (or inbox `wake` from a builder account)
+   starts the same session at the committed digest; `STARTING` → `workshop`.
+3. Save path: a builder edit + snapshot/export round-trips; session/draft
+   checksums survive wake and (if exercised) release change.
+4. Game independence: the Game app task is untouched (same task identity in
+   Dokploy), Game stays public with players online, its release never
+   retargets; with Workshop Java dark the new controller observes `[]`
+   (no process invented) and never contacts Game RCON.
+5. `docker-verify.sh` gates re-run against the created app: non-root writes,
+   read-only refusal, restart preservation, second writer exits 75.
+
+### Rollback (root + Dokploy write; bounded, one attempt)
+
+1. Fence the new writer first: stop the container app (scale to 0) and
+   confirm its lock is released; never restore old authority beside it.
+2. Restore the step-1 snapshot over the host paths (controller state 0700,
+   backend-lock selection, projections); preserve any newer drafts the new
+   writer created — copy them aside before overwriting, never delete unique
+   data.
+3. `systemctl enable --now blockfield-workshop.timer blockfield-workshop.path`,
+   then `workshopctl status`: phase and selection equal the snapshot.
+4. Uncertain or failed rollback becomes `needs-operator`: keep Workshop
+   closed, do not auto-recover Game, resolve explicitly.
+
+### Expected downtime
+
+Game: none — it stays running and public throughout; no Game restart,
+proxy change or client update is involved. Workshop: entry closed from step
+5 (old timer fenced) until step 6 passes — minutes for the 1.5 GB data
+copy plus verification round-trips, longer if the data interface needs
+re-provisioning (then stop before step 5 and keep the host authoritative).
+No promise of zero Workshop interruption.
+
+### Approval checklist (exact owner-approval items)
+
+| #   | Action                                                                | Needs                                                  |
+| --- | --------------------------------------------------------------------- | ------------------------------------------------------ |
+| 1   | Step 1 host snapshot (`/srv/minecraft/...` read+copy to `/root/...`)  | root (`agent-sudo`)                                    |
+| 2   | Step 2 create `blockfield-workshop-controller` app + volumes + env    | Dokploy write                                          |
+| 3   | Step 3 mint package-scoped GHCR token, webhook URL, RCON secret file  | owner secret handling, then root to install 0600 files |
+| 4   | Step 4 copy state/lock/data into the named volumes + chown 1000:1000  | root (`agent-sudo`)                                    |
+| 5   | Step 5 `disable --now` timer+path, start container app                | root + Dokploy write                                   |
+| 6   | Rollback (if needed): stop container app, restore snapshot, re-enable | root + Dokploy write                                   |
+| 0   | Step 0 inspection and step 6 verification                             | no approval (read-only)                                |
+
 ## New installation (requires owner approval)
 
 Dependencies: compatible published Blockfield server, proxy, site and launcher with
