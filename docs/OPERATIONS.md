@@ -784,6 +784,41 @@ Defaults: `BF_CANDIDATES_DIR=/mnt/media-hdd/blockfield/maps/candidates`, `BF_MAP
 
 Existing backups under `/srv/minecraft/workshop/map-backups` remain preserved until an explicit, verified copy to the HDD archive. Changing the default does not move existing data. Complete that migration before switching an existing host to the new path; never delete the original as part of a controller upgrade.
 
+## Approved-tag lifecycle (staged; Docker adapter stays authoritative)
+
+`dokploy_backend.py` implements the owner-approved mechanism (2026-10-30) with no docker.sock and no Dokploy API
+token: after release verification (`releases.py`) the controller moves a fixed GHCR tag
+(`<repository>:approved`, default `ghcr.io/blockfield/blockfield-server:approved`) to the verified release digest
+through the registry API, triggers the Workshop app's deploy webhook with bounded retry, and drives
+start/stop/save/status through direct private-network RCON plus the mod's READY file. A retried operation finds
+the tag already moved and the webhook dedupes on the generation key; verification reads the tag back and refuses
+a mismatch. Credentials travel in single headers and never appear in errors or logs. Game is never managed:
+with this backend Game reads as unavailable. Covered by `test_dokploy_backend.py` against fake registry/webhook
+HTTP and a loopback RCON server (tag move, idempotent retry, partial failure, timeouts, wrong digest).
+Follow-ups before handover: prove RCON framing against a real Java on the isolated Workshop stand (W06), not just
+the fake server. Fencing cannot cancel a deploy already queued in Dokploy: a delayed queued deploy landing after
+the RCON fence resurrects java, which then reads as alive-but-unselected and fails closed (explicit recovery).
+
+### One-time production setup (requires explicit owner approval — NOT performed)
+
+1. GitHub: create a fine-grained personal access token with `Packages: write` on **only** the approved-tag
+   image package (no repo, org or other package scope). Store it in `/etc/blockfield/ghcr-package-token`
+   (`root:root` 0600), referenced as `BF_GHCR_PACKAGE_TOKEN_FILE`.
+2. Dokploy: point the Workshop app image at the fixed tag (`ghcr.io/blockfield/blockfield-server:approved`
+   or the configured `BF_WORKSHOP_APPROVED_REPOSITORY`), create the app's deploy webhook, and store its URL in
+   `/etc/blockfield/workshop-webhook-url` (0600, `BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE`). Set the Workshop
+   restart policy so a stopped Java is **not** resurrected automatically: RCON `stop` must stay stopped until
+   the next webhook deploy, otherwise fencing cannot go quiet.
+3. Private network only: reachable RCON host/port with the Workshop's own password
+   (`BF_WORKSHOP_RCON_HOST`, `BF_WORKSHOP_RCON_PORT`, `BF_WORKSHOP_RCON_PASSWORD_FILE`, 0600). Never publish
+   RCON or reuse the Game password.
+4. Deploy the staged module beside the host controller (`dokploy_backend.py`, `releases.py`) and set
+   `BF_WORKSHOP_DATA`, `BF_LOCK_DIR` to the controller's mounted workshop data and lock directories.
+5. Verify on an isolated stand first: approved target from a verified published release only, first contact
+   with a live unselected Java fails closed and needs explicit recovery, tag-moved-but-webhook-failed
+   continues from the moved tag, and rollback is reverting to the Docker adapter (it remains authoritative;
+   no automatic production fallback).
+
 ## New installation (requires owner approval)
 
 Dependencies: compatible published Blockfield server, proxy, site and launcher with
