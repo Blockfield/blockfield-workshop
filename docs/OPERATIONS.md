@@ -876,7 +876,9 @@ CP; the single-writer rule and the timer/path retirement below do not change.
 2. Exactly one approved immutable controller image digest exists
    (`ghcr.io/blockfield/blockfield-workshop-controller@sha256:<64 hex>`,
    built from a merged workshop commit, CI green). Never `:latest`, never a
-   floating tag.
+   floating tag. The `Workshop controller image` workflow pushes
+   `:<full-sha>` (+ `:main`) on every main push and prints the digest in
+   the job summary — copy it from the run for the merged commit.
 3. The Workshop app's restart policy does NOT resurrect a stopped Java
    (RCON `stop` must stay stopped until the next webhook deploy), otherwise
    fencing cannot go quiet.
