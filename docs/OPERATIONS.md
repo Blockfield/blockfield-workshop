@@ -795,6 +795,9 @@ the tag already moved and the webhook dedupes on the generation key; verificatio
 a mismatch. Credentials travel in single headers and never appear in errors or logs. Game is never managed:
 with this backend Game reads as unavailable. Covered by `test_dokploy_backend.py` against fake registry/webhook
 HTTP and a loopback RCON server (tag move, idempotent retry, partial failure, timeouts, wrong digest).
+Follow-ups before handover: prove RCON framing against a real Java on the isolated Workshop stand (W06), not just
+the fake server. Fencing cannot cancel a deploy already queued in Dokploy: a delayed queued deploy landing after
+the RCON fence resurrects java, which then reads as alive-but-unselected and fails closed (explicit recovery).
 
 ### One-time production setup (requires explicit owner approval — NOT performed)
 

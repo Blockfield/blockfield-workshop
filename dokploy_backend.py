@@ -54,7 +54,14 @@ class RconError(RuntimeError):
     """Private-network RCON command failed; never carries the password."""
 
 
-def read_secret(*, value: str | None, env: str, file_env: str, what: str) -> str:
+def read_secret(
+    *,
+    value: str | None,
+    env: str,
+    file_env: str,
+    what: str,
+    error: type = RegistryError,
+) -> str:
     """Credential from an explicit value, env var or secret file (first line)."""
     if value:
         return value
@@ -66,11 +73,11 @@ def read_secret(*, value: str | None, env: str, file_env: str, what: str) -> str
         try:
             with open(path, encoding="utf-8") as handle:
                 secret = handle.readline().strip()
-        except OSError as error:
-            raise RegistryError(f"{what} secret file unreadable") from error
+        except OSError as exc:
+            raise error(f"{what} secret file unreadable") from exc
         if secret:
             return secret
-    raise RegistryError(f"{what} credential is not configured")
+    raise error(f"{what} credential is not configured")
 
 
 @dataclass
@@ -238,7 +245,17 @@ class DeployWebhook:
             env="BF_WORKSHOP_DEPLOY_WEBHOOK_URL",
             file_env="BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE",
             what="deploy webhook",
+            error=WebhookError,
         )
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(self._url)
+        host = parts.hostname or ""
+        loopback = host == "localhost" or host == "::1" or host.startswith("127.")
+        if parts.scheme != "https" and not (parts.scheme == "http" and loopback):
+            # The secret URL must not cross the wire in cleartext; plain http
+            # is only acceptable for loopback test doubles.
+            raise ValueError("deploy webhook URL must be https")
         self._http = http
         self.attempts = attempts
         self.delay = delay
@@ -297,6 +314,7 @@ class RconClient:
             env="BF_WORKSHOP_RCON_PASSWORD",
             file_env="BF_WORKSHOP_RCON_PASSWORD_FILE",
             what="workshop RCON",
+            error=RconError,
         )
         self.timeout = timeout
         self._socket: socket.socket | None = None
@@ -433,6 +451,7 @@ class DokployBackend:
         """Build from BF_ env; secrets stay in env vars or secret files."""
         import releases as release_catalog
 
+        releases_path = env.get("BF_RELEASES_FILE")
         return cls(
             data=Path(env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")),
             lock_dir=Path(env.get("BF_LOCK_DIR", "/srv/minecraft/backend-lock")),
@@ -445,12 +464,11 @@ class DokployBackend:
             webhook=DeployWebhook(),
             rcon_host=env.get("BF_WORKSHOP_RCON_HOST", "blockfield-workshop"),
             rcon_port=int(env.get("BF_WORKSHOP_RCON_PORT", "25575")),
+            releases=release_catalog.load_catalog(
+                Path(releases_path) if releases_path else None
+            ),
             **overrides,
         )
-
-    @staticmethod
-    def app_of(profile: str) -> str:
-        return "workshop" if profile == "test" else profile
 
     def _rcon(self) -> RconClient:
         return RconClient(self.rcon_host, self.rcon_port, password=self.rcon_password)
@@ -548,7 +566,8 @@ class DokployBackend:
             corrupt = True
         else:
             corrupt = False
-        if not self._alive():
+        alive = self._alive()
+        if not alive:
             # Stopped backends report nothing, mirroring the scaled-to-zero
             # service: a stale selection or READY file is not a process.
             # Corrupt selection with no living java stays invisible too;
@@ -577,7 +596,7 @@ class DokployBackend:
                 )
             except (ValueError, TypeError):
                 goal, expected = Goal("workshop", "unknown", UNKNOWN_SESSION), None
-        return [Process(goal, bool(self._alive() and expected and ready == expected))]
+        return [Process(goal, bool(alive and expected and ready == expected))]
 
     def save_and_freeze(self, process: Process) -> None:
         if process.goal.profile == "game":
@@ -617,6 +636,30 @@ class DokployBackend:
                 raise TimeoutError("cannot fence the workshop backend")
             self._sleep(self.poll)
 
+    def _operation_id(self, goal: Goal) -> str:
+        """Generation for this start; a retry reuses the persisted intent's."""
+        try:
+            selected = self.selection()
+        except (ValueError, TypeError, AttributeError, OSError):
+            selected = None
+        if isinstance(selected, dict) and all(
+            selected.get(key) == value
+            for key, value in (
+                ("profile", goal.profile),
+                ("release", goal.release),
+                ("session", goal.session),
+                ("candidate", goal.candidate),
+                ("modeId", goal.modeId),
+            )
+        ):
+            generation = selected.get("generation")
+            try:
+                if generation is not None and str(UUID(generation)) == generation:
+                    return generation
+            except (ValueError, TypeError, AttributeError):
+                pass
+        return str(uuid4())
+
     def start(self, goal: Goal) -> None:
         self.preflight(goal)
         digest = self._digest(goal.release)
@@ -625,7 +668,7 @@ class DokployBackend:
         document = {
             "schema": 1,
             "profile": goal.profile,
-            "generation": str(uuid4()),
+            "generation": self._operation_id(goal),
             "session": goal.session,
             "release": goal.release,
         }
@@ -641,31 +684,12 @@ class DokployBackend:
             0o644,
         )
         (self.data / READY_FILE).unlink(missing_ok=True)
-        # Idempotent rollout: a retried operation finds the tag already moved
-        # and the webhook dedupes on the generation key.
+        # Idempotent rollout: the generation persists in profile.json before
+        # the tag move, so a retried start() reuses it and the webhook dedupes
+        # on the same key across retries, not just within one trigger() call.
         self.mover.move(digest)
         self._webhook_inflight += 1
         try:
             self.webhook.trigger(document["generation"])
         finally:
             self._webhook_inflight -= 1
-
-    def wait_ready(self, generation: str, *, timeout: float = 600.0) -> dict:
-        """Poll until this generation reports READY; TimeoutError on deadline."""
-        deadline = self._clock() + timeout
-        while True:
-            ready = self.readiness()
-            if ready is not None and ready.get("generation") == generation:
-                selected = self.selection()
-                if (
-                    selected is not None
-                    and all(
-                        selected.get(key) == ready.get(key)
-                        for key in ("profile", "generation", "session", "release")
-                    )
-                    and self._alive()
-                ):
-                    return ready
-            if self._clock() >= deadline:
-                raise TimeoutError("workshop did not report READY for this generation")
-            self._sleep(self.poll)

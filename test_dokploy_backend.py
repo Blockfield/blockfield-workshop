@@ -317,6 +317,24 @@ class WebhookTests(unittest.TestCase):
             hook.trigger("op-3")
         self.assertEqual(len(fake.calls), 1)
 
+    def test_missing_url_raises_webhook_error(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(WebhookError):
+                DeployWebhook(http=FakeWebhook([200]), sleep=lambda s: None)
+
+    def test_plain_http_url_rejected(self):
+        with self.assertRaises(ValueError):
+            DeployWebhook(
+                url="http://hooks.example/hook",
+                http=FakeWebhook([200]),
+                sleep=lambda s: None,
+            )
+
+    def test_loopback_http_allowed_for_tests(self):
+        DeployWebhook(
+            url="http://127.0.0.1:9/hook", http=FakeWebhook([200]), sleep=lambda s: None
+        )
+
     def test_backoff_is_bounded(self):
         delays = []
         fake = FakeWebhook([500, 500, 200])
@@ -348,6 +366,11 @@ class RconTests(unittest.TestCase):
             with self.client(password="WRONG-SECRET-PW") as rcon:
                 rcon.command("save-all", "flush")
         self.assertNotIn("WRONG-SECRET-PW", str(ctx.exception))
+
+    def test_missing_password_raises_rcon_error(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RconError):
+                RconClient("127.0.0.1", self.server.port)
 
     def test_silent_server_hits_timeout(self):
         quiet = FakeRconServer(mute_commands=("save-all flush",))
@@ -426,8 +449,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(len(observed), 1)
         self.assertTrue(observed[0].ready)
         self.assertEqual(observed[0].goal.release, RELEASE)
-        confirmed = self.backend.wait_ready(selected["generation"], timeout=2.0)
-        self.assertEqual(confirmed["generation"], selected["generation"])
+        self.assertEqual(self.backend.readiness()["generation"], selected["generation"])
 
     def test_retry_after_webhook_failure_keeps_single_tag_move(self):
         failing = FakeWebhook([500, 500])
@@ -445,6 +467,37 @@ class BackendTests(unittest.TestCase):
         puts = [c for c in self.registry.calls if c[0] == "PUT"]
         self.assertEqual(len(puts), 1)
         self.assertEqual(len(recovered.calls), 1)
+
+    def test_retry_across_starts_reuses_idempotency_key(self):
+        # A retried start() for the same goal must POST with the generation
+        # persisted in profile.json before the tag move, not a fresh uuid4.
+        failing = FakeWebhook([TimeoutError("slow")])
+        self.backend.webhook = DeployWebhook(
+            url=WEBHOOK_URL, http=failing, attempts=1, sleep=lambda s: None
+        )
+        with self.assertRaises(WebhookError):
+            self.backend.start(self.goal)
+        first = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        recovered = FakeWebhook([200])
+        self.backend.webhook = DeployWebhook(
+            url=WEBHOOK_URL, http=recovered, sleep=lambda s: None
+        )
+        self.backend.start(self.goal)
+        second = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(second["generation"], first["generation"])
+        self.assertEqual(
+            recovered.calls[0][2]["Idempotency-Key"],
+            failing.calls[0][2]["Idempotency-Key"],
+        )
+        self.assertEqual(recovered.calls[0][2]["Idempotency-Key"], first["generation"])
+
+    def test_new_goal_mints_fresh_generation(self):
+        self.backend.start(self.goal)
+        first = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        other = Goal("workshop", RELEASE, str(uuid4()))
+        self.backend.start(other)
+        second = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertNotEqual(second["generation"], first["generation"])
 
     def test_wrong_digest_never_reaches_registry_or_webhook(self):
         with self.assertRaises(ValueError):
@@ -504,6 +557,30 @@ class BackendTests(unittest.TestCase):
         observed = self.backend.observe()
         self.assertEqual([p.goal.profile for p in observed], ["workshop"])
         self.assertFalse(observed[0].ready)
+
+    def test_observe_probes_tcp_once(self):
+        self.backend.start(self.goal)
+        with mock.patch.object(self.backend, "_alive", return_value=True) as alive:
+            self.backend.observe()
+        self.assertEqual(alive.call_count, 1)
+
+    def test_from_env_loads_verified_catalog(self):
+        catalog_path = Path(self.temp.name) / "releases.json"
+        catalog_path.write_text(json.dumps({RELEASE: self.record}))
+        env = {
+            "BF_GHCR_PACKAGE_TOKEN": TOKEN,
+            "BF_WORKSHOP_DEPLOY_WEBHOOK_URL": WEBHOOK_URL,
+            "BF_RELEASES_FILE": str(catalog_path),
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            backend = DokployBackend.from_env()
+        self.assertEqual(set(backend.releases), {RELEASE})
+        self.assertEqual(
+            backend.releases[RELEASE]["imageDigest"], self.record["imageDigest"]
+        )
+        del env["BF_RELEASES_FILE"]
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(DokployBackend.from_env().releases, {})
 
 
 class LifecycleIntegrationTests(unittest.TestCase):
