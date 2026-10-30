@@ -2,11 +2,15 @@
 
 Mechanism (owner decision 2026-10-30): the Workshop Dokploy app points at a
 fixed GHCR tag (``<repository>:approved``). After the controller verifies a
-published immutable release (see releases.py), this backend moves that tag to
-the verified manifest digest with a package-scoped credential, triggers the
-Workshop app's deploy webhook with bounded retry, and drives
-start/stop/save/status through direct private-network RCON plus the mod's
-READY file. No docker CLI, no Dokploy API token.
+published immutable release (see releases.py), this backend triggers a
+workflow_dispatch in the repository that owns the image package, passing the
+verified manifest digest; that workflow retags ``:approved`` with its own
+GITHUB_TOKEN, and the controller polls the workflow run to success before
+triggering the Workshop app's deploy webhook with bounded retry. Start/stop/
+save/status go through direct private-network RCON plus the mod's READY
+file. No docker CLI, no Dokploy API token, no package-scoped registry token:
+the controller holds only a single-repository fine-grained PAT (Actions
+scope) that cannot touch any package directly.
 
 The old DockerBackend stays authoritative (see docs/OPERATIONS.md); this
 module is staged beside it and shares the controller Backend protocol, the
@@ -28,22 +32,12 @@ from uuid import UUID, uuid4
 
 from controller import Goal, Process, atomic_write
 
-APPROVED_TAG = "approved"
 READY_FILE = ".blockfield-ready.json"
 UNKNOWN_SESSION = "00000000-0000-0000-0000-000000000000"
-DIGEST = re.compile(r"[0-9a-f]{64}")
-
-# OCI manifest media types the registry may serve for a server release.
-MANIFEST_TYPES = (
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.oci.image.manifest.v1+json",
-    "application/vnd.docker.distribution.manifest.v2+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-)
 
 
 class RegistryError(RuntimeError):
-    """GHCR tag move failed; the message never carries a credential."""
+    """Approved-tag move failed; the message never carries a credential."""
 
 
 class WebhookError(RuntimeError):
@@ -122,77 +116,144 @@ def _registry_base(repository: str) -> tuple[str, str]:
     raise ValueError("repository must be ghcr.io/<owner>/<image>")
 
 
-class GhcrTagMover:
-    """Move a fixed :approved tag to a verified release digest (registry API).
+class WorkflowTagMover:
+    """Move a fixed :approved tag via a workflow_dispatch in the image's repo.
 
-    The credential (``token`` / ``BF_GHCR_PACKAGE_TOKEN`` /
-    ``BF_GHCR_PACKAGE_TOKEN_FILE``) is scoped to write ONLY the approved-tag
-    package. It travels in one Authorization header and never appears in
-    errors or logs.
+    The credential (``token`` / ``BF_WORKSHOP_TAG_TOKEN`` /
+    ``BF_WORKSHOP_TAG_TOKEN_FILE``) is a fine-grained PAT restricted to the
+    single repository that owns the image package, with Actions read/write
+    only (no package, org or other repo scope). move() validates the digest,
+    dispatches the retag workflow with it, then polls the workflow run to
+    success; the workflow itself verifies the digest belongs to a published
+    verified release, retags :approved with its own GITHUB_TOKEN and reads
+    the tag back. Direct registry reads are impossible here (the package is
+    private and fine-grained PATs carry no package scope), so a successful
+    run conclusion is the confirmation. The token travels in one
+    Authorization header per call and never appears in errors or logs.
     """
+
+    API = "https://api.github.com"
 
     def __init__(
         self,
         repository: str,
         *,
+        owner_repo: str = "Blockfield/blockfield-server",
+        workflow: str = "move-approved-tag.yml",
+        ref: str = "main",
         token: str | None = None,
         http=http_request,
         timeout: float = 15.0,
+        poll_interval: float = 10.0,
+        confirm_timeout: float = 600.0,
+        dispatch_attempts: int = 3,
+        dispatch_delay: float = 1.0,
+        sleep=time.sleep,
+        clock=time.monotonic,
     ):
-        self.base, self.repository = _registry_base(repository)
+        _registry_base(repository)  # allowlist shape for digest validation
+        parts = owner_repo.split("/")
+        if len(parts) != 2 or not all(
+            part and part not in (".", "..") for part in parts
+        ):
+            raise ValueError("tag workflow needs <owner>/<repo>")
+        if dispatch_attempts < 1:
+            raise ValueError("dispatch needs at least one attempt")
+        self.repository = repository
+        self.owner_repo = owner_repo
+        self.workflow = workflow
+        self.ref = ref
         self._token = read_secret(
             value=token,
-            env="BF_GHCR_PACKAGE_TOKEN",
-            file_env="BF_GHCR_PACKAGE_TOKEN_FILE",
-            what="GHCR package",
+            env="BF_WORKSHOP_TAG_TOKEN",
+            file_env="BF_WORKSHOP_TAG_TOKEN_FILE",
+            what="tag workflow",
         )
         self._http = http
         self.timeout = timeout
+        self.poll_interval = poll_interval
+        self.confirm_timeout = confirm_timeout
+        self.dispatch_attempts = dispatch_attempts
+        self.dispatch_delay = dispatch_delay
+        self._sleep = sleep
+        self._clock = clock
 
-    def _call(
-        self,
-        method: str,
-        reference: str,
-        body: bytes | None = None,
-        content_type: str | None = None,
-    ) -> HttpResponse:
+    def _call(self, method: str, path: str, body: bytes | None = None) -> HttpResponse:
         headers = {
-            "Accept": ", ".join(MANIFEST_TYPES),
+            "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {self._token}",
         }
         if body is not None:
-            headers["Content-Type"] = content_type or MANIFEST_TYPES[1]
+            headers["Content-Type"] = "application/json"
         try:
             return self._http(
                 method,
-                f"{self.base}/manifests/{reference}",
+                f"{self.API}/repos/{self.owner_repo}{path}",
                 headers,
                 body,
                 self.timeout,
             )
         except Exception as error:
             raise RegistryError(
-                f"registry {method} failed: {type(error).__name__}"
+                f"tag workflow {method} failed: {type(error).__name__}"
             ) from error
 
-    def current(self) -> str | None:
-        """Digest the :approved tag points at now; None when the tag is absent."""
-        reply = self._call("GET", APPROVED_TAG)
-        if reply.status == 404:
-            return None
+    def _dispatch(self, digest: str, nonce: str) -> None:
+        """POST the dispatch; retry transport errors/5xx, fail fast on 4xx."""
+        body = json.dumps(
+            {"ref": self.ref, "inputs": {"digest": digest, "nonce": nonce}}
+        ).encode()
+        last: Exception | None = None
+        path = f"/actions/workflows/{self.workflow}/dispatches"
+        for attempt in range(self.dispatch_attempts):
+            try:
+                reply = self._call("POST", path, body)
+            except RegistryError as error:
+                last = error
+                reply = None
+            else:
+                if reply.status == 204:
+                    return
+                if 400 <= reply.status < 500:
+                    raise RegistryError(
+                        f"tag workflow dispatch rejected ({reply.status})"
+                    )
+                last = RegistryError(f"tag workflow dispatch answered ({reply.status})")
+            if attempt + 1 < self.dispatch_attempts:
+                self._sleep(self.dispatch_delay * 2**attempt)
+        raise RegistryError(
+            "tag workflow dispatch failed after "
+            f"{self.dispatch_attempts} attempts: "
+            f"{type(last).__name__ if last else 'unknown'}"
+        ) from last
+
+    def _find_run(self, nonce: str) -> dict | None:
+        """Newest dispatch run carrying our nonce, or None while queued."""
+        reply = self._call(
+            "GET",
+            f"/actions/workflows/{self.workflow}/runs"
+            "?event=workflow_dispatch&per_page=20",
+        )
         if reply.status != 200:
-            raise RegistryError(f"registry observe failed ({reply.status})")
-        digest = reply.headers.get("docker-content-digest", "")
-        if not DIGEST.fullmatch(digest.removeprefix("sha256:")):
-            raise RegistryError("registry returned an unparseable digest")
-        return digest
+            raise RegistryError(f"tag workflow poll failed ({reply.status})")
+        try:
+            runs = json.loads(reply.body).get("workflow_runs", [])
+        except ValueError as error:
+            raise RegistryError("tag workflow status unreadable") from error
+        for run in runs:
+            # The nonce is a fresh uuid4 per move(), so a name match is
+            # unambiguous without comparing clocks.
+            if nonce in str(run.get("name", "")):
+                return run
+        return None
 
     def move(self, digest: str) -> str:
-        """Point :approved at ``digest`` (``<repo>@sha256:<64hex>``); idempotent.
+        """Point :approved at ``digest`` (``<repo>@sha256:<64hex>``).
 
-        Verifies the release manifest exists, copies its exact bytes to the
-        tag, then reads the tag back and refuses a mismatch. Returns the
-        confirmed ``sha256:<hex>`` digest.
+        Dispatches the retag workflow and waits for its successful run; the
+        workflow does the actual retag and read-back verification. A
+        re-dispatch of the same digest converges on the same tag. Returns
+        the confirmed ``sha256:<hex>`` digest.
         """
         match = re.fullmatch(
             re.escape(self.repository) + r"@sha256:([0-9a-f]{64})", digest
@@ -201,21 +262,18 @@ class GhcrTagMover:
             # Never accept :latest, a foreign registry or a bare image ID here.
             raise ValueError("approved target needs this repository's digest")
         want = f"sha256:{match.group(1)}"
-        if self.current() == want:
-            return want
-        fetched = self._call("GET", want)
-        if fetched.status != 200:
-            raise RegistryError(f"release manifest unreadable ({fetched.status})")
-        media = fetched.headers.get("content-type", "").split(";")[0].strip()
-        if media not in MANIFEST_TYPES:
-            raise RegistryError("release has an unexpected manifest type")
-        # shortcut: GHCR serves small manifests; upgrade to ranged fetch when images need it.
-        stored = self._call("PUT", APPROVED_TAG, fetched.body, media)
-        if stored.status not in (200, 201):
-            raise RegistryError(f"tag move rejected ({stored.status})")
-        if self.current() != want:
-            raise RegistryError("tag moved but verification read back another digest")
-        return want
+        nonce = uuid4().hex
+        self._dispatch(digest, nonce)
+        deadline = self._clock() + self.confirm_timeout
+        while True:
+            run = self._find_run(nonce)
+            if run is not None and run.get("status") == "completed":
+                if run.get("conclusion") == "success":
+                    return want
+                raise RegistryError(f"tag workflow ended: {run.get('conclusion')}")
+            if self._clock() >= deadline:
+                raise RegistryError("tag workflow did not confirm the tag move in time")
+            self._sleep(self.poll_interval)
 
 
 class DeployWebhook:
@@ -430,7 +488,7 @@ class DokployBackend:
         *,
         data: Path,
         lock_dir: Path,
-        mover: GhcrTagMover,
+        mover: WorkflowTagMover,
         webhook: DeployWebhook,
         rcon_host: str,
         rcon_port: int,
@@ -468,11 +526,15 @@ class DokployBackend:
         return cls(
             data=Path(env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")),
             lock_dir=Path(env.get("BF_LOCK_DIR", "/srv/minecraft/backend-lock")),
-            mover=GhcrTagMover(
+            mover=WorkflowTagMover(
                 env.get(
                     "BF_WORKSHOP_APPROVED_REPOSITORY",
                     release_catalog.SERVER_REPOSITORY,
-                )
+                ),
+                owner_repo=env.get(
+                    "BF_WORKSHOP_TAG_REPO", "Blockfield/blockfield-server"
+                ),
+                workflow=env.get("BF_WORKSHOP_TAG_WORKFLOW", "move-approved-tag.yml"),
             ),
             webhook=DeployWebhook(),
             rcon_host=env.get("BF_WORKSHOP_RCON_HOST", "blockfield-workshop"),

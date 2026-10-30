@@ -25,18 +25,18 @@ for name in w04state w04data w04locks; do docker volume rm -f "$name" >/dev/null
 docker volume create w04state >/dev/null
 docker volume create w04data >/dev/null
 docker volume create w04locks >/dev/null
-printf 'dummy-ghcr-token' >"$SECRETS/ghcr-package-token"
+printf 'dummy-workflow-token' >"$SECRETS/github-tag-workflow-token"
 printf 'https://dokploy.local/api/webhook/deploy/00000000-0000-0000-0000-000000000000' >"$SECRETS/workshop-deploy-webhook-url"
 printf 'dummy-rcon-password' >"$SECRETS/workshop-rcon-password"
 # Secret pointers: the entrypoint reads credentials only from these files.
-set -- -e BF_GHCR_PACKAGE_TOKEN_FILE=/run/secrets/ghcr-package-token \
+set -- -e BF_WORKSHOP_TAG_TOKEN_FILE=/run/secrets/github-tag-workflow-token \
     -e BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE=/run/secrets/workshop-deploy-webhook-url \
     -e BF_WORKSHOP_RCON_PASSWORD_FILE=/run/secrets/workshop-rcon-password
 
 echo "== run entrypoint with Game off =="
 docker run -d --name w04ctl \
     -v w04state:/state -v w04data:/data -v w04locks:/locks \
-    -v "$SECRETS/ghcr-package-token:/run/secrets/ghcr-package-token:ro" \
+    -v "$SECRETS/github-tag-workflow-token:/run/secrets/github-tag-workflow-token:ro" \
     -v "$SECRETS/workshop-deploy-webhook-url:/run/secrets/workshop-deploy-webhook-url:ro" \
     -v "$SECRETS/workshop-rcon-password:/run/secrets/workshop-rcon-password:ro" \
     "$@" -e BF_STEP_INTERVAL_S=2 -e BF_STEP_FOLLOW_S=0 \
@@ -62,7 +62,7 @@ docker run --rm -v w04data:/ro:ro --entrypoint sh "$IMAGE" -c 'if touch /ro/must
 echo "== read-only rootfs still healthy =="
 docker run -d --name w04ro --read-only --tmpfs /tmp \
     -v w04state:/state -v w04data:/data -v w04locks:/locks \
-    -v "$SECRETS/ghcr-package-token:/run/secrets/ghcr-package-token:ro" \
+    -v "$SECRETS/github-tag-workflow-token:/run/secrets/github-tag-workflow-token:ro" \
     -v "$SECRETS/workshop-deploy-webhook-url:/run/secrets/workshop-deploy-webhook-url:ro" \
     -v "$SECRETS/workshop-rcon-password:/run/secrets/workshop-rcon-password:ro" \
     "$@" -e BF_STEP_INTERVAL_S=2 -e BF_STEP_FOLLOW_S=0 -e BF_HEALTH_PORT=8081 \
@@ -89,7 +89,7 @@ docker exec -d w04ctl python3 -I -c 'import fcntl,time; fd=open("/state/controll
 sleep 2
 code=0
 docker run --rm -v w04state:/state -v w04data:/data -v w04locks:/locks \
-    -v "$SECRETS/ghcr-package-token:/run/secrets/ghcr-package-token:ro" \
+    -v "$SECRETS/github-tag-workflow-token:/run/secrets/github-tag-workflow-token:ro" \
     -v "$SECRETS/workshop-deploy-webhook-url:/run/secrets/workshop-deploy-webhook-url:ro" \
     -v "$SECRETS/workshop-rcon-password:/run/secrets/workshop-rcon-password:ro" \
     "$@" -e BF_STEP_FOLLOW_S=0 \

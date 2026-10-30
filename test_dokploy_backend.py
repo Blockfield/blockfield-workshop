@@ -17,24 +17,20 @@ from uuid import uuid4
 from controller import Controller, Goal
 from release_fixtures import release_record as _fixture_record
 from dokploy_backend import (
-    APPROVED_TAG,
     DeployWebhook,
     DokployBackend,
-    GhcrTagMover,
     HttpResponse,
     RconClient,
     RconError,
     RegistryError,
     WebhookError,
+    WorkflowTagMover,
 )
 
 REPO = "ghcr.io/blockfield/blockfield-server"
 DIGEST = "sha256:" + "d" * 64
 REF = f"{REPO}@{DIGEST}"
-OTHER_DIGEST = "sha256:" + "e" * 64
-MANIFEST = b'{"schemaVersion":2,"fake":"manifest"}'
-MEDIA = "application/vnd.oci.image.manifest.v1+json"
-TOKEN = "SECRET-PACKAGE-TOKEN"
+TOKEN = "SECRET-WORKFLOW-TOKEN"
 WEBHOOK_URL = "https://hooks.example/SEKRIT-hook"
 RCON_PASSWORD = "SECRET-RCON-PASSWORD"
 
@@ -48,57 +44,56 @@ def release_record(release=RELEASE, digest="d"):
     return _fixture_record(release, digest)
 
 
-def seed_registry(registry, record):
-    """Serve the record's real manifest bytes under its verified digest."""
-    digest = record["imageDigest"].split("@", 1)[1]
-    registry.manifests = {digest: (MEDIA, record["source"]["imageManifest"].encode())}
-    return digest
+class FakeGitHub:
+    """Injectable GitHub Actions transport: dispatch + workflow runs polling.
 
+    POST /dispatches records the digest/nonce and (on 204) stages a run;
+    GET .../runs reports it in_progress for ``polls_to_settle`` polls, then
+    with ``conclusion``. Scripted per-dispatch ``outcomes`` are exceptions
+    (raised) or statuses (returned); exhausted scripts fall back to
+    ``dispatch_status``.
+    """
 
-class FakeRegistry:
-    """Injectable GHCR transport: manifests by digest, one :approved tag."""
-
-    def __init__(self):
+    def __init__(self, conclusion="success", polls_to_settle=0, dispatch_status=204):
         self.calls = []
-        self.manifests = {DIGEST: (MEDIA, MANIFEST)}
-        self.tag = None
-        self.sabotage_tag = None
-        self.fail_with = None
+        self.conclusion = conclusion
+        self.polls_to_settle = polls_to_settle
+        self.dispatch_status = dispatch_status
+        self.dispatch_outcomes = None
+        self.polls = 0
+        self.nonce = None
+        self.digest = None
 
     def __call__(self, method, url, headers, body, timeout):
         self.calls.append((method, url, dict(headers), body))
-        if self.fail_with is not None:
-            raise self.fail_with
-        reference = url.rsplit("/", 1)[-1]
-        if method == "GET" and reference == APPROVED_TAG:
-            if self.tag is None:
-                return HttpResponse(404, {}, b"")
-            _media, content = self.manifests.get(self.tag, (MEDIA, b'{"unknown":true}'))
-            return HttpResponse(
-                200,
-                {"docker-content-digest": self.tag, "content-type": MEDIA},
-                content,
-            )
-        if method == "GET":
-            if reference in self.manifests:
-                media, content = self.manifests[reference]
-                return HttpResponse(
-                    200,
-                    {"docker-content-digest": reference, "content-type": media},
-                    content,
-                )
-            return HttpResponse(404, {}, b"")
-        if method == "PUT" and reference == APPROVED_TAG:
-            for known, (_media, content) in self.manifests.items():
-                if content == body:
-                    self.tag = known
-                    break
+        if method == "POST" and url.endswith("/dispatches"):
+            outcome = None
+            if self.dispatch_outcomes:
+                outcome = self.dispatch_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            status = outcome if isinstance(outcome, int) else self.dispatch_status
+            if status == 204:
+                payload = json.loads(body)
+                self.nonce = payload["inputs"]["nonce"]
+                self.digest = payload["inputs"]["digest"]
+            return HttpResponse(status, {}, b"{}")
+        if method == "GET" and "/runs" in url:
+            self.polls += 1
+            if self.polls <= self.polls_to_settle:
+                run = {
+                    "name": f"approved-tag {self.nonce}",
+                    "status": "in_progress",
+                    "conclusion": None,
+                }
             else:
-                self.tag = "sha256:" + "0" * 64
-            if self.sabotage_tag is not None:
-                self.tag = self.sabotage_tag
-            return HttpResponse(201, {}, b"")
-        raise AssertionError(f"unexpected registry call {method} {url}")
+                run = {
+                    "name": f"approved-tag {self.nonce}",
+                    "status": "completed",
+                    "conclusion": self.conclusion,
+                }
+            return HttpResponse(200, {}, json.dumps({"workflow_runs": [run]}).encode())
+        raise AssertionError(f"unexpected github call {method} {url}")
 
 
 class FakeWebhook:
@@ -263,28 +258,47 @@ class FakeRconServer(threading.Thread):
 
 class MoverTests(unittest.TestCase):
     def setUp(self):
-        self.registry = FakeRegistry()
+        self.github = FakeGitHub()
 
     def mover(self, **kwargs):
-        return GhcrTagMover(REPO, token=TOKEN, http=self.registry, **kwargs)
+        kwargs.setdefault("sleep", lambda s: None)
+        return WorkflowTagMover(REPO, token=TOKEN, http=self.github, **kwargs)
 
-    def test_move_verifies_digest_after_put(self):
+    def test_move_dispatches_digest_and_confirms_success(self):
         self.assertEqual(self.mover().move(REF), DIGEST)
-        methods = [call[0] for call in self.registry.calls]
-        self.assertEqual(methods, ["GET", "GET", "PUT", "GET"])
-        put = self.registry.calls[2]
-        self.assertEqual(put[3], MANIFEST)
+        posts = [call for call in self.github.calls if call[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        _method, url, _headers, body = posts[0]
+        self.assertTrue(
+            url.endswith(
+                "/repos/Blockfield/blockfield-server"
+                "/actions/workflows/move-approved-tag.yml/dispatches"
+            ),
+            url,
+        )
+        payload = json.loads(body)
+        self.assertEqual(payload["ref"], "main")
+        self.assertEqual(payload["inputs"]["digest"], REF)
+        self.assertTrue(payload["inputs"]["nonce"])
+        self.assertEqual(self.github.digest, REF)
         # The credential travels in exactly one Authorization header per
         # call; it must never surface anywhere else (errors, logs).
-        for _method, _url, headers, _body in self.registry.calls:
+        for _method, _url, headers, _body in self.github.calls:
             self.assertEqual(headers["Authorization"], f"Bearer {TOKEN}")
+        self.assertNotIn(TOKEN, body.decode())
 
-    def test_move_is_idempotent_without_extra_put(self):
+    def test_move_is_convergent_without_registry_reads(self):
         mover = self.mover()
         mover.move(REF)
         self.assertEqual(mover.move(REF), DIGEST)
-        puts = [c for c in self.registry.calls if c[0] == "PUT"]
-        self.assertEqual(len(puts), 1)
+        # No registry calls at all: the package is private and this
+        # credential carries no package scope, so every move re-dispatches
+        # the same digest and the workflow converges on the same tag.
+        for _method, url, _headers, _body in self.github.calls:
+            self.assertTrue(url.startswith("https://api.github.com/"), url)
+        posts = [c for c in self.github.calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 2)
+        self.assertTrue(all(json.loads(p[3])["inputs"]["digest"] == REF for p in posts))
 
     def test_wrong_digest_rejected_before_any_call(self):
         for bad in (
@@ -295,24 +309,69 @@ class MoverTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError, msg=bad):
                 self.mover().move(bad)
-        self.assertEqual(self.registry.calls, [])
+        self.assertEqual(self.github.calls, [])
 
-    def test_tag_moved_but_verification_mismatch_fails(self):
-        self.registry.sabotage_tag = OTHER_DIGEST
-        self.registry.manifests[OTHER_DIGEST] = (MEDIA, b'{"other":true}')
-        with self.assertRaises(RegistryError):
-            self.mover().move(REF)
-
-    def test_registry_timeout_raises_without_credential(self):
-        self.registry.fail_with = TimeoutError("slow")
+    def test_dispatch_rejection_fails_fast_without_retry(self):
+        self.github.dispatch_status = 403
         with self.assertRaises(RegistryError) as ctx:
             self.mover().move(REF)
+        self.assertIn("403", str(ctx.exception))
+        posts = [c for c in self.github.calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertNotIn(TOKEN, str(ctx.exception))
+
+    def test_dispatch_retry_then_success(self):
+        delays = []
+        self.github.dispatch_outcomes = [TimeoutError("slow"), 500]
+        mover = self.mover(dispatch_delay=0.5, sleep=delays.append)
+        self.assertEqual(mover.move(REF), DIGEST)
+        posts = [c for c in self.github.calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 3)
+        self.assertEqual(delays, [0.5, 1.0])
+
+    def test_workflow_failure_conclusion_raises_without_credential(self):
+        self.github.conclusion = "failure"
+        with self.assertRaises(RegistryError) as ctx:
+            self.mover().move(REF)
+        self.assertIn("failure", str(ctx.exception))
+        self.assertNotIn(TOKEN, str(ctx.exception))
+
+    def test_run_never_settles_times_out(self):
+        github = FakeGitHub(polls_to_settle=10**9)
+        mover = WorkflowTagMover(
+            REPO,
+            token=TOKEN,
+            http=github,
+            sleep=lambda s: None,
+            poll_interval=0.001,
+            confirm_timeout=0.05,
+        )
+        with self.assertRaises(RegistryError) as ctx:
+            mover.move(REF)
+        self.assertIn("in time", str(ctx.exception))
+
+    def test_queued_run_polls_until_success(self):
+        github = FakeGitHub(polls_to_settle=2)
+        mover = WorkflowTagMover(REPO, token=TOKEN, http=github, sleep=lambda s: None)
+        self.assertEqual(mover.move(REF), DIGEST)
+        self.assertEqual(github.polls, 3)
+
+    def test_unreadable_run_list_raises_without_credential(self):
+        def broken(method, url, headers, body, timeout):
+            if method == "GET":
+                return HttpResponse(200, {}, b"not json")
+            return self.github(method, url, headers, body, timeout)
+
+        with self.assertRaises(RegistryError) as ctx:
+            WorkflowTagMover(REPO, token=TOKEN, http=broken, sleep=lambda s: None).move(
+                REF
+            )
         self.assertNotIn(TOKEN, str(ctx.exception))
 
     def test_missing_credential_lists_no_secret(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RegistryError) as ctx:
-                GhcrTagMover(REPO, http=self.registry)
+                WorkflowTagMover(REPO, http=self.github)
         self.assertNotIn(TOKEN, str(ctx.exception))
 
 
@@ -426,9 +485,8 @@ class BackendTests(unittest.TestCase):
         self.data, self.lock = root / "data", root / "lock"
         self.data.mkdir()
         (self.lock / "workshop").mkdir(parents=True)
-        self.registry = FakeRegistry()
+        self.github = FakeGitHub()
         self.record = release_record()
-        self.digest = seed_registry(self.registry, self.record)
         self.webhook_calls = FakeWebhook([200])
         self.server = FakeRconServer(outputs={"save-all flush": b"Saved the game"})
         self.server.start()
@@ -436,7 +494,9 @@ class BackendTests(unittest.TestCase):
         self.backend = DokployBackend(
             data=self.data,
             lock_dir=self.lock,
-            mover=GhcrTagMover(REPO, token=TOKEN, http=self.registry),
+            mover=WorkflowTagMover(
+                REPO, token=TOKEN, http=self.github, sleep=lambda s: None
+            ),
             webhook=DeployWebhook(
                 url=WEBHOOK_URL, http=self.webhook_calls, sleep=lambda s: None
             ),
@@ -462,11 +522,11 @@ class BackendTests(unittest.TestCase):
             )
         )
 
-    def test_start_moves_tag_triggers_webhook_and_reports_ready(self):
+    def test_start_dispatches_tag_move_triggers_webhook_and_reports_ready(self):
         self.backend.start(self.goal)
-        puts = [c for c in self.registry.calls if c[0] == "PUT"]
-        self.assertEqual(len(puts), 1)
-        self.assertEqual(self.registry.tag, self.digest)
+        posts = [c for c in self.github.calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(self.github.digest, self.record["imageDigest"])
         self.assertEqual(len(self.webhook_calls.calls), 1)
         selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
         self.assertEqual(
@@ -486,21 +546,27 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(observed[0].goal.release, RELEASE)
         self.assertEqual(self.backend.readiness()["generation"], selected["generation"])
 
-    def test_retry_after_webhook_failure_keeps_single_tag_move(self):
+    def test_retry_after_webhook_failure_redispatches_same_digest(self):
         failing = FakeWebhook([500, 500])
         self.backend.webhook = DeployWebhook(
             url=WEBHOOK_URL, http=failing, attempts=2, sleep=lambda s: None
         )
         with self.assertRaises(WebhookError):
             self.backend.start(self.goal)
-        self.assertEqual(self.registry.tag, self.digest)
+        self.assertEqual(self.github.digest, self.record["imageDigest"])
         recovered = FakeWebhook([200])
         self.backend.webhook = DeployWebhook(
             url=WEBHOOK_URL, http=recovered, sleep=lambda s: None
         )
         self.backend.start(self.goal)
-        puts = [c for c in self.registry.calls if c[0] == "PUT"]
-        self.assertEqual(len(puts), 1)
+        posts = [c for c in self.github.calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 2)
+        self.assertTrue(
+            all(
+                json.loads(p[3])["inputs"]["digest"] == self.record["imageDigest"]
+                for p in posts
+            )
+        )
         self.assertEqual(len(recovered.calls), 1)
 
     def test_retry_across_starts_reuses_idempotency_key(self):
@@ -534,16 +600,16 @@ class BackendTests(unittest.TestCase):
         second = json.loads((self.lock / "workshop/profile.json").read_bytes())
         self.assertNotEqual(second["generation"], first["generation"])
 
-    def test_wrong_digest_never_reaches_registry_or_webhook(self):
+    def test_wrong_digest_never_reaches_github_or_webhook(self):
         with self.assertRaises(ValueError):
             self.backend.mover.move("ghcr.io/other/x@sha256:" + "f" * 64)
-        self.assertEqual(self.registry.calls, [])
+        self.assertEqual(self.github.calls, [])
         self.assertEqual(self.webhook_calls.calls, [])
 
     def test_unknown_release_fails_preflight_before_effects(self):
         with self.assertRaises(ValueError):
             self.backend.start(Goal("workshop", "v-absent", str(uuid4())))
-        self.assertEqual(self.registry.calls, [])
+        self.assertEqual(self.github.calls, [])
         self.assertEqual(self.webhook_calls.calls, [])
         self.assertFalse((self.lock / "workshop/profile.json").exists())
 
@@ -631,7 +697,7 @@ class BackendTests(unittest.TestCase):
         catalog_path = Path(self.temp.name) / "releases.json"
         catalog_path.write_text(json.dumps({RELEASE: self.record}))
         env = {
-            "BF_GHCR_PACKAGE_TOKEN": TOKEN,
+            "BF_WORKSHOP_TAG_TOKEN": TOKEN,
             "BF_WORKSHOP_DEPLOY_WEBHOOK_URL": WEBHOOK_URL,
             "BF_RELEASES_FILE": str(catalog_path),
         }
@@ -656,9 +722,8 @@ class LifecycleIntegrationTests(unittest.TestCase):
         self.data, self.lock = root / "data", root / "lock"
         self.data.mkdir()
         (self.lock / "workshop").mkdir(parents=True)
-        self.registry = FakeRegistry()
+        self.github = FakeGitHub()
         self.record = release_record()
-        self.digest = seed_registry(self.registry, self.record)
         self.webhook = FakeWebhook([200])
         # The app starts dark: nothing listens yet, as before the first deploy.
         self.server = FakeRconServer(
@@ -669,7 +734,9 @@ class LifecycleIntegrationTests(unittest.TestCase):
         self.backend = DokployBackend(
             data=self.data,
             lock_dir=self.lock,
-            mover=GhcrTagMover(REPO, token=TOKEN, http=self.registry),
+            mover=WorkflowTagMover(
+                REPO, token=TOKEN, http=self.github, sleep=lambda s: None
+            ),
             webhook=DeployWebhook(
                 url=WEBHOOK_URL, http=self.webhook, sleep=lambda s: None
             ),
@@ -691,7 +758,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
         state = self.controller.step()
         self.assertEqual(state["phase"], "STARTING")
         selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
-        self.assertEqual(self.registry.tag, self.digest)
+        self.assertEqual(self.github.digest, self.record["imageDigest"])
         # The deploy brings java up; the mod reports READY for this generation.
         self.server.come_back()
         (self.data / ".blockfield-ready.json").write_text(
@@ -720,15 +787,15 @@ class LifecycleIntegrationTests(unittest.TestCase):
         state = self.controller.step()
         self.assertEqual(state["phase"], "ERROR")
         self.assertIn("explicit recovery", state["errorMessage"])
-        self.assertEqual(self.registry.calls, [])
+        self.assertEqual(self.github.calls, [])
         recovered = self.controller.step(recover=True)
         self.assertEqual(recovered["phase"], "STARTING")
-        self.assertEqual(self.registry.tag, self.digest)
+        self.assertEqual(self.github.digest, self.record["imageDigest"])
 
 
 class ShadowRunTests(unittest.TestCase):
     """Read-only shadow: ticks against a sanitized state export with Game off
-    and no java make no registry/webhook call and leave the exported gate and
+    and no java make no GitHub dispatch/webhook call and leave the exported gate and
     public projections byte-identical once converged; no secret lands on disk."""
 
     def setUp(self):
@@ -738,12 +805,14 @@ class ShadowRunTests(unittest.TestCase):
         self.data, self.lock = root / "data", root / "lock"
         self.data.mkdir()
         (self.lock / "workshop").mkdir(parents=True)
-        self.registry = FakeRegistry()
+        self.github = FakeGitHub()
         self.webhook = FakeWebhook([200])
         self.backend = DokployBackend(
             data=self.data,
             lock_dir=self.lock,
-            mover=GhcrTagMover(REPO, token=TOKEN, http=self.registry),
+            mover=WorkflowTagMover(
+                REPO, token=TOKEN, http=self.github, sleep=lambda s: None
+            ),
             webhook=DeployWebhook(
                 url=WEBHOOK_URL, http=self.webhook, sleep=lambda s: None
             ),
@@ -776,7 +845,7 @@ class ShadowRunTests(unittest.TestCase):
             self.controller.status()
         self.assertEqual((self.controller.gate_file).read_bytes(), gate_once)
         self.assertEqual((self.controller.public_file).read_bytes(), public_once)
-        self.assertEqual(self.registry.calls, [])
+        self.assertEqual(self.github.calls, [])
         self.assertEqual(self.webhook.calls, [])
         self.assertEqual(first["phase"], "UNINITIALIZED")
         for path in (self.controller.directory).rglob("*"):

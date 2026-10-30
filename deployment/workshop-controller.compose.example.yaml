@@ -60,7 +60,7 @@ services:
       BF_WORKSHOP_RCON_PORT: 25575
       # Secrets below come from Dokploy-managed secret files mounted into the
       # container; their values never appear here, in logs or in state.
-      BF_GHCR_PACKAGE_TOKEN_FILE: /run/secrets/ghcr-package-token
+      BF_WORKSHOP_TAG_TOKEN_FILE: /run/secrets/github-tag-workflow-token
       BF_WORKSHOP_DEPLOY_WEBHOOK_URL_FILE: /run/secrets/workshop-deploy-webhook-url
       BF_WORKSHOP_RCON_PASSWORD_FILE: /run/secrets/workshop-rcon-password
     volumes:
@@ -74,7 +74,7 @@ services:
       - workshop-templates:/templates:ro
       - workshop-published:/published:ro
     secrets:
-      - ghcr-package-token
+      - github-tag-workflow-token
       - workshop-deploy-webhook-url
       - workshop-rcon-password
 
@@ -88,8 +88,8 @@ volumes:
 secrets:
   # Compose-client-side file resolution is docs-only here: verify at W07
   # creation time that Dokploy actually supports secret-file mounts.
-  ghcr-package-token:
-    file: /etc/blockfield/ghcr-package-token
+  github-tag-workflow-token:
+    file: /etc/blockfield/github-tag-workflow-token
   workshop-deploy-webhook-url:
     file: /etc/blockfield/workshop-deploy-webhook-url
   workshop-rcon-password:
