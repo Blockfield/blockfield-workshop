@@ -27,7 +27,7 @@ docker volume create w04data >/dev/null
 docker volume create w04locks >/dev/null
 printf 'dummy-rcon-password' >"$SECRETS/workshop-rcon-password"
 # Secret pointers: the entrypoint reads credentials only from these files.
-set --     -e BF_WORKSHOP_RCON_PASSWORD_FILE=/run/secrets/workshop-rcon-password
+set -- -e BF_WORKSHOP_RCON_PASSWORD_FILE=/run/secrets/workshop-rcon-password
 
 echo "== run entrypoint with Game off =="
 docker run -d --name w04ctl \
