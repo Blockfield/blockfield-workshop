@@ -1827,9 +1827,9 @@ class Controller:
                     }
                     if payload is not None:
                         result["payload"] = payload
-                        if (
-                            isinstance(payload, dict)
-                            and payload.get("kind") == "ai-key"
+                        if isinstance(payload, dict) and payload.get("kind") in (
+                            "ai-key",
+                            "ai-gateway-key",
                         ):
                             # The site contract reads the ai-key status flat
                             # (kind/set/last4/sha256Prefix/appliedAt); the envelope
@@ -2306,19 +2306,27 @@ class Controller:
                 raise copy_error
             return payload
 
-    def _apply_ai_key(self, request_id: str, document: dict) -> dict:
+    def _apply_ai_key(
+        self,
+        request_id: str,
+        document: dict,
+        *,
+        filename: str = "openrouter.key",
+        status_name: str = "ai-key.json",
+        kind: str = "ai-key",
+    ) -> dict:
         """Write-only workshop AI key from the site; null removes it.
 
         Runs under the controller lock. The key value never reaches logs, results,
         state or exceptions: only its last4/sha256 prefix leave this function.
         """
         if "key" not in document:
-            raise ValueError("invalid ai-key request")
+            raise ValueError(f"invalid {kind} request")
         key = document["key"]
         if key is not None and (
             type(key) is not str or AI_KEY_PATTERN.fullmatch(key) is None
         ):
-            raise ValueError("invalid ai-key request")
+            raise ValueError(f"invalid {kind} request")
         with self._locked():
             base = self.workshop_data_dir
             if base is None:
@@ -2329,11 +2337,11 @@ class Controller:
                 raise ValueError("workshop data directory is not configured")
             directory, path = (
                 Path(base) / "blockfield-workshop",
-                Path(base) / "blockfield-workshop/openrouter.key",
+                Path(base) / f"blockfield-workshop/{filename}",
             )
             for node in (path, *path.parents):
                 if node.is_symlink():
-                    raise ValueError("unsafe ai-key path")
+                    raise ValueError(f"unsafe {kind} path")
                 if node == Path(base):
                     break
             try:
@@ -2348,7 +2356,7 @@ class Controller:
                     or info.st_uid != AI_KEY_UID
                     or info.st_gid != AI_KEY_GID
                 ):
-                    raise ValueError("unsafe ai-key directory")
+                    raise ValueError(f"unsafe {kind} directory")
             if key is None:
                 path.unlink(missing_ok=True)
                 stored = {"set": False, "last4": "", "sha256Prefix": ""}
@@ -2362,7 +2370,7 @@ class Controller:
                 }
             applied_at = self._now_ms()
             atomic_write(
-                self.admin_dir / "ai-key.json",
+                self.admin_dir / status_name,
                 json.dumps(
                     {"schema": 1, **stored, "appliedAt": applied_at},
                     ensure_ascii=False,
@@ -2370,7 +2378,7 @@ class Controller:
                 ).encode(),
                 0o644,
             )
-            return {"kind": "ai-key", **stored, "appliedAt": applied_at}
+            return {"kind": kind, **stored, "appliedAt": applied_at}
 
     def _apply(self, request_id: str, document: dict) -> int | dict | None:
         kind = document.get("kind")
@@ -2544,6 +2552,14 @@ class Controller:
             return result
         if kind == "ai-key":
             return self._apply_ai_key(request_id, document)
+        if kind == "ai-gateway-key":
+            return self._apply_ai_key(
+                request_id,
+                document,
+                filename="gateway.key",
+                status_name="ai-gateway-key.json",
+                kind="ai-gateway-key",
+            )
         if kind != "mode":
             raise ValueError("unknown kind")
         profile, expected, recover = (
