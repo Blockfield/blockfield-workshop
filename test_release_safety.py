@@ -8,7 +8,7 @@ from unittest import mock
 from uuid import uuid4
 
 from controller import Controller, Goal, Process
-from releases import load_catalog, validate_release_record
+from releases import load_catalog, resolve, validate_release_record
 from release_fixtures import catalog, release_record
 from test_controller import FakeBackend
 
@@ -462,3 +462,75 @@ class PublishedClientVersionTest(unittest.TestCase):
     def test_garbage_client_version_rejected(self):
         with self.assertRaises(ValueError):
             validate_release_record(release_record(client_version="1.0"))
+
+
+class DigestReleaseTests(unittest.TestCase):
+    """Goals and targets accept an image digest; the tag path keeps working.
+
+    Journal shape never changes (Goal keeps one free-form release string),
+    so an old reader — whose read path has no release-shape checks — keeps
+    reading new journals, and new code keeps reading old tag journals.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.backend = FakeBackend()
+        self.records = catalog()
+        self.keyed = dict(self.records)
+        for name, record in self.records.items():
+            self.keyed[record["imageDigest"].split("@", 1)[1]] = record
+        self.session = str(uuid4())
+        self.controller = Controller(self.root, self.backend, releases=self.keyed)
+        self.controller._now = lambda: 1000.0
+        self.controller.start_timeout = 10
+
+    def digest(self, release="v1.0.0"):
+        return self.records[release]["imageDigest"].split("@", 1)[1]
+
+    def test_resolve_accepts_digest_alias(self):
+        digest = self.digest()
+        self.assertEqual(resolve(self.keyed, digest)["release"], "v1.0.0")
+        self.assertEqual(resolve(self.keyed, "v1.0.0")["release"], "v1.0.0")
+        with self.assertRaises(ValueError):
+            resolve(self.keyed, "sha256:" + "f" * 64)
+        wrong = dict(self.keyed)
+        wrong["v1.0.0"] = self.records["v2.0.0"]
+        with self.assertRaises(ValueError):
+            resolve(wrong, "v1.0.0")
+
+    def test_digest_request_reaches_ready(self):
+        digest = self.digest()
+        state = self.controller.request(
+            str(uuid4()), Goal("workshop", digest, self.session), 0
+        )
+        self.assertEqual(state["desired"]["release"], digest)
+        self.controller.step()
+        self.backend.ready(Goal("workshop", digest, self.session))
+        state = self.controller.step()
+        self.assertEqual(state["desired"]["release"], digest)
+        self.assertEqual(self.controller.approved_target()["release"], "v1.0.0")
+        self.assertEqual(self.controller.status()["desired"]["release"], digest)
+
+    def test_journal_shape_unchanged_between_tag_and_digest(self):
+        tag_state = self.controller.request(
+            str(uuid4()), Goal("workshop", "v1.0.0", self.session), 0
+        )
+        other = Controller(self.root / "digest", self.backend, releases=self.keyed)
+        digest_state = other.request(
+            str(uuid4()), Goal("workshop", self.digest(), self.session), 0
+        )
+        for first, second in (
+            (tag_state, digest_state),
+            (tag_state["desired"], digest_state["desired"]),
+            (tag_state["selection"], digest_state["selection"]),
+            (tag_state["selection"]["intent"], digest_state["selection"]["intent"]),
+            (tag_state["approvedTarget"], digest_state["approvedTarget"]),
+        ):
+            self.assertEqual(set(first), set(second))
+        self.assertEqual(tag_state["desired"]["release"], "v1.0.0")
+        self.assertEqual(digest_state["desired"]["release"], self.digest())
+        # Old tag journal still validates and projects under the new code.
+        self.assertEqual(self.controller.status()["revision"], 1)
+        self.assertEqual(other.status()["revision"], 1)

@@ -79,6 +79,14 @@ class Process:
     ready: bool
 
 
+def _release_matches(release: str, record: dict) -> bool:
+    """Whether a goal release string names a verified record: its tag or its image digest."""
+    return (
+        release == record["release"]
+        or release == record["imageDigest"].split("@", 1)[1]
+    )
+
+
 class Backend(Protocol):
     def preflight(self, goal: Goal) -> None:
         """Check space, separate data, pinned profile and fencing of restart/deploy paths."""
@@ -511,8 +519,10 @@ class Controller:
                     selection["requestSession"] is None
                     or isinstance(selection["requestSession"], dict)
                 )
-                or intent.release != state["approvedTarget"]["release"]
-                or state["activeTarget"]["release"] != state["desired"]["release"]
+                or not _release_matches(intent.release, state["approvedTarget"])
+                or not _release_matches(
+                    state["desired"]["release"], state["activeTarget"]
+                )
                 or (
                     not selection["deferred"]
                     and (state["activeTarget"] != state["approvedTarget"])
@@ -521,8 +531,9 @@ class Controller:
                     state.get("rollback") is not None
                     and (
                         state.get("rollbackTarget") is None
-                        or state["rollbackTarget"]["release"]
-                        != state["rollback"]["release"]
+                        or not _release_matches(
+                            state["rollback"]["release"], state["rollbackTarget"]
+                        )
                     )
                 )
             ):
@@ -640,14 +651,14 @@ class Controller:
                 known = state.get(key)
                 if (
                     known is not None
-                    and known["release"] == release
+                    and _release_matches(release, known)
                     and known != record
                 ):
                     raise ValueError("published release identity changed")
             return record
         # Catalog loss permits only the exact already committed identity.
         target = state.get("approvedTarget")
-        if target is not None and target["release"] == release:
+        if target is not None and _release_matches(release, target):
             return release_catalog.validate_release_record(target)
         raise ValueError(f"release {release!r} is not a verified published release")
 
@@ -1191,7 +1202,9 @@ class Controller:
                 activeTarget=(
                     record
                     if state.get("activeTarget") is None
-                    and record["release"] == (state.get("desired") or {}).get("release")
+                    and _release_matches(
+                        (state.get("desired") or {}).get("release"), record
+                    )
                     else state.get("activeTarget")
                 ),
                 selection={
@@ -1613,7 +1626,7 @@ class Controller:
         if stable.profile == "game":
             raise RuntimeError("legacy Game rollback must be migrated before recovery")
         target = state.get("rollbackTarget")
-        if target is None or target["release"] != stable.release:
+        if target is None or not _release_matches(stable.release, target):
             raise ValueError(
                 "rollback requires its committed previous release identity"
             )
