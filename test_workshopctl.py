@@ -153,6 +153,13 @@ class WorkshopctlTests(unittest.TestCase):
             1,
         )
 
+    def test_step_follows_only_committable_phases(self):
+        # DRAINING is never committed by the controller; waiting on it (or
+        # offering cancel for it) only confuses operators during incidents.
+        self.assertEqual(
+            workshopctl.FOLLOWED_PHASES, {"REQUESTED", "SAVING", "STARTING"}
+        )
+
     def test_recover_runs_explicit_step(self):
         self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("request", "game", "--release", "v1.0.0")

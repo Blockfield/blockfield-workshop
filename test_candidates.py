@@ -4,6 +4,7 @@ from release_fixtures import catalog
 
 import json
 import os
+import shutil
 import tempfile
 import time
 import zipfile
@@ -150,6 +151,18 @@ class CandidateTests(unittest.TestCase):
         self.store.publish(meta["id"], ACTOR)
         with zipfile.ZipFile(self.store.archive_path(meta["id"])) as archive:
             self.assertEqual(json.loads(archive.read("map.json"))["name"], "edited")
+
+    def test_export_reaps_stale_temp_files(self):
+        meta = self.store.create("konstaxa", ACTOR)
+        exports = self.store.versions.archive / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        stale = exports / ".export-deadbeef.tmp"
+        stale.write_bytes(b"partial")
+        target = exports / "candidate.zip"
+        checksum, size = self.store.versions.export_package(meta, target)
+        self.assertFalse(stale.exists())
+        self.assertTrue(target.is_file())
+        self.assertGreater(size, 0)
 
     def test_acceptance_preserves_live_world_json_and_archive(self):
         meta = self.store.create("konstaxa", ACTOR)
@@ -359,6 +372,61 @@ class BaseAndPlaytestTests(unittest.TestCase):
         self.assertFalse((target / "manifest.json").exists())
         with self.assertRaises(ValueError):
             self.store.sha256_of("0" * 32)
+
+    def test_extract_rejects_tampered_bytes(self):
+        meta = self.store.create("konstaxa", ACTOR)
+        target = self.data / "test-candidate-tampered"
+        real_read = zipfile.ZipFile.read
+
+        def tampered(archive, name):
+            data = real_read(archive, name)
+            key = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            return b"tampered" if key == "world/region/r.0.0.mca" else data
+
+        with mock.patch.object(zipfile.ZipFile, "read", tampered):
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                self.store.extract(self.store.sha256_of(meta["id"]), target)
+
+    def test_extract_rejects_leftover_bytes_from_a_partial_wipe(self):
+        meta = self.store.create("konstaxa", ACTOR)
+        target = self.data / "test-candidate-stale"
+        stale = target / "world" / "region" / "r.9.9.mca"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"stale")
+        real_rmtree = shutil.rmtree
+
+        def partial_wipe(path, *args, **kwargs):
+            real_rmtree(path, *args, **kwargs)
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.write_bytes(b"stale")
+
+        with mock.patch.object(candidates.shutil, "rmtree", partial_wipe):
+            with self.assertRaisesRegex(ValueError, "does not match its manifest"):
+                self.store.extract(self.store.sha256_of(meta["id"]), target)
+
+    def test_snapshot_streams_region_files_without_loading_them(self):
+        seen = []
+        real_read_bytes = Path.read_bytes
+
+        def spy_read_bytes(path):
+            if path.suffix == ".mca":
+                seen.append(path)
+            return real_read_bytes(path)
+
+        with mock.patch.object(Path, "read_bytes", spy_read_bytes):
+            self.store.create("konstaxa", ACTOR)
+        self.assertEqual(seen, [])
+
+    def test_oversized_world_fails_before_loading_any_region(self):
+        region = self.world / "region"
+        for name in ("r.9.9.mca", "r.9.10.mca"):
+            with open(region / name, "wb") as handle:
+                handle.truncate(600 << 20)
+        with mock.patch.object(
+            Path, "read_bytes", side_effect=AssertionError("must not load a huge world")
+        ):
+            with self.assertRaisesRegex(ValueError, "exceeds package limit"):
+                self.store.versions.world_files(self.world, b"{}")
 
     def test_extract_for_the_playtest_is_not_group_writable(self):
         meta = self.store.create("konstaxa", ACTOR)

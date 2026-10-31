@@ -348,6 +348,7 @@ class SleepTests(unittest.TestCase):
                     "kind": "wake",
                     "phase": "REQUESTED",
                     "revision": sleeping["revision"] + 1,
+                    "started": True,
                 },
             ),
         )
@@ -393,6 +394,7 @@ class SleepTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["payload"]["phase"], "workshop")
         self.assertIsNone(result["revision"])
+        self.assertFalse(result["payload"]["started"])
         self.assertEqual(self.controller.status()["revision"], revision)
         self.assertEqual(self.backend.events, [])
         # While STARTING a wake also reports ok without a second start.
@@ -405,6 +407,7 @@ class SleepTests(unittest.TestCase):
         self.process()
         result = self.result(request_id)
         self.assertEqual((result["ok"], result["payload"]["phase"]), (True, "STARTING"))
+        self.assertFalse(result["payload"]["started"])
         self.assertEqual(self.backend.events.count("start"), starts)
 
     def test_repeated_wake_while_starting_is_single_start(self):
@@ -590,6 +593,7 @@ class CliWakeTests(unittest.TestCase):
         code, result = self.ctl("wake")
         self.assertEqual(code, 0)
         self.assertEqual(result["wake"]["phase"], "REQUESTED")
+        self.assertTrue(result["wake"]["started"])
         self.assertEqual(result["state"]["phase"], "STARTING")
         self.assertEqual(result["state"]["desired"]["session"], session)
         self.backend.ready(Goal(**result["state"]["desired"]))

@@ -1684,13 +1684,29 @@ class Controller:
 
     def cancel(self) -> dict:
         """Unprivileged abort of a stuck switch (site -> inbox "cancel", no root): roll back now
-        instead of waiting for the deadline. Only valid while a switch is actually in flight."""
+        instead of waiting for the deadline. Only valid while a switch is actually in flight.
+        With no previous stable profile (first-ever start, or a recover retry that never became
+        ready) there is nothing to restore: fence anything half-started and park in ERROR so an
+        explicit request --recover can retry, instead of spinning with the gate closed."""
         with self._locked():
             state = self._read()
-            if state.get("phase") not in {"DRAINING", "STARTING"}:
+            if state.get("phase") not in {"STARTING"}:
                 raise ValueError("nothing to cancel: no switch is in progress")
             if not state.get("rollback"):
-                raise ValueError("no previous stable profile recorded to roll back to")
+                self.backend.fence_pending_starts()
+                state.update(
+                    revision=state["revision"] + 1,
+                    operation=str(uuid4()),
+                    phase="ERROR",
+                    gate="closed",
+                    error="Cancelled",
+                    errorMessage="cancelled by admin request; explicit recovery required",
+                    since=self._now_ms(),
+                    rollback=None,
+                    rollbackTarget=None,
+                )
+                self._write(state)
+                return state
             return self._rollback(
                 state, Goal(**state["desired"]), "cancelled by admin request"
             )
@@ -1701,7 +1717,9 @@ class Controller:
         Sleeping restarts the same goal through the ordinary request path, so the next
         step starts it like any other switch (STARTING -> workshop) at the exact
         approved digest; the session, maps and drafts are unchanged. Any other phase is
-        already awake or starting and reports ok without side effects. A member actor
+        already awake or starting and reports ok without side effects, with
+        "started": False so the site can tell it apart from a real wake ("started": True).
+        A member actor
         (draslId/name) must belong to the workshop ACL; None is the root operator
         (workshopctl) and skips that check.
         """
@@ -1715,6 +1733,9 @@ class Controller:
                     "kind": "wake",
                     "phase": state.get("phase"),
                     "revision": state.get("revision"),
+                    # No-op: the editor is already awake or starting. Explicit so the
+                    # site never reads ok:true as "just started" while builders stay out.
+                    "started": False,
                 }
             target = self._project_target(state)
             if target is None:
@@ -1727,6 +1748,7 @@ class Controller:
                 "kind": "wake",
                 "phase": state["phase"],
                 "revision": state["revision"],
+                "started": True,
             }
 
     def process_inbox(self, now_ms: int | None = None) -> int:
@@ -1856,15 +1878,27 @@ class Controller:
             destination = packages / (meta["sha256"] + ".zip")
             if not destination.exists():
                 packages.mkdir(parents=True, exist_ok=True)
-                temporary = destination.with_suffix(".tmp")
+                # Unique temp per export: concurrent steps (timer + manual) share
+                # this loop and must not trample each other's copy mid-digest.
+                fd, name = tempfile.mkstemp(
+                    dir=packages, prefix=destination.name + ".", suffix=".tmp"
+                )
+                temporary = Path(name)
+                os.close(fd)
                 try:
                     shutil.copyfile(source, temporary)
                     with temporary.open("rb") as handle:
                         digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                        os.fsync(handle.fileno())
                     if digest != meta["sha256"]:
                         raise ValueError("accepted package checksum mismatch")
                     temporary.chmod(0o444)
                     temporary.replace(destination)
+                    directory_fd = os.open(packages, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
                     if meta.get("native"):
                         meta["derivedPackage"] = True
                         self.maps._write_meta(meta)

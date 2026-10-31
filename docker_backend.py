@@ -1158,11 +1158,22 @@ class DockerBackend:
     @contextmanager
     def workshop_saves_held(self):
         """Hot snapshot: chunks are flushed and autosave is off while the copy runs, so builders stay
-        connected. The mod replaces markup files atomically; a stopped editor has nothing to hold."""
+        connected. The mod replaces markup files atomically; a stopped editor has nothing to hold.
+        Entry re-enables autosave first: a previous failed save-on (or a kill mid-snapshot)
+        otherwise leaves it off silently and the next save-off accepts "already turned off"."""
         if self.inventory(tasks=False)["workshop"]["java"] == 0:
             yield
             return
         try:
+            result = self._rcon("workshop", "save-on")
+            if result is None or not any(
+                message in result
+                for message in (
+                    "Automatic saving is now enabled",
+                    "Saving is already turned on",
+                )
+            ):
+                raise RuntimeError("save-on did not confirm autosave enabled")
             result = self._rcon("workshop", "save-off")
             if result is None or not any(
                 message in result
@@ -1177,8 +1188,20 @@ class DockerBackend:
                 raise RuntimeError("save-all did not confirm success for live snapshot")
             yield
         finally:
-            # A timed-out save-off may still have reached Java.
-            result = self._rcon("workshop", "save-on")
+            # A timed-out save-off may still have reached Java; retry an
+            # unconfirmed save-on once, since it likely only missed the reply.
+            try:
+                result = self._rcon("workshop", "save-on")
+            except Exception:
+                result = None
+            if result is None or not any(
+                message in result
+                for message in (
+                    "Automatic saving is now enabled",
+                    "Saving is already turned on",
+                )
+            ):
+                result = self._rcon("workshop", "save-on")
             if result is None or not any(
                 message in result
                 for message in (

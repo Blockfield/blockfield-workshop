@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from controller import DEFAULT_MESSAGE, Controller, Goal  # noqa: E402
 
 # Transitional phases worth re-checking right away; stable phases and ERROR wait for the next tick.
-FOLLOWED_PHASES = {"REQUESTED", "DRAINING", "SAVING", "STARTING"}
+FOLLOWED_PHASES = {"REQUESTED", "SAVING", "STARTING"}
 
 BUSY = 75
 

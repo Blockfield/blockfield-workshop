@@ -24,6 +24,7 @@ import shutil
 import socket
 import struct
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -377,6 +378,56 @@ class DokployBackend:
             result = rcon.command("save-all", "flush")
         if "Saved the game" not in result:
             raise RuntimeError(f"save-all did not confirm success: {result[:300]}")
+
+    @staticmethod
+    def _save_on_confirmed(result: str) -> bool:
+        return any(
+            message in result
+            for message in (
+                "Automatic saving is now enabled",
+                "Saving is already turned on",
+            )
+        )
+
+    @contextmanager
+    def workshop_saves_held(self):
+        """Hot snapshot: flush chunks and hold autosave off while the copy runs, so builders stay
+        connected. A stopped editor has nothing to hold. Entry re-enables autosave first: a
+        previous failed save-on (or a kill mid-snapshot) otherwise leaves it off silently and the
+        next save-off accepts "already turned off" as success."""
+        if not self._alive():
+            yield
+            return
+        with self._rcon() as rcon:
+            try:
+                if not self._save_on_confirmed(rcon.command("save-on")):
+                    raise RuntimeError("save-on did not confirm autosave enabled")
+                result = rcon.command("save-off")
+                if not any(
+                    message in result
+                    for message in (
+                        "Automatic saving is now disabled",
+                        "Saving is already turned off",
+                    )
+                ):
+                    raise RuntimeError("save-off did not confirm autosave disabled")
+                result = rcon.command("save-all", "flush")
+                if "Saved the game" not in result:
+                    raise RuntimeError(
+                        "save-all did not confirm success for live snapshot"
+                    )
+                yield
+            finally:
+                # A timed-out save-off may still have reached Java; retry an
+                # unconfirmed save-on once, since it likely only missed the reply.
+                try:
+                    result = rcon.command("save-on")
+                except RconError:
+                    result = rcon.command("save-on")
+                if not self._save_on_confirmed(result):
+                    result = rcon.command("save-on")
+                if not self._save_on_confirmed(result):
+                    raise RuntimeError("save-on did not confirm autosave restored")
 
     def _stop_and_wait(self, timeout_message: str) -> None:
         """RCON stop, then wait dark. Shutdown tears down the reply path, so

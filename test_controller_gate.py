@@ -2,11 +2,14 @@
 
 from release_fixtures import catalog
 
+import hashlib
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 from controller import MAP_IDS, Controller, DEFAULT_MESSAGE, Goal, Process, member
 from test_controller import FakeBackend
@@ -61,6 +64,95 @@ class GateTests(unittest.TestCase):
         self.controller.step()
         self.backend.ready(self.goal)
         return self.controller.step()
+
+    def test_concurrent_package_publish_never_shares_a_temp(self):
+        admin = self.dir / "admin"
+        admin.mkdir()
+        packages = admin / "packages"
+        packages.mkdir()
+        data = b"P" * 4096
+        source = self.dir / ("c" * 32 + ".zip")
+        source.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        meta = {"id": "c" * 32, "status": "accepted", "native": False, "sha256": digest}
+
+        class StubMaps:
+            canonical_sessions = False
+
+            def __init__(self, packages):
+                self.packages = packages
+
+            def retire_merged_overlays(self):
+                return []
+
+            def list(self):
+                return [dict(meta)]
+
+            def archive_path(self, cid):
+                return source
+
+            def export(self):
+                return []
+
+            def sessions(self):
+                return {"sessions": [], "total": 0, "next": None}
+
+            def catalog(self):
+                return []
+
+        first_done = threading.Event()
+        gate = threading.Lock()
+        calls = {"n": 0}
+        real_digest = hashlib.file_digest
+
+        def gated_digest(handle, *args, **kwargs):
+            with gate:
+                calls["n"] += 1
+                second = calls["n"] > 1
+            if second:
+                # The other run already replaced and unlinked the shared temp
+                # (old code): this read must not race a missing file.
+                self.assertTrue(first_done.wait(30))
+            return real_digest(handle, *args, **kwargs)
+
+        errors = []
+
+        def run(controller):
+            try:
+                controller.export_maps()
+            except Exception as error:  # noqa: BLE001 - collected across threads
+                errors.append(error)
+            finally:
+                first_done.set()
+
+        controllers = [
+            Controller(
+                self.dir / f"state{i}",
+                FakeBackend(),
+                admin_dir=admin,
+                maps=StubMaps(packages),
+                releases=catalog(),
+            )
+            for i in (1, 2)
+        ]
+        with mock.patch("hashlib.file_digest", gated_digest):
+            threads = [
+                threading.Thread(target=run, args=(controller,))
+                for controller in controllers
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(60)
+            self.assertFalse(
+                [thread for thread in threads if thread.is_alive()],
+                "package publish threads hung",
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual((packages / (digest + ".zip")).read_bytes(), data)
+        self.assertEqual(
+            [path for path in packages.iterdir() if path.suffix == ".tmp"], []
+        )
 
     def test_game_adoption_exports_public(self):
         self.controller.request(str(uuid4()), Goal("game", "v1.0.0"), 0)
