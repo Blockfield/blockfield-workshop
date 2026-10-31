@@ -248,6 +248,7 @@ class Controller:
         maps=None,
         workshop_data_dir: Path | None = None,
         releases: dict | None = None,
+        releases_path: Path | None = None,
         target_file: Path | None = None,
     ):
         """A missed STARTING deadline restores a previous Workshop/test goal when available."""
@@ -276,6 +277,10 @@ class Controller:
             Path(target_file) if target_file else self.directory / "target.json"
         )
         self.releases = dict(releases) if releases else {}
+        # Hot catalog reload for the long-running loop: entrypoint builds the
+        # controller once, but releases.json gains records on every release.
+        self.releases_path = Path(releases_path) if releases_path is not None else None
+        self._releases_fingerprint = self._fingerprint_releases()
         self.default_message = message.strip()[:500] or DEFAULT_MESSAGE
         self.admin_dir = Path(admin_dir) if admin_dir else None
         self.inbox_dir = Path(inbox_dir) if inbox_dir else None
@@ -292,6 +297,51 @@ class Controller:
     def _now_ms(self) -> int:
         return int(self._now() * 1000)
 
+    def _fingerprint_releases(self):
+        """(mtime_ns, size) of the catalog file, or None when it is absent."""
+        if self.releases_path is None:
+            return None
+        try:
+            info = os.stat(self.releases_path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return (info.st_mtime_ns, info.st_size)
+
+    def maybe_reload_releases(self) -> None:
+        """Hot-reload releases.json when it changed; validated exactly as at startup.
+
+        An invalid new catalog keeps the previous one and logs to stderr, so a
+        half-written or untrusted export can never revoke a committed target.
+        """
+        if self.releases_path is None:
+            return
+        fingerprint = self._fingerprint_releases()
+        if fingerprint == self._releases_fingerprint:
+            return
+        if fingerprint is None:
+            if self._releases_fingerprint is not None:
+                print(
+                    "controller: releases catalog missing; keeping previous releases",
+                    file=sys.stderr,
+                )
+            self._releases_fingerprint = None
+            return
+        try:
+            fresh = release_catalog.load_catalog(self.releases_path)
+        except ValueError as error:
+            print(
+                f"controller: keeping previous releases catalog: {error}",
+                file=sys.stderr,
+            )
+            self._releases_fingerprint = fingerprint
+            return
+        self.releases = fresh
+        if hasattr(self.backend, "releases"):
+            self.backend.releases = dict(fresh)
+        self._releases_fingerprint = fingerprint
+
     @contextmanager
     def _locked(self, name: str = "controller.lock"):
         flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
@@ -303,6 +353,9 @@ class Controller:
             os.close(fd)
 
     def _read(self) -> dict:
+        # Every state observation sees catalog updates: the long-running loop
+        # builds the controller once, but releases.json gains records on release.
+        self.maybe_reload_releases()
         # Check links before existence: a dangling link is corruption, not fresh state.
         if self.file.is_symlink():
             raise ValueError("invalid state file")
