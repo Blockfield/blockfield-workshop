@@ -6,8 +6,8 @@ Backend: --backend docker (host default, needs the Docker socket) or dokploy
 point and needing no Dokploy token). Container paths come from BF_* env with
 host defaults; the deployment/ examples set the container values.
 
-workshopctl request workshop --session <uuid> [--release vX.Y.Z]
-workshopctl request game [--release vX.Y.Z] [--recover]
+workshopctl request workshop --session <uuid> [--release vX.Y.Z|sha256:<digest>]
+workshopctl request game [--release vX.Y.Z|sha256:<digest>] [--recover]
 workshopctl target       # last approved release target (kept while Game is off)
 workshopctl members [draslId:name[:role[:mapId+mapId...]] ...]
 workshopctl step | status | cancel | wake      # step applies the site admin inbox first

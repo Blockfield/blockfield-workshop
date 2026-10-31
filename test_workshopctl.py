@@ -557,3 +557,32 @@ class WorkshopctlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DigestGoalTests(unittest.TestCase):
+    def test_digest_goal_stages_offline(self):
+        inner = WorkshopctlTests("test_verified_release_catalog_gates_offline_staging")
+        inner.setUp()
+        self.addCleanup(inner.temp.cleanup)
+        # inner is never torn down: take over its environment restoration.
+        self.addCleanup(os.environ.pop, "BF_STEP_FOLLOW_S", None)
+        self.root, self.backend = inner.root, inner.backend
+        catalog = inner.write_catalog("v1.0.0")
+        digest = catalog["v1.0.0"]["imageDigest"].split("@", 1)[1]
+        catalog[digest] = catalog["v1.0.0"]
+        (self.root / "controller/releases.json").write_text(json.dumps(catalog))
+        session = str(uuid4())
+        code, state = inner.ctl(
+            "request", "workshop", "--session", session, "--release", digest
+        )
+        self.assertEqual(code, 0, state)
+        self.assertEqual(state["desired"]["release"], digest)
+        code, target = inner.ctl("target")
+        self.assertEqual(code, 0, target)
+        self.assertEqual(target["target"]["release"], "v1.0.0")
+        self.assertEqual(
+            target["target"]["imageDigest"], catalog["v1.0.0"]["imageDigest"]
+        )
+        self.assertEqual(inner.ctl("step")[1]["phase"], "STARTING")
+        self.backend.ready(Goal("workshop", digest, session))
+        self.assertEqual(inner.ctl("step")[1]["gate"], "builders")

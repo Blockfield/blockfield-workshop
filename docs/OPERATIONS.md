@@ -146,7 +146,10 @@ selectionRevision,previousTarget}`. `operation`/`selectionRevision` refer to the
 `runtimeOperation` and `stateRevision` match current state/status. Admin status also exports the journal's
 `selection:{operation,revision,deferred}`. A reader must compare both revisions and operations with a stable
 status reread; a standalone projection cannot approve a release. The controller repairs missing, corrupt or stale
-projections from validated durable state under its lock before effects or `target` reads. Without that state,
+projections from validated durable state under its lock before effects or `target` reads. Controller rollback
+across the digest change is unsupported: a journal holding a digest goal fails validation on the old controller
+(its selection check compares the goal release to the record tag), so after any `sha256:` selection only roll
+forward — re-request the release by tag if needed — never downgrade the controller. Without that state,
 a corrupt/unreadable projection fails closed. Preflight/session/state-write failures preserve the previous tuple;
 a crash after state commit may leave a stale projection which is repaired on restart. Retrying the same selection
 operation is idempotent; changed intent/evidence or stale new revisions are rejected. A target acknowledgement is

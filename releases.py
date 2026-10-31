@@ -215,8 +215,11 @@ def resolve(catalog: dict[str, dict], release: str) -> dict:
         raise ValueError(
             f"release {release!r} is not a verified published release"
         ) from None
-    if record["release"] != release:
-        raise ValueError("catalog key differs from record release")
+    if (
+        record["release"] != release
+        and record["imageDigest"].split("@", 1)[1] != release
+    ):
+        raise ValueError("catalog key differs from record release and digest")
     return record
 
 
