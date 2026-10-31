@@ -43,7 +43,7 @@ class MapVersionTests(unittest.TestCase):
     def another_map(self, map_id, kind="arena"):
         draft = self.data / "world/dimensions/blockfield_workshop" / map_id
         (draft / "region").mkdir(parents=True)
-        (draft / "region/r.0.0.mca").write_bytes(b"other map")
+        (draft / "region/r.0.0.mca").write_bytes(fixtures.region_variant(4))
         template = self.templates / map_id
         shutil.copytree(draft, template)
         (draft / "blockfield-base.json").write_text(
@@ -63,7 +63,7 @@ class MapVersionTests(unittest.TestCase):
         copy_id = str(uuid4())
         copy = self.store.checkout("konstaxa", first["versionDigest"], copy_id)
         world = Path(copy["bundle"]) / "world"
-        (world / "region/r.0.0.mca").write_bytes(b"changed once")
+        (world / "region/r.0.0.mca").write_bytes(fixtures.region_variant(5))
         (world / "entities/r.0.0.mca").unlink()
         second = self.candidate(working_copy_id=copy_id)
         version = self.store.versions.read("konstaxa", second["versionDigest"])
@@ -83,7 +83,7 @@ class MapVersionTests(unittest.TestCase):
         )
         self.assertEqual(
             (Path(restored["bundle"]) / "world/entities/r.0.0.mca").read_bytes(),
-            b"entities",
+            fixtures.REGION_ENTITIES,
         )
         self.assertEqual(self.store.versions.head("fields"), other_head)
         restore = self.store.versions.read("konstaxa", restored["versionDigest"])
@@ -120,7 +120,7 @@ class MapVersionTests(unittest.TestCase):
             (writable.stat().st_dev, writable.stat().st_ino),
         )
         writable.write_bytes(b"writer")
-        self.assertEqual(blob.read_bytes(), b"edited-region")
+        self.assertEqual(blob.read_bytes(), fixtures.REGION_DRAFT)
         with self.assertRaisesRegex(ValueError, "already exists"):
             self.store.checkout("konstaxa", first["versionDigest"], copy_id)
         self.assertEqual(writable.read_bytes(), b"writer")

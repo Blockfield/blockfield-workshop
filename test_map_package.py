@@ -1,12 +1,20 @@
 import hashlib
 import json
+import struct
+import zlib
 from pathlib import Path
 import stat
 import tempfile
 import unittest
 import warnings
 import zipfile
-from map_package import validate
+from map_package import (
+    FORMAT_VERSION,
+    GAME_DATA_VERSION,
+    scan_package,
+    seed_region,
+    validate,
+)
 
 
 def digest(data):
@@ -142,6 +150,172 @@ class PackageTests(unittest.TestCase):
         ]:
             with self.assertRaises(ValueError):
                 _json(data)
+
+
+class ManifestV2Tests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name, "candidate.zip")
+        self.region = seed_region()
+        self.palette = scan_package({"world/region/r.0.0.mca": self.region})
+
+    def manifest(self, **overrides):
+        base = {
+            "schemaVersion": 2,
+            "mapId": "arena",
+            "version": "v2",
+            "baseVersion": "v1",
+            "formatVersion": FORMAT_VERSION,
+            "dataVersion": self.palette["data_version"],
+            "requiredBlocks": {
+                "registry": self.palette["registry"],
+                "blocks": self.palette["blocks"],
+            },
+            "requiredMods": [],
+            "files": {},
+        }
+        base.update(overrides)
+        return base
+
+    def pack(self, manifest, files):
+        manifest = dict(manifest)
+        manifest["files"] = {name: digest(data) for name, data in files.items()}
+        with zipfile.ZipFile(self.path, "w") as archive:
+            archive.writestr("manifest.json", json.dumps(manifest))
+            for name, data in files.items():
+                archive.writestr(name, data)
+        return digest(self.path.read_bytes())
+
+    def files(self, region=None):
+        return {
+            "map.json": json.dumps({"id": "arena"}).encode(),
+            "world/region/r.0.0.mca": region if region is not None else self.region,
+        }
+
+    def test_v2_validates_and_reports_fields(self):
+        manifest = validate(self.path, self.pack(self.manifest(), self.files()))
+        self.assertEqual(manifest["schemaVersion"], 2)
+        self.assertEqual(manifest["formatVersion"], FORMAT_VERSION)
+        self.assertEqual(manifest["dataVersion"], GAME_DATA_VERSION)
+        self.assertEqual(
+            manifest["requiredBlocks"]["blocks"], ["minecraft:air", "minecraft:stone"]
+        )
+
+    def test_v1_still_accepted_as_legacy(self):
+        files = self.files()
+        manifest = {
+            "schemaVersion": 1,
+            "mapId": "arena",
+            "version": "v2",
+            "baseVersion": "v1",
+            "files": {name: digest(data) for name, data in files.items()},
+        }
+        with zipfile.ZipFile(self.path, "w") as archive:
+            archive.writestr("manifest.json", json.dumps(manifest))
+            for name, data in files.items():
+                archive.writestr(name, data)
+        self.assertEqual(
+            validate(self.path, digest(self.path.read_bytes()))["schemaVersion"], 1
+        )
+
+    def test_v2_rejects_newer_format(self):
+        with self.assertRaisesRegex(ValueError, "unsupported map format"):
+            validate(
+                self.path,
+                self.pack(
+                    self.manifest(formatVersion=FORMAT_VERSION + 1), self.files()
+                ),
+            )
+
+    def test_v2_rejects_block_drift(self):
+        manifest = self.manifest()
+        manifest["requiredBlocks"] = {
+            "registry": hashlib.sha256(b"minecraft:air").hexdigest(),
+            "blocks": ["minecraft:air"],
+        }
+        with self.assertRaisesRegex(ValueError, "differ from the manifest"):
+            validate(self.path, self.pack(manifest, self.files()))
+
+    def test_v2_rejects_data_version_drift(self):
+        with self.assertRaisesRegex(ValueError, "differs from the manifest"):
+            validate(
+                self.path,
+                self.pack(self.manifest(dataVersion=1), self.files()),
+            )
+
+    def test_v2_rejects_registry_mismatch(self):
+        manifest = self.manifest()
+        manifest["requiredBlocks"] = {
+            "registry": "0" * 64,
+            "blocks": manifest["requiredBlocks"]["blocks"],
+        }
+        with self.assertRaisesRegex(ValueError, "registry mismatch"):
+            validate(self.path, self.pack(manifest, self.files()))
+
+    def test_v2_rejects_wrong_content_hash(self):
+        manifest = self.manifest(sha256="0" * 64)
+        with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+            validate(self.path, self.pack(manifest, self.files()))
+
+    def test_v2_rejects_bad_mods(self):
+        for mods in (
+            [{"id": "no spaces", "version": None}],
+            [{"id": "ok", "version": 3}],
+            "mods",
+        ):
+            with self.subTest(mods=mods):
+                with self.assertRaisesRegex(ValueError, "invalid required mods"):
+                    validate(
+                        self.path,
+                        self.pack(self.manifest(requiredMods=mods), self.files()),
+                    )
+
+    def test_v2_rejects_garbage_region(self):
+        with self.assertRaisesRegex(ValueError, "truncated region file"):
+            validate(
+                self.path, self.pack(self.manifest(), self.files(region=b"garbage"))
+            )
+
+    def test_registry_construction_matches_game_admission(self):
+        # Cross-repo contract with blockfield-server scripts/maps/map_manifest.py.
+        self.assertEqual(
+            self.palette["registry"],
+            hashlib.sha256(b"minecraft:air\nminecraft:stone").hexdigest(),
+        )
+
+    def test_scan_tolerates_empty_files(self):
+        palette = scan_package(
+            {
+                "world/region/r.0.0.mca": self.region,
+                "world/poi/r.0.0.mca": b"",
+            }
+        )
+        self.assertEqual(palette["blocks"], self.palette["blocks"])
+
+    def test_missing_sidecar_skips_its_chunk(self):
+        header = bytearray(8192)
+        header[0:4] = (2).to_bytes(3, "big") + bytes([1])
+        mca = bytes(header) + struct.pack(">i", 1) + bytes([2 | 128])
+        palette = scan_package({"world/region/r.0.0.mca": mca})
+        self.assertEqual(palette["blocks"], [])
+        self.assertIsNone(palette["data_version"])
+
+    def test_external_sidecar_resolves(self):
+        seed = seed_region()
+        (length,) = struct.unpack_from(">i", seed, 8192)
+        nbt_body = zlib.decompress(seed[8197 : 8197 + length - 1])
+        header = bytearray(8192)
+        header[0:4] = (2).to_bytes(3, "big") + bytes([1])
+        mca = bytes(header) + struct.pack(">i", 1) + bytes([2 | 128])
+        palette = scan_package(
+            {
+                "world/region/r.0.0.mca": mca,
+                "world/region/c.0.0.mcc": zlib.compress(nbt_body),
+            }
+        )
+        self.assertEqual(palette["blocks"], ["minecraft:air", "minecraft:stone"])
+        self.assertEqual(palette["data_version"], GAME_DATA_VERSION)
 
 
 if __name__ == "__main__":

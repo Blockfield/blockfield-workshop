@@ -8,6 +8,7 @@ Unknown world sidecars are rejected, not silently discarded; extend only after c
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import math
@@ -350,11 +351,208 @@ def validate_playable(config):
 
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
+_PART = re.compile(r"[a-z0-9_.-]{1,64}\Z")
+# Map manifest v2 (workshop/Game split): every published package carries the
+# format version, required blocks and mods plus the content hash, so Game
+# admission can refuse incompatible maps with a message instead of crashing.
+# Readers accept v1 during the migration. The registry hash construction must
+# match Blockfield/blockfield-server scripts/maps/map_manifest.py exactly.
+SCHEMA_VERSION = 2
+FORMAT_VERSION = 1
+GAME_DATA_VERSION = 3955  # MC 1.21.1 baseline, as in seed_region()
+
+
+def _read_string(data, pos):
+    (length,) = struct.unpack_from(">H", data, pos)
+    pos += 2
+    if pos + length > len(data):
+        raise ValueError("truncated NBT data")
+    try:
+        return data[pos : pos + length].decode("utf-8"), pos + length
+    except UnicodeDecodeError:
+        raise ValueError("unreadable NBT string")
+
+
+def _read_payload(data, pos, kind):
+    """Read one NBT payload of a known tag kind; IndexError/struct.error mean truncation."""
+    if kind in {1, 2, 3, 4, 5, 6}:
+        fmt = {1: ">b", 2: ">h", 3: ">i", 4: ">q", 5: ">f", 6: ">d"}[kind]
+        return struct.unpack_from(fmt, data, pos)[0], pos + struct.calcsize(fmt)
+    if kind == 7:
+        (length,) = struct.unpack_from(">i", data, pos)
+        pos += 4
+        if length < 0 or pos + length > len(data):
+            raise ValueError("truncated NBT data")
+        return data[pos : pos + length], pos + length
+    if kind == 8:
+        return _read_string(data, pos)
+    if kind == 9:
+        subtype, pos = data[pos], pos + 1
+        (length,) = struct.unpack_from(">i", data, pos)
+        pos += 4
+        if length < 0 or (subtype == 0 and length):
+            raise ValueError("invalid NBT list")
+        items = []
+        for _ in range(length):
+            item, pos = _read_payload(data, pos, subtype)
+            items.append(item)
+        return items, pos
+    if kind == 10:
+        return _read_compound(data, pos)
+    if kind in {11, 12}:
+        fmt = {11: ">i", 12: ">q"}[kind]
+        (length,) = struct.unpack_from(">i", data, pos)
+        pos += 4
+        if length < 0 or pos + length * struct.calcsize(fmt) > len(data):
+            raise ValueError("truncated NBT data")
+        items = list(struct.unpack_from(f">{length}{fmt[1]}", data, pos))
+        return items, pos + length * struct.calcsize(fmt)
+    raise ValueError("unknown NBT tag")
+
+
+def _read_compound(data, pos):
+    value = {}
+    while True:
+        if pos >= len(data):
+            raise ValueError("truncated NBT data")
+        kind, pos = data[pos], pos + 1
+        if kind == 0:
+            return value, pos
+        name, pos = _read_string(data, pos)
+        item, pos = _read_payload(data, pos, kind)
+        value[name] = item
+
+
+def _read_root(data):
+    """Parse one Anvil chunk into (name, compound); truncation reads as ValueError."""
+    try:
+        if not data or data[0] != 10:
+            raise ValueError("map chunk is not a compound tag")
+        name, pos = _read_string(data, 1)
+        value, _ = _read_compound(data, pos)
+        return name, value
+    except (struct.error, IndexError):
+        raise ValueError("truncated NBT data")
+
+
 # One spelling per coordinate: \d would admit Unicode digits and 0/-0/00 aliases.
 _COORD = r"(?:0|-?[1-9][0-9]*)"
 _REGION = re.compile(
     rf"world/(region|entities|poi)/(?:r\.{_COORD}\.{_COORD}\.mca|c\.{_COORD}\.{_COORD}\.mcc)\Z"
 )
+
+
+def _decompress(compression, body):
+    if compression == 1:
+        try:
+            return gzip.decompress(body)
+        except OSError:
+            raise ValueError("unreadable chunk data")
+    if compression == 2:
+        try:
+            return zlib.decompress(body)
+        except zlib.error:
+            raise ValueError("unreadable chunk data")
+    if compression == 3:
+        return body
+    raise ValueError("unsupported chunk compression")
+
+
+def _collect_chunk(chunk, names, versions):
+    if not isinstance(chunk, dict):
+        raise ValueError("unreadable chunk data")
+    data_version = chunk.get("DataVersion", 0)
+    if data_version:
+        if type(data_version) is not int:
+            raise ValueError("unreadable chunk data version")
+        versions.append(data_version)
+    sections = chunk.get("sections", [])
+    if not isinstance(sections, list):
+        raise ValueError("unreadable chunk sections")
+    for section in sections:
+        states = section.get("block_states", {}) if isinstance(section, dict) else {}
+        palette = states.get("palette", []) if isinstance(states, dict) else []
+        if not isinstance(palette, list):
+            raise ValueError("unreadable block palette")
+        for entry in palette:
+            name = entry.get("Name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or name.count(":") != 1:
+                raise ValueError("unreadable block palette")
+            namespace, block = name.split(":")
+            if not _PART.fullmatch(namespace) or not _PART.fullmatch(block):
+                raise ValueError(f"unreadable block id {name!r}")
+            names.append(name)
+
+
+def _scan_region(data, region, externals):
+    """One .mca file into (block names, max DataVersion or None).
+
+    `region` is the file's (rx, rz) grid; `externals` maps `c.X.Z.mcc`
+    basenames of the same directory to bytes for oversized chunks. Missing
+    sidecars skip the chunk like Game admission does.
+    """
+    if not data:
+        # Empty region files are normal for poi/entities; they hold no chunks.
+        return [], None
+    if len(data) < 8192:
+        raise ValueError("truncated region file")
+    names, versions = [], []
+    for slot in range(1024):
+        offset = int.from_bytes(data[slot * 4 : slot * 4 + 3], "big")
+        sectors = data[slot * 4 + 3]
+        if not sectors:
+            continue
+        start = offset * 4096
+        if start + 5 > len(data):
+            raise ValueError("truncated region file")
+        (length,) = struct.unpack_from(">i", data, start)
+        compression = data[start + 4]
+        body = data[start + 5 : start + 4 + length]
+        if len(body) != length - 1:
+            raise ValueError("truncated region file")
+        if compression & 128:
+            chunk_x = region[0] * 32 + slot % 32
+            chunk_z = region[1] * 32 + slot // 32
+            sidecar = externals.get(f"c.{chunk_x}.{chunk_z}.mcc")
+            if sidecar is None:
+                continue
+            _, chunk = _read_root(_decompress(compression & 127, sidecar))
+        else:
+            _, chunk = _read_root(_decompress(compression, body))
+        _collect_chunk(chunk, names, versions)
+    return names, max(versions) if versions else None
+
+
+def scan_package(members):
+    """Block palette, registry hash and max DataVersion of package members.
+
+    `members` maps archive paths to bytes. Only world region files are read;
+    oversized chunks resolve through sibling `.mcc` sidecars (same layout as
+    Game admission); a missing sidecar skips its chunk.
+    """
+    by_name = dict(members)
+    names, versions = [], []
+    for name in sorted(by_name):
+        if not name.startswith("world/") or not name.endswith(".mca"):
+            continue
+        parts = name.split("/")[-1].split(".")
+        region = (int(parts[1]), int(parts[2]))
+        directory = name.rsplit("/", 1)[0]
+        externals = {
+            key.rsplit("/", 1)[-1]: data
+            for key, data in by_name.items()
+            if key.rsplit("/", 1)[0] == directory and key.endswith(".mcc")
+        }
+        chunk_names, data_version = _scan_region(by_name[name], region, externals)
+        names.extend(chunk_names)
+        if data_version is not None:
+            versions.append(data_version)
+    blocks = sorted(set(names))
+    return {
+        "blocks": blocks,
+        "registry": hashlib.sha256("\n".join(blocks).encode()).hexdigest(),
+        "data_version": max(versions) if versions else None,
+    }
 
 
 def _json(raw: bytes):
@@ -476,7 +674,7 @@ def validate(
             if (
                 not isinstance(manifest, dict)
                 or type(manifest.get("schemaVersion")) is not int
-                or manifest["schemaVersion"] != 1
+                or manifest["schemaVersion"] not in (1, 2)
             ):
                 raise ValueError("unsupported manifest schema")
             for field in ("mapId", "version", "baseVersion"):
@@ -507,7 +705,73 @@ def validate(
                 raise ValueError("map config/world identity mismatch")
             if config.get("kind", "arena") not in {"arena", "lobby", "limbo"}:
                 raise ValueError("unknown map kind")
+            if manifest["schemaVersion"] == 2:
+                _validate_v2(manifest, expected_sha256, files, archive)
             return manifest
+
+
+def _validate_v2(manifest, expected_sha256, files, archive):
+    """Manifest v2 extras: format, content hash, blocks and mods vs the archive."""
+    if type(manifest.get("formatVersion")) is not int or not (
+        1 <= manifest["formatVersion"] <= FORMAT_VERSION
+    ):
+        raise ValueError("unsupported map format")
+    # The archive hash is verified by the caller against the pin; a manifest
+    # embedded in the archive cannot self-describe it (export writes the zip
+    # first), so it is only checked when present (pins always carry it).
+    if "sha256" in manifest and manifest["sha256"] != expected_sha256:
+        raise ValueError("content hash mismatch")
+    blocks = manifest.get("requiredBlocks")
+    if (
+        not isinstance(blocks, dict)
+        or not isinstance(blocks.get("blocks"), list)
+        or not _HEX.fullmatch(blocks.get("registry", ""))
+    ):
+        raise ValueError("invalid required blocks")
+    if blocks["blocks"] != sorted(set(blocks["blocks"])) or any(
+        not isinstance(name, str)
+        or name.count(":") != 1
+        or not _PART.fullmatch(name.split(":")[0])
+        or not _PART.fullmatch(name.split(":")[1])
+        for name in blocks["blocks"]
+    ):
+        raise ValueError("invalid required blocks")
+    if (
+        hashlib.sha256("\n".join(blocks["blocks"]).encode()).hexdigest()
+        != blocks["registry"]
+    ):
+        raise ValueError("block registry mismatch")
+    members = {}
+    for name, entry in files.items():
+        with archive.open(entry) as member:
+            # archive.open, not archive.read: callers may interpose on read
+            # (tamper tests do), while the hashed stream above stays authoritative.
+            members[name] = member.read()
+    scanned = scan_package(members)
+    if scanned["blocks"] != blocks["blocks"]:
+        raise ValueError("map blocks differ from the manifest")
+    data_version = manifest.get("dataVersion")
+    if data_version is not None and type(data_version) is not int:
+        raise ValueError("invalid map data version")
+    if data_version != scanned["data_version"]:
+        raise ValueError("map data version differs from the manifest")
+    if type(data_version) is int and data_version > GAME_DATA_VERSION:
+        raise ValueError("map requires a newer game version")
+    mods = manifest.get("requiredMods")
+    if not isinstance(mods, list):
+        raise ValueError("invalid required mods")
+    for entry in mods:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("id"), str)
+            or not _PART.fullmatch(entry["id"])
+            or not (
+                entry.get("version") is None or isinstance(entry.get("version"), str)
+            )
+        ):
+            raise ValueError("invalid required mods")
+    # Mod presence is Game admission's job (it owns the mod list); the
+    # publisher only records which namespaces the map needs.
 
 
 def main():

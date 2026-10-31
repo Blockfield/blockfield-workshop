@@ -1976,16 +1976,33 @@ class MapVersions:
         # A killed export leaves its temp behind; the next export reaps the same prefix.
         for stale in target.parent.glob(".export-*.tmp"):
             stale.unlink(missing_ok=True)
+        palette = map_package.scan_package(
+            {name: path.read_bytes() for name, path in files.items()}
+        )
+        namespaces = sorted(
+            {name.split(":")[0] for name in palette["blocks"]} - {"minecraft"}
+        )
         if (
             shutil.disk_usage(target.parent).free
             < sum(path.stat().st_size for path in files.values()) + SNAPSHOT_MARGIN
         ):
             raise OSError("not enough free space for ZIP export")
         manifest = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "mapId": meta["mapId"],
             "version": meta["versionDigest"],
             "baseVersion": meta.get("baseVersion") or "template",
+            "formatVersion": map_package.FORMAT_VERSION,
+            "dataVersion": palette["data_version"],
+            "requiredBlocks": {
+                "registry": palette["registry"],
+                "blocks": palette["blocks"],
+            },
+            # The Workshop does not own the Game mod list; versions are
+            # stamped at publish from the Game pins.
+            "requiredMods": [
+                {"id": namespace, "version": None} for namespace in namespaces
+            ],
             "files": version["files"],
         }
         fd, name = tempfile.mkstemp(dir=target.parent, prefix=".export-", suffix=".tmp")
