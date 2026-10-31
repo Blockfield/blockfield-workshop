@@ -152,6 +152,30 @@ a crash after state commit may leave a stale projection which is repaired on res
 operation is idempotent; changed intent/evidence or stale new revisions are rejected. A target acknowledgement is
 not configured-image or READY evidence; the runtime adapter/verifier must prove those separately.
 
+### Release mismatch recovery (controller/wave desync)
+
+Moving `:approved` and redeploying the Workshop without first selecting the release in the
+controller leaves the controller with the old desired release while the Workshop runs the new
+image: phase STARTING, Workshop gate closed (admins only), no rollback state, waits forever.
+The long-running controller reloads `releases.json` whenever its mtime/size changes (validated
+exactly as at startup; an invalid new catalog keeps the previous one and logs), so no controller
+restart is ever part of recovery. Recover in order, never forcing a switch:
+
+```sh
+# 1. Merge the exported vX.Y.Z record into the controller's releases.json
+#    (atomic write, keep existing keys, refuse a changed record under the same tag).
+# 2. Stage the release; deferred staging is allowed while STARTING:
+just python workshopctl.py request workshop --release vX.Y.Z --session <current-session-from-status>
+# 3. Move :approved back to the controller's committed release (Workshop ready again).
+# 4. The controller auto-activates vX.Y.Z from the reloaded catalog (no restart).
+# 5. ERROR recovery: stop the Workshop, write profile.json vX.Y.Z, STARTING:
+just python workshopctl.py request game --recover
+# 6. Dispatch move-approved-tag vX.Y.Z (redeploy) -> phase workshop / gate builders on vX.Y.Z.
+```
+
+A release change requested while sleeping stays staged (`selection.deferred`, phase unchanged)
+until wake, which activates the staged target; never wake a sleeping editor just to select.
+
 ## Cold Workshop sleep and wake
 
 The always-on editor sleeps when nobody builds, freeing its RAM on the game host, and wakes on

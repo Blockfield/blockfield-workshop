@@ -117,6 +117,7 @@ def build_controller(
             env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")
         ),
         releases=release_catalog.load_catalog(releases_path),
+        releases_path=releases_path,
     )
     if hasattr(backend, "maps"):
         backend.maps = controller.maps
