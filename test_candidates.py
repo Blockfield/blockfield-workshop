@@ -19,9 +19,22 @@ from unittest import mock
 import candidates
 from candidates import MapStore, template_digest
 from controller import Controller, Goal
+from map_package import seed_region
 from test_controller import FakeBackend
 
 ACTOR = {"draslId": "e10438e4797b49718cfecec6a8fa171b", "name": "Nether"}
+
+
+def region_variant(marker):
+    """Distinct valid .mca bytes: the timestamp area is inert to every flow."""
+    data = bytearray(seed_region())
+    data[5000] ^= marker
+    return bytes(data)
+
+
+REGION_DRAFT = region_variant(1)
+REGION_ENTITIES = region_variant(2)
+REGION_TEMPLATE = region_variant(3)
 
 
 class CandidateTests(unittest.TestCase):
@@ -37,10 +50,10 @@ class CandidateTests(unittest.TestCase):
         self.data = self.root / "workshop-data"
         world = self.data / "world" / "dimensions" / "blockfield_workshop" / "konstaxa"
         (world / "region").mkdir(parents=True)
-        (world / "region" / "r.0.0.mca").write_bytes(b"edited-region")
+        (world / "region" / "r.0.0.mca").write_bytes(REGION_DRAFT)
         (world / "region" / "r.1.0.mca").write_bytes(b"")  # placeholder: skipped
         (world / "entities").mkdir()
-        (world / "entities" / "r.0.0.mca").write_bytes(b"entities")
+        (world / "entities" / "r.0.0.mca").write_bytes(REGION_ENTITIES)
         (self.data / "blockfield" / "maps").mkdir(parents=True)
         (self.data / "blockfield" / "maps" / "konstaxa.json").write_text(
             json.dumps({"id": "konstaxa", "name": "base"})
@@ -48,7 +61,7 @@ class CandidateTests(unittest.TestCase):
         self.templates = self.root / "templates"
         (self.templates / "konstaxa" / "region").mkdir(parents=True)
         (self.templates / "konstaxa" / "region" / "r.0.0.mca").write_bytes(
-            b"old-region"
+            REGION_TEMPLATE
         )
         self.world = world
         (world / "blockfield-base.json").write_text(
@@ -163,6 +176,12 @@ class CandidateTests(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertTrue(target.is_file())
         self.assertGreater(size, 0)
+        with zipfile.ZipFile(target) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+        self.assertEqual(manifest["schemaVersion"], 2)
+        self.assertEqual(manifest["formatVersion"], 1)
+        self.assertTrue(manifest["requiredBlocks"]["blocks"])
+        self.assertEqual({entry["id"] for entry in manifest["requiredMods"]}, set())
 
     def test_acceptance_preserves_live_world_json_and_archive(self):
         meta = self.store.create("konstaxa", ACTOR)
@@ -172,7 +191,7 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(accepted["status"], "accepted")
         self.assertEqual(archive.read_bytes(), before)
         self.assertEqual(
-            (self.templates / "konstaxa/region/r.0.0.mca").read_bytes(), b"old-region"
+            (self.templates / "konstaxa/region/r.0.0.mca").read_bytes(), REGION_TEMPLATE
         )
         self.assertFalse(self.published.exists())
         self.assertFalse(self.store.backups.exists())
@@ -346,7 +365,7 @@ class BaseAndPlaytestTests(unittest.TestCase):
                 self.store.publish(meta["id"], ACTOR)
         self.assertEqual(
             (self.templates / "konstaxa" / "region" / "r.0.0.mca").read_bytes(),
-            b"old-region",
+            REGION_TEMPLATE,
         )
         self.assertEqual([p.name for p in self.templates.iterdir()], ["konstaxa"])
         self.assertEqual(
@@ -364,7 +383,7 @@ class BaseAndPlaytestTests(unittest.TestCase):
         )
         self.assertEqual((target / "map-id").read_text().strip(), "konstaxa")
         self.assertEqual(
-            (target / "world" / "region" / "r.0.0.mca").read_bytes(), b"edited-region"
+            (target / "world" / "region" / "r.0.0.mca").read_bytes(), REGION_DRAFT
         )
         self.assertEqual(
             json.loads((target / "map.json").read_text())["id"], "konstaxa"
