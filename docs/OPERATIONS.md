@@ -268,6 +268,8 @@ ref, immutable commit/review, comparison or merge preview. Non-map control envel
   `{kind:"ai-key",set,last4,sha256Prefix,appliedAt}` both as payload and as top-level fields; `admin/ai-key.json`
   keeps the latest `{schema:1,set,last4,sha256Prefix,appliedAt}` so the site can show "key set" without
   reading any secret. The key never appears in logs, results, state or errors.
+- `ai-gateway-key` `{key}`: same contract for the Vercel AI Gateway key, written to
+  `<BF_WORKSHOP_DATA>/blockfield-workshop/gateway.key` with status in `admin/ai-gateway-key.json`.
 
 ## Map candidates (candidates.py)
 
