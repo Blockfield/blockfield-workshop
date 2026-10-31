@@ -467,9 +467,11 @@ class PublishedClientVersionTest(unittest.TestCase):
 class DigestReleaseTests(unittest.TestCase):
     """Goals and targets accept an image digest; the tag path keeps working.
 
-    Journal shape never changes (Goal keeps one free-form release string),
-    so an old reader — whose read path has no release-shape checks — keeps
-    reading new journals, and new code keeps reading old tag journals.
+    Journal shape never changes (Goal keeps one free-form release string), so
+    new code keeps reading old tag journals — but an old reader rejects a
+    journal holding a digest goal (its selection check compares the goal
+    release to the record tag), so rolling the controller back after digest
+    goals exist is unsupported.
     """
 
     def setUp(self):
@@ -534,3 +536,18 @@ class DigestReleaseTests(unittest.TestCase):
         # Old tag journal still validates and projects under the new code.
         self.assertEqual(self.controller.status()["revision"], 1)
         self.assertEqual(other.status()["revision"], 1)
+
+    def test_tag_request_writes_no_digest_goal(self):
+        # A digest appears in a goal only when explicitly requested: a tag
+        # request stores the tag in every goal slot, never the digest alias.
+        state = self.controller.request(
+            str(uuid4()), Goal("workshop", "v1.0.0", self.session), 0
+        )
+        digest = self.digest()
+        self.assertNotEqual(digest, "v1.0.0")
+        for slot in (
+            state["desired"]["release"],
+            state["selection"]["intent"]["release"],
+            state["selection"]["request"]["release"],
+        ):
+            self.assertEqual(slot, "v1.0.0")
