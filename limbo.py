@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 import re
 import stat
@@ -166,7 +167,12 @@ class LimboArtifacts:
             or result.get("size") != len(data)
         ):
             raise ValueError("native Limbo export checksum/size mismatch")
-        return self._install(expected, data)
+        selection = self._install(expected, data)
+        # The job served its purpose: request/result/schematic would otherwise
+        # accumulate (up to 4 MiB each) and stale results could confuse retries.
+        # Install already succeeded, so a cleanup failure must not fail it.
+        shutil.rmtree(directory, ignore_errors=True)
+        return selection
 
     def reuse(self, versions, source, target):
         original, restored = (

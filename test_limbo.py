@@ -65,17 +65,26 @@ class LimboTests(unittest.TestCase):
         job, _ = self.job(adapter, version)
         return adapter.install_job(self.store.versions, version, job)
 
+    def test_failed_install_keeps_the_job_for_forensics(self):
+        version = self.version()
+        adapter = self.adapter()
+        job, directory = self.job(adapter, version)
+        (directory / "lobby.schem").write_bytes(b"tampered after the native result")
+        with self.assertRaisesRegex(ValueError, "checksum/size mismatch"):
+            adapter.install_job(self.store.versions, version, job)
+        self.assertTrue(directory.is_dir())
+        self.assertIsNone(self.store.versions.head("limbo"))
+
     def test_independent_immutable_derivative_and_stopped_selection(self):
         version = self.version()
         adapter = self.adapter()
         job, directory = self.job(adapter, version)
         selection = adapter.install_job(self.store.versions, version, job)
+        # A successful install reaps the job: request/result/schematic must not
+        # accumulate, and the installed derivative stands on its own.
+        self.assertFalse(directory.exists())
         artifact = adapter.artifacts / selection["artifact"]
-        self.assertNotEqual(
-            artifact.stat().st_ino, (directory / "lobby.schem").stat().st_ino
-        )
         self.assertEqual(artifact.stat().st_mode & 0o777, 0o444)
-        (directory / "lobby.schem").write_bytes(b"later job edit")
         self.assertEqual(adapter.ready(self.store.versions, version), selection)
         head = self.store.activate("limbo", version, ACTOR, None)
         target = self.store.versions.active / "limbo/selection.json"

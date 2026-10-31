@@ -119,6 +119,54 @@ class TimeoutTests(unittest.TestCase):
         self.assertEqual(self.controller.step()["desired"]["profile"], "workshop")
         self.assertEqual(self.backend.processes[0].goal.profile, "game")
 
+    def test_cancel_parks_starting_without_rollback_in_error_for_recovery(self):
+        # First-ever start that never becomes ready: no rollback exists, and
+        # request --recover is rejected from STARTING, so cancel must open the
+        # explicit-recovery path instead of requiring root state.json surgery.
+        self.controller.request(str(uuid4()), self.editor, 0)
+        self.assertEqual(self.controller.step()["phase"], "STARTING")
+        with self.assertRaises(RuntimeError):
+            self.controller.request(
+                str(uuid4()),
+                Goal("game", "v1.0.0"),
+                self.controller.status()["revision"],
+                recover=True,
+            )
+        state = self.controller.cancel()
+        self.assertEqual((state["phase"], state["gate"]), ("ERROR", "closed"))
+        self.assertIsNone(state["rollback"])
+        recovered = self.controller.request(
+            str(uuid4()),
+            Goal("game", "v1.0.0"),
+            state["revision"],
+            recover=True,
+        )
+        self.assertEqual(recovered["phase"], "ERROR")
+        self.backend.ready(self.editor)
+        stepped = self.controller.step(recover=True)
+        self.assertEqual((stepped["phase"], stepped["gate"]), ("workshop", "builders"))
+
+    def test_cancel_refuses_dead_draining_phase(self):
+        self.dir.joinpath("state.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "phase": "DRAINING",
+                    "gate": "draining",
+                    "operation": str(uuid4()),
+                    "revision": 1,
+                    "desired": {
+                        "profile": "workshop",
+                        "release": "v1.0.0",
+                        "session": str(uuid4()),
+                        "candidate": None,
+                    },
+                }
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "nothing to cancel"):
+            self.controller.cancel()
+
     def test_cancel_restores_editor_without_game_mutation(self):
         self.stable_editor()
         self.start_test()

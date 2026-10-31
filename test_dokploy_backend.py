@@ -354,6 +354,65 @@ class BackendTests(unittest.TestCase):
             self.backend.stop(self.backend.observe()[0])
         self.assertIsInstance(ctx.exception.__cause__, RconError)
 
+    def held_commands(self, *replies):
+        """Run the hold with canned per-call RCON replies; return the command words."""
+        calls = []
+        replies = list(replies)
+
+        def fake_command(instance, words, *rest):
+            calls.append(" ".join((words, *rest)))
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        with mock.patch.object(RconClient, "command", fake_command):
+            with self.backend.workshop_saves_held():
+                pass
+        return calls
+
+    def test_hot_snapshot_holds_saves_around_copy(self):
+        self.assertEqual(
+            self.held_commands(
+                "Automatic saving is now enabled",
+                "Automatic saving is now disabled",
+                "Saved the game",
+                "Automatic saving is now enabled",
+            ),
+            ["save-on", "save-off", "save-all flush", "save-on"],
+        )
+
+    def test_hot_snapshot_without_java_has_no_side_effect(self):
+        with mock.patch.object(self.backend, "_alive", return_value=False):
+            with mock.patch.object(
+                RconClient, "command", side_effect=AssertionError("must not call RCON")
+            ):
+                with self.backend.workshop_saves_held():
+                    pass
+
+    def test_hot_snapshot_refuses_unflushed_copy_and_restores_autosave(self):
+        with self.assertRaises(RuntimeError):
+            self.held_commands(
+                "Automatic saving is now enabled",
+                "Automatic saving is now disabled",
+                "nope",
+                "Automatic saving is now enabled",
+            )
+
+    def test_hot_snapshot_retries_an_unconfirmed_save_on(self):
+        with self.assertRaisesRegex(RuntimeError, "autosave restored"):
+            self.held_commands(
+                "Automatic saving is now enabled",
+                "Automatic saving is now disabled",
+                "Saved the game",
+                "nope",
+                "nope",
+            )
+
+    def test_hot_snapshot_entry_refuses_when_autosave_state_unknown(self):
+        with self.assertRaisesRegex(RuntimeError, "autosave enabled"):
+            self.held_commands("nope", "Automatic saving is now enabled")
+
     def test_fence_stops_a_lingering_backend(self):
         self.backend.start(self.goal)
         self.assertTrue(self.backend._alive())

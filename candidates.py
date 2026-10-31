@@ -1079,7 +1079,12 @@ class MapStore:
         archive_path = self.archive_path(found[0]["id"])
         manifest = map_package.validate(archive_path, sha256)
         target = Path(target)
-        shutil.rmtree(target, ignore_errors=True)
+        if target.is_symlink() or target.is_file():
+            raise ValueError("unsafe extract target")
+        if target.is_dir():
+            # Loud, never ignored: a partial wipe plus unvalidated writes
+            # would mix old and new bytes into a Franken-map for the test run.
+            shutil.rmtree(target)
         with zipfile.ZipFile(archive_path) as archive:
             for entry in archive.infolist():
                 if entry.is_dir() or entry.filename == "manifest.json":
@@ -1087,6 +1092,20 @@ class MapStore:
                 destination = target / entry.filename
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(archive.read(entry))
+        for name, digest in manifest["files"].items():
+            data = (target / name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise ValueError(f"extracted {name} checksum mismatch")
+        actual = {
+            path.relative_to(target).as_posix()
+            for path in target.rglob("*")
+            if path.is_file() and path.name != "map-id"
+        }
+        if actual != set(manifest["files"]):
+            raise ValueError(
+                "extracted tree does not match its manifest: "
+                f"{sorted(actual ^ set(manifest['files']))[:8]}"
+            )
         (target / "map-id").write_text(manifest["mapId"] + "\n")
         _chown_tree(target, writable=False)
         return manifest["mapId"]
@@ -1785,6 +1804,33 @@ class MapVersions:
             Path(temporary).unlink(missing_ok=True)
         return digest
 
+    def _put_blob_file(self, path: Path) -> str:
+        """Stream a world file into the CAS without ever loading it fully into RAM."""
+        blob_dir = self.archive / "blobs"
+        blob_dir.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=blob_dir, prefix=".blob-")
+        try:
+            digest = hashlib.sha256()
+            with os.fdopen(fd, "wb") as out:
+                with path.open("rb") as handle:
+                    while chunk := handle.read(1 << 20):
+                        digest.update(chunk)
+                        out.write(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            name = digest.hexdigest()
+            target = self._blob(name)
+            if target.exists() or target.is_symlink():
+                self._verify_blob(name)
+                return name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(temporary, 0o444)
+            os.replace(temporary, target)
+            _sync_directory(target.parent)
+            return name
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
     def _verify_blob(self, digest: str) -> Path:
         path = self._blob(digest)
         if path.is_symlink() or not path.is_file() or _sha256(path) != digest:
@@ -1868,7 +1914,7 @@ class MapVersions:
     def world_files(self, world: Path, config: bytes) -> dict:
         if world.is_symlink() or not world.is_dir():
             raise ValueError("unsafe template world")
-        files = {"map.json": self._put_blob(config)}
+        regions = []
         for kind in WORLD_KINDS:
             directory = world / kind
             if directory.is_symlink() or directory.exists() and not directory.is_dir():
@@ -1881,9 +1927,15 @@ class MapVersions:
                 name = f"world/{kind}/{path.name}"
                 if not map_package._REGION.fullmatch(name):
                     raise ValueError("unapproved Anvil sidecar")
-                data = path.read_bytes()
-                if data or path.suffix == ".mcc":
-                    files[name] = self._put_blob(data)
+                regions.append((name, path))
+        # Fail before loading anything: a degenerate multi-GiB region file must
+        # not OOM the controller mid-snapshot (same limit _record enforces).
+        if sum(path.stat().st_size for _, path in regions) + len(config) > 1 << 30:
+            raise ValueError("map expanded size exceeds package limit")
+        files = {"map.json": self._put_blob(config)}
+        for name, path in regions:
+            if path.stat().st_size or path.suffix == ".mcc":
+                files[name] = self._put_blob_file(path)
         return files
 
     def import_template(self, map_id: str, world: Path, config: Path) -> str:
@@ -1921,6 +1973,9 @@ class MapVersions:
             name: self._verify_blob(digest) for name, digest in version["files"].items()
         }
         target.parent.mkdir(parents=True, exist_ok=True)
+        # A killed export leaves its temp behind; the next export reaps the same prefix.
+        for stale in target.parent.glob(".export-*.tmp"):
+            stale.unlink(missing_ok=True)
         if (
             shutil.disk_usage(target.parent).free
             < sum(path.stat().st_size for path in files.values()) + SNAPSHOT_MARGIN

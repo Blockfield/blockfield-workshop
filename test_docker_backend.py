@@ -728,7 +728,7 @@ class DockerBackendTests(unittest.TestCase):
                 raise OSError("copy failed")
         self.assertEqual(
             [call[4:] for call in self.calls() if call[1] == "exec"],
-            [["save-off"], ["save-all", "flush"], ["save-on"]],
+            [["save-on"], ["save-off"], ["save-all", "flush"], ["save-on"]],
         )
         for response in ("", "Saving failed", "Saved the game"):
             self.load()
@@ -746,11 +746,12 @@ class DockerBackendTests(unittest.TestCase):
         off = "Automatic saving is now disabled"
         on = "Automatic saving is now enabled"
         for responses in (
-            [TimeoutError("save-off timed out"), on],
+            [on, TimeoutError("save-off timed out"), on],
+            [on, "", on],
+            [on, off, TimeoutError("flush timed out"), on],
+            [on, off, "Saving failed", on],
+            [on, off, None, on],
             ["", on],
-            [off, TimeoutError("flush timed out"), on],
-            [off, "Saving failed", on],
-            [off, None, on],
         ):
             with self.subTest(responses=responses):
                 with mock.patch.object(
@@ -765,7 +766,9 @@ class DockerBackendTests(unittest.TestCase):
         for response in (None, "", TimeoutError("restore timed out")):
             with self.subTest(response=response):
                 with mock.patch.object(
-                    self.backend, "_rcon", side_effect=[off, "Saved the game", response]
+                    self.backend,
+                    "_rcon",
+                    side_effect=[on, off, "Saved the game", response, response],
                 ):
                     with self.assertRaises((RuntimeError, TimeoutError)):
                         with self.backend.workshop_saves_held():
