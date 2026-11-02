@@ -917,7 +917,11 @@ class Controller:
         return idle
 
     def _observe(self) -> tuple[list[Process], Process | None, Process | None]:
-        processes = self.backend.observe()
+        return self._split(self.backend.observe())
+
+    def _split(
+        self, processes: list[Process]
+    ) -> tuple[list[Process], Process | None, Process | None]:
         game = [p for p in processes if p.goal.profile == "game"]
         workshop = [p for p in processes if p.goal.profile in {"workshop", "test"}]
         if len(game) > 1 or len(workshop) > 1:
@@ -948,11 +952,19 @@ class Controller:
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return None
 
-    def _export(self, state: dict, *, deadline: int | None = None) -> None:
+    def _export(
+        self,
+        state: dict,
+        *,
+        deadline: int | None = None,
+        processes: list[Process] | None = None,
+    ) -> None:
         """Proxy gate (private ACL) and public site status. Rewritten only when content changes.
 
         deadline is passed in by the caller for the ticks where it is live (STARTING wait
         loops); it is derived from "since" rather than persisted, so it is never stale on disk.
+        processes reuses one step's observation so a step probes the backend only once;
+        omit it whenever the backend may have changed since the observation.
         """
         gate = (
             state["gate"]
@@ -962,7 +974,10 @@ class Controller:
         game_status = {"phase": "UNAVAILABLE", "gate": "closed", "release": None}
         game_observed = False
         try:
-            _, game, workshop = self._observe()
+            if processes is None:
+                _, game, workshop = self._observe()
+            else:
+                _, game, workshop = self._split(processes)
             if game is not None:
                 game_observed = True
                 game_status = {
@@ -1405,14 +1420,16 @@ class Controller:
                 # selection never tracks the running Game anymore. ERROR still
                 # needs explicit recovery; nothing here consumes the record.
                 if previous_phase == "ERROR" and not recover:
-                    self._export(state)
+                    self._export(state, processes=processes)
                     return state
                 elif previous_phase == "sleeping":
-                    return self._sleeping_step(state, goal, current)
+                    return self._sleeping_step(
+                        state, goal, current, processes=processes
+                    )
                 if goal is None or goal.profile == "game":
                     # Only an explicit request imports an initial validated target.
                     # Legacy Game goals and running Game are never approval evidence.
-                    self._export({**state, "gate": "closed"})
+                    self._export({**state, "gate": "closed"}, processes=processes)
                     return state
                 if (state.get("rollback") or {}).get("profile") == "game":
                     # A legacy global switch must never restart or stop the independently running Game.
@@ -1468,17 +1485,21 @@ class Controller:
                         if self._maybe_sleep(state, goal, current):
                             return state
                         commit(goal.profile, OPEN_GATES[goal.profile])
-                        self._export(state)
+                        self._export(state, processes=processes)
                         return state
                     commit("STARTING", "closed")
-                    return self._starting_wait(state, goal, unexpected=None)
+                    return self._starting_wait(
+                        state, goal, unexpected=None, processes=processes
+                    )
                 if previous_phase == "STARTING" and not recover:
                     # Either nothing is visible yet (intent was durable before start(); never reissue it
                     # automatically, including after a controller crash or delayed process visibility) or
                     # current is an unexpected backend -- e.g. the 2026-09-18 incident, where an external
                     # restart resurrected another backend mid-start. Either way: wait for the deadline,
                     # fencing off anything unexpected instead of erroring out and requiring root recovery.
-                    return self._starting_wait(state, goal, unexpected=current)
+                    return self._starting_wait(
+                        state, goal, unexpected=current, processes=processes
+                    )
                 # Only work that stops or starts a backend is gated by space/lock checks: a stable, ready backend
                 # must not be closed to everybody because free space dipped (it keeps running either way).
                 self.backend.preflight(goal)
@@ -1572,7 +1593,11 @@ class Controller:
         return True
 
     def _sleeping_step(
-        self, state: dict, goal: Goal | None, current: Process | None
+        self,
+        state: dict,
+        goal: Goal | None,
+        current: Process | None,
+        processes: list[Process] | None = None,
     ) -> dict:
         """Asleep: no backend is expected; an externally started matching backend is adopted."""
         if (
@@ -1587,16 +1612,21 @@ class Controller:
                 state["gate"] = OPEN_GATES[goal.profile]
                 self._write(state)
             else:
-                self._export(state)
+                self._export(state, processes=processes)
             return state
-        self._export(state)
+        self._export(state, processes=processes)
         return state
 
     def _starting_wait(
-        self, state: dict, goal: Goal, unexpected: Process | None
+        self,
+        state: dict,
+        goal: Goal,
+        unexpected: Process | None,
+        processes: list[Process] | None = None,
     ) -> dict:
         if unexpected is not None:
             self.backend.fence_pending_starts()
+            processes = None  # fencing changes backends; re-observe below
         elapsed_ms = self._now_ms() - state["since"]
         if elapsed_ms > self.start_timeout * 1000:
             detail = (
@@ -1609,7 +1639,11 @@ class Controller:
                 goal,
                 f"start of {goal.profile} timed out after {elapsed_ms // 1000}s ({detail})",
             )
-        self._export(state, deadline=state["since"] + int(self.start_timeout * 1000))
+        self._export(
+            state,
+            deadline=state["since"] + int(self.start_timeout * 1000),
+            processes=processes,
+        )
         return state
 
     def _rollback(self, state: dict, goal: Goal, reason: str) -> dict:

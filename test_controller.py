@@ -447,6 +447,23 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(state["phase"], "STARTING")
                 self.assertEqual(state["desired"]["release"], "v1.0.0")
 
+    def test_stable_step_observes_backend_once(self):
+        # One RCON liveness probe per controller step: _export reuses the step's
+        # observation instead of probing again (was 2 probes/step -> log spam).
+        self.start_workshop()
+        calls = 0
+        real_observe = self.backend.observe
+
+        def counting_observe():
+            nonlocal calls
+            calls += 1
+            return real_observe()
+
+        self.backend.observe = counting_observe
+        state = self.controller.step()
+        self.assertEqual(state["phase"], "workshop")
+        self.assertEqual(calls, 1)
+
 
 class ReleaseSelectionTests(unittest.TestCase):
     """Desired release = verified published immutable server release.
