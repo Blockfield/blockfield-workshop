@@ -571,7 +571,7 @@ class Controller:
             )
         return target
 
-    def _write(self, state: dict) -> None:
+    def _write(self, state: dict, *, processes: list[Process] | None = None) -> None:
         self._validate_selection(state)
         data = json.dumps(
             state, ensure_ascii=False, sort_keys=True, allow_nan=False
@@ -580,7 +580,11 @@ class Controller:
             raise ValueError("controller state exceeds its bounded reader")
         atomic_write(self.file, data)
         self._project_target(state)
-        self._export(state)
+        # processes reuses the step's observation: every export of a step shares
+        # one observation, so a nested export can never be newer than the step's
+        # trailing export (stale data must not overwrite fresh gate decisions).
+        # Omit it whenever the backend may have changed since the observation.
+        self._export(state, processes=processes)
 
     def members(self) -> list[dict]:
         """Missing or invalid ACL admits nobody."""
@@ -898,7 +902,9 @@ class Controller:
             for name in names
         )
 
-    def _activity_idle(self, state: dict) -> bool:
+    def _activity_idle(
+        self, state: dict, *, processes: list[Process] | None = None
+    ) -> bool:
         """Fresh idle activity report; any activity clears the idle timer."""
         document = self._read_activity()
         generation = self._readiness_generation()
@@ -913,7 +919,7 @@ class Controller:
         )
         if not idle and state.get("idleSince") is not None:
             state["idleSince"] = None
-            self._write(state)
+            self._write(state, processes=processes)
         return idle
 
     def _observe(self) -> tuple[list[Process], Process | None, Process | None]:
@@ -1388,6 +1394,8 @@ class Controller:
                 error: str | None = None,
                 error_message: str | None = None,
             ) -> None:
+                # processes resolves at call time, so post-fence/re-observe
+                # callers export the rebound (latest) observation, never older.
                 if (
                     state["phase"],
                     state["gate"],
@@ -1402,7 +1410,7 @@ class Controller:
                     state.update(
                         phase=phase, gate=gate, error=error, errorMessage=error_message
                     )
-                    self._write(state)
+                    self._write(state, processes=processes)
 
             try:
                 processes, game, current = self._observe()
@@ -1434,7 +1442,7 @@ class Controller:
                 if (state.get("rollback") or {}).get("profile") == "game":
                     # A legacy global switch must never restart or stop the independently running Game.
                     state["rollback"] = None
-                    self._write(state)
+                    self._write(state, processes=processes)
                 if recover and previous_phase in {"STARTING", "ERROR"}:
                     commit(
                         previous_phase,
@@ -1482,7 +1490,7 @@ class Controller:
                 # Selecting another release is an explicit new operation.
                 if current is not None and current.goal == goal:
                     if current.ready:
-                        if self._maybe_sleep(state, goal, current):
+                        if self._maybe_sleep(state, goal, current, processes=processes):
                             return state
                         commit(goal.profile, OPEN_GATES[goal.profile])
                         self._export(state, processes=processes)
@@ -1533,7 +1541,13 @@ class Controller:
                 self._write(state)
                 return state
 
-    def _maybe_sleep(self, state: dict, goal: Goal, current: Process) -> bool:
+    def _maybe_sleep(
+        self,
+        state: dict,
+        goal: Goal,
+        current: Process,
+        processes: list[Process] | None = None,
+    ) -> bool:
         """Sleep the stable idle editor through the existing graceful save/stop path.
 
         True when the backend was stopped and the phase is now sleeping. Never sleeps
@@ -1549,27 +1563,27 @@ class Controller:
         ):
             if state.get("idleSince") is not None:
                 state["idleSince"] = None
-                self._write(state)
+                self._write(state, processes=processes)
             return False
         if not self.idle_sleep_s or self.idle_sleep_s < 0:
             if state.get("idleSince") is not None:
                 state["idleSince"] = None
-                self._write(state)
+                self._write(state, processes=processes)
             return False
-        if not self._activity_idle(state):
+        if not self._activity_idle(state, processes=processes):
             return False
         now = self._now_ms()
         idle_since = state.get("idleSince")
         if type(idle_since) is not int:
             state["idleSince"] = now
-            self._write(state)
+            self._write(state, processes=processes)
             return False
         if now - idle_since < int(self.idle_sleep_s * 1000):
             return False
         # Stop admitting before the save: a join after the idle report would lose edits made
         # after freeze. A failed save/stop lands in ERROR, which stays closed.
         state["gate"] = "closed"
-        self._write(state)
+        self._write(state, processes=processes)
         self.backend.save_and_freeze(current)
         self.backend.stop(current)
         remaining, _, managed = self._observe()
@@ -1610,7 +1624,7 @@ class Controller:
                 state["since"] = self._now_ms()
                 state["phase"] = "workshop"
                 state["gate"] = OPEN_GATES[goal.profile]
-                self._write(state)
+                self._write(state, processes=processes)
             else:
                 self._export(state, processes=processes)
             return state

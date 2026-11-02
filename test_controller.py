@@ -464,6 +464,27 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(state["phase"], "workshop")
         self.assertEqual(calls, 1)
 
+    def test_writing_step_reuses_the_step_observation(self):
+        # A commit that writes must not trigger a second probe through the
+        # nested export: every export of the step shares one observation, so a
+        # trailing export can never overwrite a fresh gate decision with stale data.
+        self.start_workshop()
+        state = json.loads(self.controller.file.read_bytes())
+        state["gate"] = "closed"
+        self.controller.file.write_text(json.dumps(state))
+        calls = 0
+        real_observe = self.backend.observe
+
+        def counting_observe():
+            nonlocal calls
+            calls += 1
+            return real_observe()
+
+        self.backend.observe = counting_observe
+        state = self.controller.step()
+        self.assertEqual((state["phase"], state["gate"]), ("workshop", "builders"))
+        self.assertEqual(calls, 1)
+
 
 class ReleaseSelectionTests(unittest.TestCase):
     """Desired release = verified published immutable server release.
