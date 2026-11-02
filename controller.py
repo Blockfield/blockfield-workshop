@@ -1520,10 +1520,12 @@ class Controller:
                     commit("SAVING", "closed")
                     self.backend.save_and_freeze(current)
                     self.backend.stop(current)
-                    remaining, _, managed = self._observe()
-                    if managed is not None:
+                    # Rebind: the STARTING commit below must export the post-stop
+                    # observation (the game side may have changed during save/stop).
+                    processes, game, current = self._observe()
+                    if current is not None:
                         raise RuntimeError("old backend not confirmed stopped")
-                    if self.maps is not None and not remaining:
+                    if self.maps is not None and not processes:
                         self.maps.versions.reclaim_unheaded_bundles()
                 commit("STARTING", "closed")
                 self.backend.start(goal)
@@ -1586,10 +1588,10 @@ class Controller:
         self._write(state, processes=processes)
         self.backend.save_and_freeze(current)
         self.backend.stop(current)
-        remaining, _, managed = self._observe()
+        post_stop, _, managed = self._observe()
         if managed is not None:
             raise RuntimeError("old backend not confirmed stopped")
-        if self.maps is not None and not remaining:
+        if self.maps is not None and not post_stop:
             self.maps.versions.reclaim_unheaded_bundles()
         state.update(
             revision=state["revision"] + 1,
@@ -1603,7 +1605,9 @@ class Controller:
             idleSince=None,
         )
         state.pop("releaseFollow", None)
-        self._write(state)
+        # Post-stop observation: the game side may have changed while the editor
+        # was being saved and stopped, so export it fresh, not pre-stop.
+        self._write(state, processes=post_stop)
         return True
 
     def _sleeping_step(
