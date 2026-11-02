@@ -238,7 +238,6 @@ class BackendTests(unittest.TestCase):
             lock_dir=self.lock,
             rcon_host="127.0.0.1",
             rcon_port=self.server.port,
-            game_port=self.server.port,
             rcon_password=RCON_PASSWORD,
             releases={RELEASE: self.record},
             stop_timeout=2.0,
@@ -323,7 +322,6 @@ class BackendTests(unittest.TestCase):
         stubborn.start()
         self.addCleanup(stubborn.shutdown)
         self.backend.rcon_port = stubborn.port
-        self.backend.game_port = stubborn.port
         self.backend.start(self.goal)
         with self.assertRaises(TimeoutError):
             self.backend.stop(self.backend.observe()[0])
@@ -337,7 +335,6 @@ class BackendTests(unittest.TestCase):
         resetting.start()
         self.addCleanup(resetting.shutdown)
         self.backend.rcon_port = resetting.port
-        self.backend.game_port = resetting.port
         self.backend.start(self.goal)
         process = self.backend.observe()[0]
         self.backend.stop(process)
@@ -352,7 +349,6 @@ class BackendTests(unittest.TestCase):
         resetting.start()
         self.addCleanup(resetting.shutdown)
         self.backend.rcon_port = resetting.port
-        self.backend.game_port = resetting.port
         self.backend.start(self.goal)
         with self.assertRaises(TimeoutError) as ctx:
             self.backend.stop(self.backend.observe()[0])
@@ -442,17 +438,6 @@ class BackendTests(unittest.TestCase):
             self.backend.observe()
         self.assertEqual(alive.call_count, 1)
 
-    def test_alive_probes_game_port_not_rcon(self):
-        # Liveness must not touch RCON: with RCON live but the game port
-        # dark the backend reads stopped, and no RCON command is recorded.
-        self.backend.start(self.goal)
-        self.backend.game_port = 1  # nothing listens: TCP probe refuses
-        self.assertFalse(self.backend._alive())
-        self.assertEqual(self.backend.observe(), [])
-        self.assertEqual(self.server.commands, [])
-        self.backend.game_port = self.server.port
-        self.assertTrue(self.backend._alive())
-
     def test_from_env_loads_verified_catalog(self):
         catalog_path = Path(self.temp.name) / "releases.json"
         catalog_path.write_text(json.dumps({RELEASE: self.record}))
@@ -465,14 +450,6 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(
             backend.releases[RELEASE]["imageDigest"], self.record["imageDigest"]
         )
-        self.assertEqual(
-            (backend.rcon_host, backend.rcon_port, backend.game_port),
-            ("blockfield-workshop", 25575, 25565),
-        )
-        with mock.patch.dict(
-            os.environ, {**env, "BF_WORKSHOP_GAME_PORT": "25566"}, clear=True
-        ):
-            self.assertEqual(DokployBackend.from_env().game_port, 25566)
         del env["BF_RELEASES_FILE"]
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(DokployBackend.from_env().releases, {})
@@ -500,7 +477,6 @@ class LifecycleIntegrationTests(unittest.TestCase):
             lock_dir=self.lock,
             rcon_host="127.0.0.1",
             rcon_port=self.server.port,
-            game_port=self.server.port,
             rcon_password=RCON_PASSWORD,
             releases={RELEASE: self.record},
             stop_timeout=2.0,
@@ -569,7 +545,6 @@ class ShadowRunTests(unittest.TestCase):
             lock_dir=self.lock,
             rcon_host="127.0.0.1",
             rcon_port=1,  # nothing listens: TCP probe refuses, no auth sent
-            game_port=1,
             rcon_password=RCON_PASSWORD,
             releases={RELEASE: release_record()},
             stop_timeout=1.0,

@@ -6,10 +6,11 @@ release with its own GITHUB_TOKEN after release verification passes, then
 triggers the Workshop app redeploy through the app's Dokploy webhook. This
 backend never moves tags and never calls webhooks: start() only persists the
 verified selection (profile.json) and clears the READY file, while
-save/stop go through direct private-network RCON and status through a
-game-port TCP probe plus the mod's READY file. The approved release is read back from the running Workshop (READY +
+save/stop/status go through direct private-network RCON plus the mod's READY
+file. The approved release is read back from the running Workshop (READY +
 selection) for reporting only. No docker CLI, no Dokploy API token, no
 GitHub credentials at all: only the Workshop's own RCON password.
+
 The old DockerBackend stays authoritative (see docs/OPERATIONS.md); this
 module is staged beside it and shares the controller Backend protocol, the
 profile.json selection schema and the READY-file contract.
@@ -187,9 +188,9 @@ class RconClient:
 class DokployBackend:
     """Workshop-only lifecycle beside the release-owned approved tag.
 
-    Observes the mod's READY file plus a game-port liveness probe (TCP
-    connect, no auth), saves through ``save-all flush`` and stops through
-    RCON ``stop``. start() only persists the verified selection and clears the
+    Observes the mod's READY file plus an RCON liveness probe (TCP connect,
+    no auth), saves through ``save-all flush`` and stops through RCON
+    ``stop``. start() only persists the verified selection and clears the
     READY file — the :approved rollout itself is the server release CI's
     job; the approved release is read back from the running Workshop for
     reporting only. Never touches Game: observe() reports Workshop/test
@@ -204,7 +205,6 @@ class DokployBackend:
         rcon_host: str,
         rcon_port: int,
         rcon_password: str | None = None,
-        game_port: int = 25565,
         releases: dict | None = None,
         maps=None,
         stop_timeout: float = 300.0,
@@ -218,7 +218,6 @@ class DokployBackend:
         self.rcon_host = rcon_host
         self.rcon_port = rcon_port
         self.rcon_password = rcon_password
-        self.game_port = game_port
         self.releases = dict(releases) if releases else {}
         self.maps = maps
         self.stop_timeout = stop_timeout
@@ -238,7 +237,6 @@ class DokployBackend:
             lock_dir=Path(env.get("BF_LOCK_DIR", "/srv/minecraft/backend-lock")),
             rcon_host=env.get("BF_WORKSHOP_RCON_HOST", "blockfield-workshop"),
             rcon_port=int(env.get("BF_WORKSHOP_RCON_PORT", "25575")),
-            game_port=int(env.get("BF_WORKSHOP_GAME_PORT", "25565")),
             releases=release_catalog.load_catalog(
                 Path(releases_path) if releases_path else None
             ),
@@ -249,13 +247,10 @@ class DokployBackend:
         return RconClient(self.rcon_host, self.rcon_port, password=self.rcon_password)
 
     def _alive(self) -> bool:
-        """Game-port liveness probe: a bare TCP connect+close never leaves
-        the handshake stage, whose disconnect handler is a no-op, so unlike
-        the RCON accept path (INFO "Thread RCON Client ..." per connection)
-        it logs nothing. RCON stays for save/stop commands only."""
+        """TCP liveness probe: java accepts RCON connections without auth."""
         try:
             probe = socket.create_connection(
-                (self.rcon_host, self.game_port), timeout=5.0
+                (self.rcon_host, self.rcon_port), timeout=5.0
             )
         except OSError:
             return False
