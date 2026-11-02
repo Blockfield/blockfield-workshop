@@ -434,38 +434,10 @@ class DokployBackend:
                 if not self._save_on_confirmed(result):
                     raise RuntimeError("save-on did not confirm autosave restored")
 
-    def _await_rcon_dark(self, deadline: float) -> bool:
-        """True once the RCON listener is gone. It dies with the java
-        process (after the game port closes and worlds save), so holding
-        one accept with nothing sent — no auth, no command — confirms full
-        exit. A refused connect is already dark; a mid-shutdown reset reads
-        as dark too. Exactly one accept per call, stop/fence paths only."""
-        if self._clock() >= deadline:
-            return False
-        try:
-            sock = socket.create_connection(
-                (self.rcon_host, self.rcon_port), timeout=5.0
-            )
-        except OSError:
-            return True
-        with sock:
-            sock.settimeout(max(0.0, deadline - self._clock()))
-            try:
-                while sock.recv(4096):
-                    pass
-            except socket.timeout:
-                return False
-            except OSError:
-                return True
-            else:
-                return True
-
     def _stop_and_wait(self, timeout_message: str) -> None:
         """RCON stop, then wait dark. Shutdown tears down the reply path, so
         a mid-command RCON error only matters if the backend stays alive;
-        connect/auth errors still raise immediately. The game port closes
-        before java finishes flushing, so after it goes dark one held RCON
-        accept confirms the process itself is gone before lifecycle changes."""
+        connect/auth errors still raise immediately."""
         error: RconError | None = None
         with self._rcon() as rcon:
             try:
@@ -477,8 +449,6 @@ class DokployBackend:
             if self._clock() >= deadline:
                 raise TimeoutError(timeout_message) from error
             self._sleep(self.poll)
-        if not self._await_rcon_dark(deadline):
-            raise TimeoutError(timeout_message) from error
 
     def stop(self, process: Process) -> None:
         if process.goal.profile == "game":

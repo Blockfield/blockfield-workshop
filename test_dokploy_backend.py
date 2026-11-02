@@ -10,7 +10,6 @@ import socket
 import struct
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -358,39 +357,6 @@ class BackendTests(unittest.TestCase):
         with self.assertRaises(TimeoutError) as ctx:
             self.backend.stop(self.backend.observe()[0])
         self.assertIsInstance(ctx.exception.__cause__, RconError)
-
-    def test_stop_waits_for_rcon_dark_after_game_port_dark(self):
-        # The game port closes before java finishes flushing; stop/fence
-        # must not return until the RCON listener (full process lifetime)
-        # is gone. One held accept with nothing sent confirms full exit.
-        held = socket.socket()
-        held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        held.bind(("127.0.0.1", 0))
-        held.listen(1)
-        held.settimeout(5.0)
-        self.addCleanup(held.close)
-        closed_at = []
-
-        def serve():
-            conn, _ = held.accept()
-            with conn:
-                time.sleep(0.4)
-            closed_at.append(time.monotonic())
-
-        server = threading.Thread(target=serve, daemon=True)
-        server.start()
-        self.backend.rcon_port = held.getsockname()[1]
-        stub = mock.MagicMock()
-        stub.__enter__.return_value.command.return_value = ""
-        with (
-            mock.patch.object(self.backend, "_alive", return_value=False),
-            mock.patch.object(self.backend, "_rcon", return_value=stub),
-        ):
-            self.backend._stop_and_wait("still running")
-            returned_at = time.monotonic()
-        server.join(timeout=5)
-        self.assertTrue(closed_at)
-        self.assertGreaterEqual(returned_at, closed_at[0])
 
     def held_commands(self, *replies):
         """Run the hold with canned per-call RCON replies; return the command words."""
