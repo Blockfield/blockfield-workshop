@@ -1325,6 +1325,16 @@ class DockerBackendTests(unittest.TestCase):
             }
         )
         self.backend._check_workshop_ai(spec)
+        # Custom providers still accept the previous vendor/name shape.
+        self._write_site_settings(
+            self._valid_site_settings()
+            | {
+                "providers": providers,
+                "transcriptionProvider": "acme",
+                "transcriptionModel": "vendor/" + "x" * 112,
+            }
+        )
+        self.backend._check_workshop_ai(spec)
         bad_documents = {
             "preset native generation": self._valid_site_settings(
                 generationModel="gpt-4o-mini"

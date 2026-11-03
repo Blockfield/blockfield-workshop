@@ -145,13 +145,16 @@ def _valid_provider_entry(entry) -> str | None:
 
 
 def _valid_model(value, custom: bool) -> bool:
-    """Preset ids keep the vendor/name shape; custom providers allow native ids."""
+    """Presets keep the vendor/name shape; custom providers allow native ids too."""
     if type(value) is not str:
         return False
     if custom:
-        return (
-            len(value) <= AI_NATIVE_MODEL_MAX_LEN
-            and AI_NATIVE_MODEL.fullmatch(value) is not None
+        return len(value) <= AI_MODEL_MAX_LEN and (
+            AI_MODEL.fullmatch(value) is not None
+            or (
+                len(value) <= AI_NATIVE_MODEL_MAX_LEN
+                and AI_NATIVE_MODEL.fullmatch(value) is not None
+            )
         )
     return len(value) <= AI_MODEL_MAX_LEN and AI_MODEL.fullmatch(value) is not None
 
