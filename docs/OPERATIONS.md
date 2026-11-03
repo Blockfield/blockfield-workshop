@@ -270,6 +270,10 @@ ref, immutable commit/review, comparison or merge preview. Non-map control envel
   reading any secret. The key never appears in logs, results, state or errors.
 - `ai-gateway-key` `{key}`: same contract for the Vercel AI Gateway key, written to
   `<BF_WORKSHOP_DATA>/blockfield-workshop/gateway.key` with status in `admin/ai-gateway-key.json`.
+- `ai-provider-key` `{provider,key}`: same contract for any provider registry id
+  (`^[a-z0-9][a-z0-9-]{0,31}$`); presets resolve to the file/status names above,
+  a custom id writes `<BF_WORKSHOP_DATA>/blockfield-workshop/<id>.key` with status
+  in `admin/<id>-key.json`. `null` removes the stored key like the preset kinds.
 
 ## Map candidates (candidates.py)
 

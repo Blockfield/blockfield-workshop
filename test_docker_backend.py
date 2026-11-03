@@ -1186,6 +1186,137 @@ class DockerBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "own server key"):
             self.backend._check_workshop_ai(spec)
 
+    def test_ai_site_settings_mixed_providers_per_model(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        document = self._valid_site_settings() | {
+            "inputGuardEnabled": True,
+            "providers": [
+                {
+                    "id": "acme-stt",
+                    "label": "Acme STT",
+                    "baseUrl": "https://stt.example.com/v1",
+                }
+            ],
+            "generationProvider": "openrouter",
+            "guardProvider": "vercel-gateway",
+            "transcriptionProvider": "acme-stt",
+        }
+        self._write_site_settings(document)
+        # Every referenced provider needs its own key file.
+        self._write_key_file(filename="openrouter.key")
+        self._write_key_file(filename="gateway.key")
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(spec)
+        self._write_key_file(filename="acme-stt.key")
+        self.backend._check_workshop_ai(spec)
+        # A missing guard key is refused too when the guard model is enabled.
+        (self.data["workshop"] / "blockfield-workshop/gateway.key").unlink()
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(spec)
+
+    def test_ai_site_settings_unknown_referenced_provider_is_refused(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        self._write_site_settings(
+            self._valid_site_settings() | {"generationProvider": "nope"}
+        )
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+        for label, providers in (
+            (
+                "preset id",
+                [
+                    {
+                        "id": "openrouter",
+                        "label": "x",
+                        "baseUrl": "https://x.example.com",
+                    }
+                ],
+            ),
+            (
+                "uppercase id",
+                [{"id": "Acme", "label": "x", "baseUrl": "https://x.example.com"}],
+            ),
+            (
+                "duplicate id",
+                [
+                    {"id": "acme", "label": "a", "baseUrl": "https://a.example.com"},
+                    {"id": "acme", "label": "b", "baseUrl": "https://b.example.com"},
+                ],
+            ),
+            (
+                "nine entries",
+                [
+                    {"id": f"p{i}", "label": "x", "baseUrl": "https://x.example.com"}
+                    for i in range(9)
+                ],
+            ),
+            (
+                "http url",
+                [{"id": "acme", "label": "x", "baseUrl": "http://x.example.com"}],
+            ),
+            (
+                "credentials",
+                [{"id": "acme", "label": "x", "baseUrl": "https://u:p@x.example.com"}],
+            ),
+            (
+                "query",
+                [{"id": "acme", "label": "x", "baseUrl": "https://x.example.com/?k=v"}],
+            ),
+            (
+                "fragment",
+                [{"id": "acme", "label": "x", "baseUrl": "https://x.example.com/#f"}],
+            ),
+            (
+                "too long",
+                [
+                    {
+                        "id": "acme",
+                        "label": "x",
+                        "baseUrl": "https://x.example.com/" + "p" * 200,
+                    }
+                ],
+            ),
+            ("not a list", {"acme": "https://x.example.com"}),
+        ):
+            with self.subTest(label=label):
+                self._write_site_settings(
+                    self._valid_site_settings() | {"providers": providers}
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "invalid workshop AI site settings"
+                ):
+                    self.backend._check_workshop_ai(spec)
+
+    def test_ai_site_settings_cleanup_model_needs_its_provider_key(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        self._write_site_settings(
+            self._valid_site_settings() | {"cleanupModel": "vendor/tidy-1"}
+        )
+        # Cleanup defaults to the transcription provider, whose key is present.
+        self.backend._check_workshop_ai(spec)
+        self._write_site_settings(
+            self._valid_site_settings()
+            | {
+                "providers": [
+                    {"id": "acme", "label": "Acme", "baseUrl": "https://x.example.com"}
+                ],
+                "cleanupModel": "vendor/tidy-1",
+                "cleanupProvider": "acme",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(spec)
+        self._write_key_file(filename="acme.key")
+        self.backend._check_workshop_ai(spec)
+        self._write_site_settings(
+            self._valid_site_settings()
+            | {"cleanupModel": "vendor/tidy-1", "cleanupProvider": "nope"}
+        )
+        with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
+            self.backend._check_workshop_ai(spec)
+
     def test_ai_site_settings_provider_key_review_cases(self):
         # An OpenRouter env key does not satisfy an enabled gateway setup.
         _, spec = self._setup_ai_fixture(enabled=False, key=True)

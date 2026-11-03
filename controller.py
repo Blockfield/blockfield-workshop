@@ -145,6 +145,21 @@ LIVE_ONLY_KINDS = {
 AI_KEY_PATTERN = re.compile(r"[\x21-\x7e]{20,2048}")
 AI_KEY_UID = 1000
 AI_KEY_GID = 1000
+# Provider registry ids (contract with the site): presets keep their historic key
+# file and status names; a custom id uses <id>.key and <id>-key.json. The shape
+# excludes dots and slashes, so a custom file name can never escape its directory.
+AI_PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+AI_PROVIDER_KEY_PRESETS = {
+    "openrouter": ("openrouter.key", "ai-key.json", "ai-key"),
+    "vercel-gateway": ("gateway.key", "ai-gateway-key.json", "ai-gateway-key"),
+}
+
+
+def ai_provider_key_names(provider_id: str) -> tuple[str, str, str]:
+    """Key file name, admin status name and inbox kind for any registry provider id."""
+    if provider_id in AI_PROVIDER_KEY_PRESETS:
+        return AI_PROVIDER_KEY_PRESETS[provider_id]
+    return (f"{provider_id}.key", f"{provider_id}-key.json", "ai-provider-key")
 
 
 WORKSHOP_KEY_GID = 1000  # the site and the workshop server both run as uid/gid 1000 and mount admin/ read-only
@@ -1882,6 +1897,7 @@ class Controller:
                         if isinstance(payload, dict) and payload.get("kind") in (
                             "ai-key",
                             "ai-gateway-key",
+                            "ai-provider-key",
                         ):
                             # The site contract reads the ai-key status flat
                             # (kind/set/last4/sha256Prefix/appliedAt); the envelope
@@ -2611,6 +2627,18 @@ class Controller:
                 filename="gateway.key",
                 status_name="ai-gateway-key.json",
                 kind="ai-gateway-key",
+            )
+        if kind == "ai-provider-key":
+            provider = document.get("provider")
+            if type(provider) is not str or AI_PROVIDER_ID.fullmatch(provider) is None:
+                raise ValueError("invalid ai-provider-key request")
+            filename, status_name, _ = ai_provider_key_names(provider)
+            return self._apply_ai_key(
+                request_id,
+                document,
+                filename=filename,
+                status_name=status_name,
+                kind="ai-provider-key",
             )
         if kind != "mode":
             raise ValueError("unknown kind")

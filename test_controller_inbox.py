@@ -890,6 +890,149 @@ class AiGatewayKeyInboxTests(unittest.TestCase):
                     self.assertNotIn(self.other_key.encode(), data)
 
 
+class AiProviderKeyInboxTests(unittest.TestCase):
+    """Generic provider key: any registry id; presets keep their file/status names."""
+
+    CUSTOM = "acme-stt"
+
+    def setUp(self):
+        InboxTests.setUp(self)
+        # Production writes 1000:1000; tests own the file as whatever user runs them.
+        for name, value in (("AI_KEY_UID", os.getuid()), ("AI_KEY_GID", os.getgid())):
+            patcher = unittest.mock.patch(f"controller.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.workshop_data = self.dir / "workshop-data"
+        self.workshop_data.mkdir()
+        self.controller.workshop_data_dir = self.workshop_data
+        self.key = "sk-or-v1-" + "Ab12" * 10
+        self.other_key = "sk-or-v1-" + "Zz99" * 10
+
+    def process(self, **kwargs):
+        with contextlib.redirect_stderr(self.log):
+            return self.controller.process_inbox(**kwargs)
+
+    result = InboxTests.result
+    read = InboxTests.read
+
+    def put(self, request_id=None, **fields):
+        request_id = request_id or str(uuid4())
+        document = {
+            "schema": 1,
+            "id": request_id,
+            "kind": "ai-provider-key",
+            "actor": {"draslId": DRASL, "name": "Nether"},
+            "createdAt": int(time.time() * 1000),
+            **fields,
+        }
+        path = self.inbox / f"{request_id}.json"
+        path.write_text(json.dumps(document))
+        return request_id
+
+    def key_file(self, provider=CUSTOM):
+        return self.workshop_data / f"blockfield-workshop/{provider}.key"
+
+    def test_set_replace_delete_custom_provider(self):
+        request_id = self.put(provider=self.CUSTOM, key=self.key)
+        self.assertEqual(self.process(), 1)
+        result = self.result(request_id)
+        self.assertEqual(
+            (result["ok"], result["error"], result["kind"], result["set"]),
+            (True, None, "ai-provider-key", True),
+        )
+        self.assertEqual(
+            (result["last4"], result["sha256Prefix"]),
+            (self.key[-4:], hashlib.sha256(self.key.encode()).hexdigest()[:8]),
+        )
+        key_path = self.key_file()
+        self.assertEqual(key_path.read_text(), self.key)
+        info = key_path.stat()
+        self.assertEqual(
+            (
+                stat.S_IMODE(info.st_mode),
+                info.st_uid,
+                info.st_gid,
+                info.st_nlink,
+            ),
+            (0o600, os.getuid(), os.getgid(), 1),
+        )
+        status = json.loads((self.admin / f"{self.CUSTOM}-key.json").read_text())
+        self.assertEqual(status["set"], True)
+        self.assertEqual(status["schema"], 1)
+
+        replace = self.put(provider=self.CUSTOM, key=self.other_key)
+        self.process()
+        self.assertEqual(self.key_file().read_text(), self.other_key)
+        self.assertTrue(self.result(replace)["set"])
+
+        remove = self.put(provider=self.CUSTOM, key=None)
+        self.process()
+        result = self.result(remove)
+        self.assertEqual(
+            (result["ok"], result["set"], result["last4"], result["sha256Prefix"]),
+            (True, False, "", ""),
+        )
+        self.assertFalse(key_path.exists())
+        status = json.loads((self.admin / f"{self.CUSTOM}-key.json").read_text())
+        self.assertEqual(status["set"], False)
+
+    def test_preset_ids_keep_their_file_and_status_names(self):
+        request_id = self.put(provider="openrouter", key=self.key)
+        self.assertEqual(self.process(), 1)
+        self.assertTrue(self.result(request_id)["ok"])
+        self.assertEqual(
+            (self.workshop_data / "blockfield-workshop/openrouter.key").read_text(),
+            self.key,
+        )
+        self.assertTrue((self.admin / "ai-key.json").exists())
+        gateway = self.put(provider="vercel-gateway", key=self.other_key)
+        self.process()
+        self.assertTrue(self.result(gateway)["ok"])
+        self.assertEqual(
+            (self.workshop_data / "blockfield-workshop/gateway.key").read_text(),
+            self.other_key,
+        )
+        self.assertTrue((self.admin / "ai-gateway-key.json").exists())
+
+    def test_invalid_provider_ids_are_refused_generically(self):
+        for label, fields in (
+            ("uppercase", {"provider": "OpenRouter", "key": self.key}),
+            ("slash", {"provider": "a/b", "key": self.key}),
+            ("dotdot", {"provider": "..", "key": self.key}),
+            ("empty", {"provider": "", "key": self.key}),
+            ("too long", {"provider": "a" * 33, "key": self.key}),
+            ("non-string", {"provider": 7, "key": self.key}),
+            ("missing", {"key": self.key}),
+            ("bad key", {"provider": self.CUSTOM, "key": "x" * 19}),
+        ):
+            with self.subTest(label):
+                request_id = self.put(**fields)
+                self.process()
+                result = self.result(request_id)
+                self.assertEqual(
+                    (result["ok"], result["error"]),
+                    (False, "invalid ai-provider-key request"),
+                )
+                self.assertNotIn("kind", result)
+        self.assertFalse(self.key_file().exists())
+        self.assertFalse((self.admin / f"{self.CUSTOM}-key.json").exists())
+
+    def test_key_never_appears_outside_its_file(self):
+        self.put(provider=self.CUSTOM, key=self.key)
+        self.put(provider=self.CUSTOM, key=self.other_key)
+        self.process()
+        self.process()
+        log = self.log.getvalue()
+        self.assertNotIn(self.key, log)
+        self.assertNotIn(self.other_key, log)
+        for path in self.dir.rglob("*"):
+            if path.is_file() and path != self.key_file():
+                with self.subTest(path=path):
+                    data = path.read_bytes()
+                    self.assertNotIn(self.key.encode(), data)
+                    self.assertNotIn(self.other_key.encode(), data)
+
+
 if __name__ == "__main__":
     unittest.main()
 

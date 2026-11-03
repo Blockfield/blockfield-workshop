@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 import os
 from pathlib import Path
 import re
@@ -50,6 +51,17 @@ AI_PROVIDER_KEY_FILES = {
     "openrouter": Path("blockfield-workshop/openrouter.key"),
     "vercel-gateway": Path("blockfield-workshop/gateway.key"),
 }
+# Provider registry (contract with the site): presets above, custom entries from
+# the settings document as {id, label, baseUrl}. Ids exclude dots and slashes,
+# so a custom key file name can never escape its directory.
+AI_PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+AI_PROVIDERS_MAX = 8
+AI_PROVIDER_BASE_URL_MAX_LEN = 200
+AI_PROVIDER_MODEL_FIELDS = (
+    "generationProvider",
+    "guardProvider",
+    "transcriptionProvider",
+)
 # Inbox-managed key: <workshop data>/blockfield-workshop/openrouter.key, 0600 1000:1000.
 AI_KEY_PATH = AI_PROVIDER_KEY_FILES["openrouter"]
 # Site integer/price limits (workshop-ai-policy.ts); validated only when present
@@ -80,6 +92,70 @@ class App:
 
 def _has_symlink(path: Path) -> bool:
     return any(p.is_symlink() for p in (path, *path.parents))
+
+
+def _ai_provider_key_file(provider_id: str) -> Path:
+    """Inbox key file for any registry id; presets keep their historic names."""
+    if provider_id in AI_PROVIDER_KEY_FILES:
+        return AI_PROVIDER_KEY_FILES[provider_id]
+    return Path("blockfield-workshop") / f"{provider_id}.key"
+
+
+def _valid_provider_base_url(value) -> bool:
+    """Absolute https URL without credentials, query or fragment (contract)."""
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > AI_PROVIDER_BASE_URL_MAX_LEN
+        or any(char.isspace() for char in value)
+    ):
+        return False
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "https"
+        and bool(parts.hostname)
+        and parts.username is None
+        and parts.password is None
+        and parts.query == ""
+        and parts.fragment == ""
+    )
+
+
+def _valid_provider_entry(entry) -> str | None:
+    """Custom provider id when the registry entry is valid, else None."""
+    if (
+        not isinstance(entry, dict)
+        or type(entry.get("id")) is not str
+        or AI_PROVIDER_ID.fullmatch(entry["id"]) is None
+        or entry["id"] in AI_PROVIDER_KEY_FILES
+        or type(entry.get("label")) is not str
+        or not entry.get("label")
+        or len(entry["label"]) > AI_PROVIDER_BASE_URL_MAX_LEN
+        or not _valid_provider_base_url(entry.get("baseUrl"))
+    ):
+        return None
+    return entry["id"]
+
+
+def _ai_referenced_providers(document: dict) -> set[str]:
+    """Provider ids needing a key when AI is enabled (cleanup only when set)."""
+    default = document.get("provider", "openrouter")
+    referenced = set()
+    for field in ("generationProvider", "transcriptionProvider"):
+        value = document.get(field)
+        referenced.add(default if value is None else value)
+    guard = document.get("guardProvider")
+    if document.get("inputGuardEnabled", False):
+        referenced.add(default if guard is None else guard)
+    if document.get("cleanupModel"):
+        cleanup = document.get("cleanupProvider")
+        if cleanup is None:
+            cleanup = document.get("transcriptionProvider")
+        referenced.add(default if cleanup is None else cleanup)
+    return referenced
 
 
 def _check_readonly_view(source: Path, view: Path) -> None:
@@ -766,13 +842,24 @@ class DockerBackend:
             document.get("guardModel"),
             document.get("transcriptionModel"),
         )
+        providers = document.get("providers", [])
+        if type(providers) is not list or len(providers) > AI_PROVIDERS_MAX:
+            raise ValueError("invalid workshop AI site settings")
+        custom_ids = set()
+        for entry in providers:
+            provider_id = _valid_provider_entry(entry)
+            if provider_id is None or provider_id in custom_ids:
+                raise ValueError("invalid workshop AI site settings")
+            custom_ids.add(provider_id)
+        known_providers = set(AI_PROVIDER_KEY_FILES) | custom_ids
+        cleanup = document.get("cleanupModel", "")
         if (
             type(document.get("schema")) is not int
             or document["schema"] != 1
             or type(document.get("revision")) is not int
             or not 0 <= document["revision"] <= AI_SITE_SETTINGS_REVISION_MAX
             or type(document.get("enabled")) is not bool
-            or document.get("provider", "openrouter") not in AI_PROVIDER_KEY_FILES
+            or document.get("provider", "openrouter") not in known_providers
             or type(document.get("inputGuardEnabled", False)) is not bool
             or type(generation) is not str
             or len(generation) > AI_MODEL_MAX_LEN
@@ -783,6 +870,25 @@ class DockerBackend:
             or type(transcription) is not str
             or len(transcription) > AI_MODEL_MAX_LEN
             or AI_MODEL.fullmatch(transcription) is None
+            or any(
+                document.get(field) is not None
+                and document.get(field) not in known_providers
+                for field in AI_PROVIDER_MODEL_FIELDS
+            )
+            or (
+                type(cleanup) is not str
+                or (
+                    cleanup
+                    and (
+                        len(cleanup) > AI_MODEL_MAX_LEN
+                        or AI_MODEL.fullmatch(cleanup) is None
+                    )
+                )
+            )
+            or (
+                document.get("cleanupProvider") is not None
+                and document.get("cleanupProvider") not in known_providers
+            )
         ):
             raise ValueError("invalid workshop AI site settings")
         for field, (low, high) in AI_SITE_INT_FIELDS.items():
@@ -859,23 +965,30 @@ class DockerBackend:
             host_enabled = document.get("enabled", False)
         site_document = self._read_ai_site_document()
         site_enabled = site_document is not None and site_document["enabled"]
-        provider = (site_document or {}).get("provider", "openrouter")
-        # Any known key file arms the strict checks; only the selected provider's
-        # key (or its matching env credential) satisfies an enabled configuration.
-        # Both files are validated independently: a present-but-unsafe key for the
-        # unselected provider must still fail closed.
+        known_ids = set(AI_PROVIDER_KEY_FILES)
+        if site_document is not None:
+            known_ids |= {entry["id"] for entry in site_document.get("providers", [])}
+        referenced = (
+            _ai_referenced_providers(site_document)
+            if site_document is not None
+            else {"openrouter"}
+        )
+        # Any known key file arms the strict checks; every referenced provider
+        # needs its own key (or the matching env credential). All known files
+        # are validated independently: a present-but-unsafe key for an
+        # unreferenced provider must still fail closed.
         key_present = {
-            pid: self._has_ai_key_file(filename)
-            for pid, filename in AI_PROVIDER_KEY_FILES.items()
+            pid: self._has_ai_key_file(_ai_provider_key_file(pid)) for pid in known_ids
         }
-        provider_key = key_present[provider]
+        provider_keys_ready = all(
+            key_present[pid] or (env_key and pid == "openrouter") for pid in referenced
+        )
         any_key = any(key_present.values())
         if not (host_enabled or site_enabled or any_key or env_key):
             return
         if environment.get("BLOCKFIELD_PROFILE") != "workshop":
             raise ValueError("workshop container profile is not configured")
-        env_ok = env_key and provider == "openrouter"
-        if (host_enabled or site_enabled) and not (provider_key or env_ok):
+        if (host_enabled or site_enabled) and not provider_keys_ready:
             raise ValueError("enabled workshop AI needs its own server key")
         if (
             environment.get(
