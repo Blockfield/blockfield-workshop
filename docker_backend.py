@@ -860,12 +860,20 @@ class DockerBackend:
         site_document = self._read_ai_site_document()
         site_enabled = site_document is not None and site_document["enabled"]
         provider = (site_document or {}).get("provider", "openrouter")
-        key_file = self._has_ai_key_file(AI_PROVIDER_KEY_FILES[provider])
-        if not (host_enabled or site_enabled or key_file or env_key):
+        # Any known key file arms the strict checks; only the selected provider's
+        # key (or its matching env credential) satisfies an enabled configuration.
+        provider_key = self._has_ai_key_file(AI_PROVIDER_KEY_FILES[provider])
+        any_key = provider_key or any(
+            self._has_ai_key_file(filename)
+            for pid, filename in AI_PROVIDER_KEY_FILES.items()
+            if pid != provider
+        )
+        if not (host_enabled or site_enabled or any_key or env_key):
             return
         if environment.get("BLOCKFIELD_PROFILE") != "workshop":
             raise ValueError("workshop container profile is not configured")
-        if (host_enabled or site_enabled) and not (key_file or env_key):
+        env_ok = env_key and provider == "openrouter"
+        if (host_enabled or site_enabled) and not (provider_key or env_ok):
             raise ValueError("enabled workshop AI needs its own server key")
         if (
             environment.get(

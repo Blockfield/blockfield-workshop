@@ -1186,6 +1186,26 @@ class DockerBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "own server key"):
             self.backend._check_workshop_ai(spec)
 
+    def test_ai_site_settings_provider_key_review_cases(self):
+        # An OpenRouter env key does not satisfy an enabled gateway setup.
+        _, spec = self._setup_ai_fixture(enabled=False, key=True)
+        self._write_site_settings(
+            self._valid_site_settings() | {"provider": "vercel-gateway"}
+        )
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(spec)
+        self._write_key_file(filename="gateway.key")
+        self.backend._check_workshop_ai(spec)
+        # A stray key file still arms the strict checks when AI is disabled.
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_site_settings(
+            self._valid_site_settings(enabled=False) | {"provider": "vercel-gateway"}
+        )
+        self._write_key_file(filename="openrouter.key")
+        spec["Mounts"][0]["ReadOnly"] = True
+        with self.assertRaisesRegex(ValueError, "mount"):
+            self.backend._check_workshop_ai(spec)
+
     def test_ai_key_file_without_enabled_still_runs_strict_checks(self):
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
         self._write_key_file()
