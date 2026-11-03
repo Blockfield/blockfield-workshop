@@ -1302,6 +1302,71 @@ class DockerBackendTests(unittest.TestCase):
                 ):
                     self.backend._check_workshop_ai(spec)
 
+    def test_ai_site_settings_custom_provider_native_model_ids(self):
+        # Custom providers accept native ids; presets keep the vendor/name shape.
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        self._write_key_file(filename="acme.key")
+        providers = [
+            {"id": "acme", "label": "Acme", "baseUrl": "https://x.example.com"}
+        ]
+        self._write_site_settings(
+            self._valid_site_settings()
+            | {
+                "providers": providers,
+                "generationProvider": "acme",
+                "generationModel": "gpt-4o-mini",
+                "guardProvider": "acme",
+                "guardModel": "gpt-4o-mini",
+                "transcriptionProvider": "acme",
+                "transcriptionModel": "gpt-4o-mini",
+                "cleanupModel": "gpt-4o-mini",
+                "cleanupProvider": "acme",
+            }
+        )
+        self.backend._check_workshop_ai(spec)
+        # Custom providers still accept the previous vendor/name shape.
+        self._write_site_settings(
+            self._valid_site_settings()
+            | {
+                "providers": providers,
+                "transcriptionProvider": "acme",
+                "transcriptionModel": "vendor/" + "x" * 112,
+            }
+        )
+        self.backend._check_workshop_ai(spec)
+        bad_documents = {
+            "preset native generation": self._valid_site_settings(
+                generationModel="gpt-4o-mini"
+            ),
+            "preset native guard": self._valid_site_settings(guardModel="gpt-4o-mini"),
+            "preset native transcription": self._valid_site_settings(
+                transcriptionModel="gpt-4o-mini"
+            ),
+            "preset native cleanup": self._valid_site_settings(
+                cleanupModel="gpt-4o-mini"
+            ),
+            "custom bad chars": self._valid_site_settings()
+            | {
+                "providers": providers,
+                "generationProvider": "acme",
+                "generationModel": "has space",
+            },
+            "custom too long": self._valid_site_settings()
+            | {
+                "providers": providers,
+                "generationProvider": "acme",
+                "generationModel": "x" * 101,
+            },
+        }
+        for name, document in bad_documents.items():
+            with self.subTest(name=name):
+                self._write_site_settings(document)
+                with self.assertRaisesRegex(
+                    ValueError, "invalid workshop AI site settings"
+                ):
+                    self.backend._check_workshop_ai(spec)
+
     def test_ai_site_settings_cleanup_model_needs_its_provider_key(self):
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
         self._write_key_file()
