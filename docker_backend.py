@@ -862,12 +862,14 @@ class DockerBackend:
         provider = (site_document or {}).get("provider", "openrouter")
         # Any known key file arms the strict checks; only the selected provider's
         # key (or its matching env credential) satisfies an enabled configuration.
-        provider_key = self._has_ai_key_file(AI_PROVIDER_KEY_FILES[provider])
-        any_key = provider_key or any(
-            self._has_ai_key_file(filename)
+        # Both files are validated independently: a present-but-unsafe key for the
+        # unselected provider must still fail closed.
+        key_present = {
+            pid: self._has_ai_key_file(filename)
             for pid, filename in AI_PROVIDER_KEY_FILES.items()
-            if pid != provider
-        )
+        }
+        provider_key = key_present[provider]
+        any_key = any(key_present.values())
         if not (host_enabled or site_enabled or any_key or env_key):
             return
         if environment.get("BLOCKFIELD_PROFILE") != "workshop":

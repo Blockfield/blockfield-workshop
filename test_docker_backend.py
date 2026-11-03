@@ -1196,6 +1196,11 @@ class DockerBackendTests(unittest.TestCase):
             self.backend._check_workshop_ai(spec)
         self._write_key_file(filename="gateway.key")
         self.backend._check_workshop_ai(spec)
+        # An unsafe key for the unselected provider still fails closed.
+        openrouter = self._write_key_file(filename="openrouter.key")
+        openrouter.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "unsafe workshop AI key file"):
+            self.backend._check_workshop_ai(spec)
         # A stray key file still arms the strict checks when AI is disabled.
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
         self._write_site_settings(
