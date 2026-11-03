@@ -46,6 +46,9 @@ AI_SITE_SETTINGS_REVISION_MAX = 2**53 - 1
 # Same shape as the mod and the site: vendor/name with an optional :variant such as :free.
 AI_MODEL = re.compile(r"[a-zA-Z0-9._-]{1,64}/[a-zA-Z0-9._/:-]{1,126}")
 AI_MODEL_MAX_LEN = 128
+# Native ids for custom providers (contract): no vendor prefix required.
+AI_NATIVE_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,99}")
+AI_NATIVE_MODEL_MAX_LEN = 100
 # Controller inbox key files per site provider id (controller `_apply_ai_key`
 # writes openrouter.key for "ai-key", gateway.key for "ai-gateway-key").
 AI_PROVIDER_KEY_FILES = {
@@ -139,6 +142,18 @@ def _valid_provider_entry(entry) -> str | None:
     ):
         return None
     return entry["id"]
+
+
+def _valid_model(value, custom: bool) -> bool:
+    """Preset ids keep the vendor/name shape; custom providers allow native ids."""
+    if type(value) is not str:
+        return False
+    if custom:
+        return (
+            len(value) <= AI_NATIVE_MODEL_MAX_LEN
+            and AI_NATIVE_MODEL.fullmatch(value) is not None
+        )
+    return len(value) <= AI_MODEL_MAX_LEN and AI_MODEL.fullmatch(value) is not None
 
 
 def _ai_referenced_providers(document: dict) -> set[str]:
@@ -853,6 +868,19 @@ class DockerBackend:
                 raise ValueError("invalid workshop AI site settings")
             custom_ids.add(provider_id)
         known_providers = set(AI_PROVIDER_KEY_FILES) | custom_ids
+        default = document.get("provider", "openrouter")
+        generation_provider = document.get("generationProvider")
+        if generation_provider is None:
+            generation_provider = default
+        guard_provider = document.get("guardProvider")
+        if guard_provider is None:
+            guard_provider = default
+        transcription_provider = document.get("transcriptionProvider")
+        if transcription_provider is None:
+            transcription_provider = default
+        cleanup_provider = document.get("cleanupProvider")
+        if cleanup_provider is None:
+            cleanup_provider = transcription_provider
         cleanup = document.get("cleanupModel", "")
         if (
             type(document.get("schema")) is not int
@@ -862,15 +890,9 @@ class DockerBackend:
             or type(document.get("enabled")) is not bool
             or document.get("provider", "openrouter") not in known_providers
             or type(document.get("inputGuardEnabled", False)) is not bool
-            or type(generation) is not str
-            or len(generation) > AI_MODEL_MAX_LEN
-            or AI_MODEL.fullmatch(generation) is None
-            or type(guard) is not str
-            or len(guard) > AI_MODEL_MAX_LEN
-            or AI_MODEL.fullmatch(guard) is None
-            or type(transcription) is not str
-            or len(transcription) > AI_MODEL_MAX_LEN
-            or AI_MODEL.fullmatch(transcription) is None
+            or not _valid_model(generation, generation_provider in custom_ids)
+            or not _valid_model(guard, guard_provider in custom_ids)
+            or not _valid_model(transcription, transcription_provider in custom_ids)
             or any(
                 document.get(field) is not None
                 and document.get(field) not in known_providers
@@ -880,10 +902,7 @@ class DockerBackend:
                 type(cleanup) is not str
                 or (
                     cleanup
-                    and (
-                        len(cleanup) > AI_MODEL_MAX_LEN
-                        or AI_MODEL.fullmatch(cleanup) is None
-                    )
+                    and not _valid_model(cleanup, cleanup_provider in custom_ids)
                 )
             )
             or (
