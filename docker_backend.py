@@ -41,12 +41,32 @@ LABEL = "label=com.docker.swarm.service.name="
 AI_SITE_SETTINGS_FILE = "workshop-ai-settings.json"
 AI_SITE_SETTINGS_MAX_BYTES = 4096
 AI_SITE_SETTINGS_REVISION_MAX = 2**53 - 1
-# Same shape as the mod: vendor/name with an optional :variant such as :free.
+# Same shape as the mod and the site: vendor/name with an optional :variant such as :free.
 AI_MODEL = re.compile(r"[a-zA-Z0-9._-]{1,64}/[a-zA-Z0-9._/:-]{1,126}")
-AI_TRANSCRIPTION_MODELS = frozenset({"elevenlabs/scribe-v2", "openai/whisper-1"})
-AI_GUARD_MODEL = re.compile(r"typesafe/jev-[a-zA-Z0-9._-]{1,64}")
+AI_MODEL_MAX_LEN = 128
+# Controller inbox key files per site provider id (controller `_apply_ai_key`
+# writes openrouter.key for "ai-key", gateway.key for "ai-gateway-key").
+AI_PROVIDER_KEY_FILES = {
+    "openrouter": Path("blockfield-workshop/openrouter.key"),
+    "vercel-gateway": Path("blockfield-workshop/gateway.key"),
+}
 # Inbox-managed key: <workshop data>/blockfield-workshop/openrouter.key, 0600 1000:1000.
-AI_KEY_PATH = Path("blockfield-workshop/openrouter.key")
+AI_KEY_PATH = AI_PROVIDER_KEY_FILES["openrouter"]
+# Site integer/price limits (workshop-ai-policy.ts); validated only when present
+# so pre-provider documents still pass. Unknown keys are ignored, not refused.
+AI_SITE_INT_FIELDS = {
+    "maxBlocks": (1, 32768),
+    "blocksPerTick": (1, 16384),
+    "minimumBuildTicks": (40, 1200),
+    "applyBudgetMs": (1, 20),
+    "hourlyRequestLimit": (1, 1_000_000),
+    "hourlyPlayerRequestLimit": (1, 1_000_000),
+    "maxHourlyBuilders": (1, 4096),
+}
+AI_SITE_PRICE_FIELDS = (
+    "generationMaxPricePromptUsdPerM",
+    "generationMaxPriceCompletionUsdPerM",
+)
 AI_KEY_MAX_BYTES = 2048
 AI_KEY_UID = 1000
 AI_KEY_GID = 1000
@@ -695,13 +715,19 @@ class DockerBackend:
                     "extra workshop mount shadows immutable active storage"
                 )
 
-    def _ai_site_enabled(self) -> bool:
-        """Site settings enabled flag; missing file means host fallback. Invalid refuses."""
+    def _read_ai_site_document(self) -> dict | None:
+        """Validated site settings; None when the file is absent. Invalid refuses.
+
+        Known keys are validated (types/shape); unknown keys are ignored so a newer
+        site never bricks the gate. Missing provider/inputGuardEnabled/limits fall
+        back to the pre-provider defaults; schema, enabled and the 3 model ids are
+        required. Never logs values.
+        """
         path = self.ai_settings_dir / AI_SITE_SETTINGS_FILE
         try:
             info = os.lstat(path)
         except FileNotFoundError:
-            return False
+            return None
         except OSError:
             raise ValueError("unsafe workshop AI site settings") from None
         if (
@@ -714,7 +740,7 @@ class DockerBackend:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         except FileNotFoundError:
-            return False
+            return None
         except OSError:
             raise ValueError("unsafe workshop AI site settings") from None
         try:
@@ -741,34 +767,46 @@ class DockerBackend:
             document.get("transcriptionModel"),
         )
         if (
-            set(document)
-            != {
-                "schema",
-                "revision",
-                "enabled",
-                "generationModel",
-                "guardModel",
-                "transcriptionModel",
-            }
-            or type(document.get("schema")) is not int
+            type(document.get("schema")) is not int
             or document["schema"] != 1
             or type(document.get("revision")) is not int
             or not 0 <= document["revision"] <= AI_SITE_SETTINGS_REVISION_MAX
             or type(document.get("enabled")) is not bool
+            or document.get("provider", "openrouter") not in AI_PROVIDER_KEY_FILES
+            or type(document.get("inputGuardEnabled", False)) is not bool
             or type(generation) is not str
-            or len(generation) > 128
+            or len(generation) > AI_MODEL_MAX_LEN
             or AI_MODEL.fullmatch(generation) is None
-            or type(transcription) is not str
-            or transcription not in AI_TRANSCRIPTION_MODELS
             or type(guard) is not str
-            or AI_GUARD_MODEL.fullmatch(guard) is None
+            or len(guard) > AI_MODEL_MAX_LEN
+            or AI_MODEL.fullmatch(guard) is None
+            or type(transcription) is not str
+            or len(transcription) > AI_MODEL_MAX_LEN
+            or AI_MODEL.fullmatch(transcription) is None
         ):
             raise ValueError("invalid workshop AI site settings")
-        return document["enabled"]
+        for field, (low, high) in AI_SITE_INT_FIELDS.items():
+            value = document.get(field)
+            if value is not None and (
+                type(value) is not int or not low <= value <= high
+            ):
+                raise ValueError("invalid workshop AI site settings")
+        for field in AI_SITE_PRICE_FIELDS:
+            value = document.get(field)
+            if value is not None and (
+                type(value) not in (int, float) or not 0 <= value <= 1000
+            ):
+                raise ValueError("invalid workshop AI site settings")
+        return document
 
-    def _has_ai_key_file(self) -> bool:
+    def _ai_site_enabled(self) -> bool:
+        """Site settings enabled flag; missing file means host fallback. Invalid refuses."""
+        document = self._read_ai_site_document()
+        return document is not None and document["enabled"]
+
+    def _has_ai_key_file(self, filename: Path | str = AI_KEY_PATH) -> bool:
         """Inbox-managed key presence; validated by metadata only, content never read."""
-        path = self.apps["workshop"].data / AI_KEY_PATH
+        path = self.apps["workshop"].data / filename
         try:
             info = os.lstat(path)
         except FileNotFoundError:
@@ -819,8 +857,10 @@ class DockerBackend:
             finally:
                 os.close(fd)
             host_enabled = document.get("enabled", False)
-        site_enabled = self._ai_site_enabled()
-        key_file = self._has_ai_key_file()
+        site_document = self._read_ai_site_document()
+        site_enabled = site_document is not None and site_document["enabled"]
+        provider = (site_document or {}).get("provider", "openrouter")
+        key_file = self._has_ai_key_file(AI_PROVIDER_KEY_FILES[provider])
         if not (host_enabled or site_enabled or key_file or env_key):
             return
         if environment.get("BLOCKFIELD_PROFILE") != "workshop":

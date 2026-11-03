@@ -1150,10 +1150,12 @@ class DockerBackendTests(unittest.TestCase):
         path.write_text(json.dumps(document))
         return path
 
-    def _write_key_file(self, data=b"sk-or-v1-" + b"x" * 32, mode=0o600):
+    def _write_key_file(
+        self, data=b"sk-or-v1-" + b"x" * 32, mode=0o600, filename="openrouter.key"
+    ):
         directory = self.data["workshop"] / "blockfield-workshop"
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "openrouter.key"
+        path = directory / filename
         path.write_bytes(data)
         os.chmod(path, mode)
         return path
@@ -1165,6 +1167,24 @@ class DockerBackendTests(unittest.TestCase):
             self.backend._check_workshop_ai(spec)
         self._write_key_file()
         self.backend._check_workshop_ai(spec)
+
+    def test_ai_site_settings_per_provider_key_file(self):
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        gateway = self._valid_site_settings() | {"provider": "vercel-gateway"}
+        self._write_site_settings(gateway)
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(spec)
+        # The other provider's key does not satisfy a gateway setup.
+        self._write_key_file(filename="openrouter.key")
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(spec)
+        self._write_key_file(filename="gateway.key")
+        self.backend._check_workshop_ai(spec)
+        # And the reverse: gateway.key alone does not satisfy openrouter.
+        self._write_site_settings(self._valid_site_settings())
+        (self.data["workshop"] / "blockfield-workshop/openrouter.key").unlink()
+        with self.assertRaisesRegex(ValueError, "own server key"):
+            self.backend._check_workshop_ai(spec)
 
     def test_ai_key_file_without_enabled_still_runs_strict_checks(self):
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
@@ -1207,12 +1227,42 @@ class DockerBackendTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "own data directory"):
                 self.backend._check_workshop_ai(spec)
 
-    def test_ai_site_settings_closed_schema(self):
+    def test_ai_site_settings_tolerant_schema(self):
+        # The site writes 17 keys; the gate validates known keys and ignores the rest.
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
         self._write_key_file()
-        valid = self._valid_site_settings()
+        site_document = self._valid_site_settings() | {
+            "provider": "openrouter",
+            "inputGuardEnabled": False,
+            "maxBlocks": 16384,
+            "blocksPerTick": 2048,
+            "minimumBuildTicks": 80,
+            "applyBudgetMs": 8,
+            "hourlyRequestLimit": 360,
+            "hourlyPlayerRequestLimit": 60,
+            "maxHourlyBuilders": 256,
+            "generationMaxPricePromptUsdPerM": 0.1,
+            "generationMaxPriceCompletionUsdPerM": 0.2,
+        }
+        self.assertEqual(len(site_document), 17)
+        self._write_site_settings(site_document)
+        self.backend._check_workshop_ai(spec)
+        # Unknown keys from a newer site never brick the gate.
+        self._write_site_settings(site_document | {"futureKey": True})
+        self.backend._check_workshop_ai(spec)
+        # Pre-provider documents still pass with the default provider's key.
+        self._write_site_settings(self._valid_site_settings())
+        self.backend._check_workshop_ai(spec)
+        # Free-form models: no transcription/guard family allowlists.
+        self._write_site_settings(
+            self._valid_site_settings(
+                guardModel="custom/guard-1",
+                transcriptionModel="custom/stt-2",
+            )
+        )
+        self.backend._check_workshop_ai(spec)
+        valid = site_document
         bad_documents = {
-            "extra key": valid | {"debug": True},
             "missing key": {
                 key: value
                 for key, value in valid.items()
@@ -1223,6 +1273,8 @@ class DockerBackendTests(unittest.TestCase):
             "revision 2**53": self._valid_site_settings(revision=2**53),
             "revision bool": self._valid_site_settings(revision=True),
             "enabled string": self._valid_site_settings(enabled="true"),
+            "unknown provider": dict(valid, provider="cliproxy"),
+            "input guard string": dict(valid, inputGuardEnabled="false"),
             "generation without slash": self._valid_site_settings(
                 generationModel="gpt-4"
             ),
@@ -1233,17 +1285,18 @@ class DockerBackendTests(unittest.TestCase):
             "generation colon vendor": self._valid_site_settings(
                 generationModel="a:b/c"
             ),
-            "transcription unsupported": self._valid_site_settings(
-                transcriptionModel="provider/stt"
-            ),
             "generation too long": self._valid_site_settings(
                 generationModel="a" * 64 + "/" + "b" * 64
             ),
-            "guard wrong family": self._valid_site_settings(
-                guardModel="meta/muse-spark-1.3-contributor"
-            ),
             "guard too long": self._valid_site_settings(
-                guardModel="typesafe/jev-" + "x" * 65
+                guardModel="typesafe/jev-" + "x" * 120
+            ),
+            "maxBlocks 0": dict(valid, maxBlocks=0),
+            "maxBlocks float": dict(valid, maxBlocks=16.5),
+            "hourly limit bool": dict(valid, hourlyRequestLimit=True),
+            "price negative": dict(valid, generationMaxPricePromptUsdPerM=-1),
+            "price infinite": dict(
+                valid, generationMaxPriceCompletionUsdPerM=float("inf")
             ),
             "non-dict": [1, 2],
             "invalid json": b"{",
