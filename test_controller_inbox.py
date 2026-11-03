@@ -751,6 +751,145 @@ class AiKeyInboxTests(unittest.TestCase):
         self.assertNotIn(self.key, json.dumps(state))
 
 
+class AiGatewayKeyInboxTests(unittest.TestCase):
+    """The gateway key mirrors the OpenRouter flow into gateway.key."""
+
+    def setUp(self):
+        InboxTests.setUp(self)
+        # Production writes 1000:1000; tests own the file as whatever user runs them.
+        for name, value in (("AI_KEY_UID", os.getuid()), ("AI_KEY_GID", os.getgid())):
+            patcher = unittest.mock.patch(f"controller.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.workshop_data = self.dir / "workshop-data"
+        self.workshop_data.mkdir()
+        self.controller.workshop_data_dir = self.workshop_data
+        self.key = "sk-or-v1-" + "Ab12" * 10
+        self.other_key = "sk-or-v1-" + "Zz99" * 10
+
+    def process(self, **kwargs):
+        with contextlib.redirect_stderr(self.log):
+            return self.controller.process_inbox(**kwargs)
+
+    result = InboxTests.result
+    read = InboxTests.read
+
+    def put(self, request_id=None, **fields):
+        request_id = request_id or str(uuid4())
+        document = {
+            "schema": 1,
+            "id": request_id,
+            "kind": "ai-gateway-key",
+            "actor": {"draslId": DRASL, "name": "Nether"},
+            "createdAt": int(time.time() * 1000),
+            **fields,
+        }
+        path = self.inbox / f"{request_id}.json"
+        path.write_text(json.dumps(document))
+        return request_id
+
+    def key_file(self):
+        return self.workshop_data / "blockfield-workshop/gateway.key"
+
+    def test_set_replace_delete_and_status(self):
+        request_id = self.put(key=self.key)
+        self.assertEqual(self.process(), 1)
+        result = self.result(request_id)
+        self.assertEqual(
+            (result["ok"], result["error"], result["kind"], result["set"]),
+            (True, None, "ai-gateway-key", True),
+        )
+        self.assertEqual(
+            (
+                result["last4"],
+                result["sha256Prefix"],
+                result["payload"],
+            ),
+            (
+                self.key[-4:],
+                hashlib.sha256(self.key.encode()).hexdigest()[:8],
+                {
+                    "kind": "ai-gateway-key",
+                    "set": True,
+                    "last4": self.key[-4:],
+                    "sha256Prefix": hashlib.sha256(self.key.encode()).hexdigest()[:8],
+                    "appliedAt": result["appliedAt"],
+                },
+            ),
+        )
+        self.assertIs(type(result["appliedAt"]), int)
+        key_path = self.key_file()
+        self.assertEqual(key_path.read_text(), self.key)
+        info = key_path.stat()
+        self.assertEqual(
+            (
+                stat.S_IMODE(info.st_mode),
+                info.st_uid,
+                info.st_gid,
+                info.st_nlink,
+            ),
+            (0o600, os.getuid(), os.getgid(), 1),
+        )
+        status = json.loads((self.admin / "ai-gateway-key.json").read_text())
+        self.assertEqual(status["set"], True)
+        self.assertEqual(status["schema"], 1)
+        self.assertEqual(os.listdir(self.inbox), [])
+        self.assertIn(
+            f"inbox {request_id} kind='ai-gateway-key' actor=Nether ok",
+            self.log.getvalue(),
+        )
+
+        replace = self.put(key=self.other_key)
+        self.process()
+        self.assertEqual(self.key_file().read_text(), self.other_key)
+        self.assertTrue(self.result(replace)["set"])
+
+        remove = self.put(key=None)
+        self.process()
+        result = self.result(remove)
+        self.assertEqual(
+            (result["ok"], result["set"], result["last4"], result["sha256Prefix"]),
+            (True, False, "", ""),
+        )
+        self.assertFalse(key_path.exists())
+        status = json.loads((self.admin / "ai-gateway-key.json").read_text())
+        self.assertEqual(status["set"], False)
+        # Removing an absent key is still a successful no-op.
+        self.process()
+
+    def test_invalid_keys_are_refused_generically(self):
+        for label, fields in (
+            ("too short", {"key": "x" * 19}),
+            ("missing", {}),
+        ):
+            with self.subTest(label):
+                request_id = self.put(**fields)
+                self.process()
+                result = self.result(request_id)
+                self.assertEqual(
+                    (result["ok"], result["error"]),
+                    (False, "invalid ai-gateway-key request"),
+                )
+                self.assertNotIn("kind", result)
+        self.assertFalse(self.key_file().exists())
+        self.assertFalse((self.admin / "ai-gateway-key.json").exists())
+
+    def test_key_never_appears_outside_its_file(self):
+        self.put(key=self.key)
+        self.put(key=self.other_key)
+        self.process()
+        self.process()
+        log = self.log.getvalue()
+        self.assertNotIn(self.key, log)
+        self.assertNotIn(self.other_key, log)
+        for path in self.dir.rglob("*"):
+            if path.is_file() and path != self.key_file():
+                with self.subTest(path=path):
+                    data = path.read_bytes()
+                    self.assertNotIn(self.key.encode(), data)
+                    self.assertNotIn(self.other_key.encode(), data)
+
+
 if __name__ == "__main__":
     unittest.main()
 
