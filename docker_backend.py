@@ -20,7 +20,7 @@ import subprocess
 import time
 from uuid import UUID, uuid4
 
-from controller import Goal, Process, atomic_write
+from controller import AI_PROVIDER_RESERVED_IDS, Goal, Process, atomic_write
 import map_package
 
 # itzg runs `java ... -jar ./fabric-server-mc.1.21.1-loader.X-launcher.Y.jar`.
@@ -40,7 +40,8 @@ GAME_DIGEST = re.compile(re.escape(GAME_REPOSITORY) + r"@sha256:[0-9a-f]{64}")
 LABEL = "label=com.docker.swarm.service.name="
 # Site-managed workshop AI settings (contract: closed schema, regular single-link file).
 AI_SITE_SETTINGS_FILE = "workshop-ai-settings.json"
-AI_SITE_SETTINGS_MAX_BYTES = 4096
+# Eight full registry entries plus settings stay under this bound.
+AI_SITE_SETTINGS_MAX_BYTES = 8192
 AI_SITE_SETTINGS_REVISION_MAX = 2**53 - 1
 # Same shape as the mod and the site: vendor/name with an optional :variant such as :free.
 AI_MODEL = re.compile(r"[a-zA-Z0-9._-]{1,64}/[a-zA-Z0-9._/:-]{1,126}")
@@ -130,7 +131,7 @@ def _valid_provider_entry(entry) -> str | None:
         not isinstance(entry, dict)
         or type(entry.get("id")) is not str
         or AI_PROVIDER_ID.fullmatch(entry["id"]) is None
-        or entry["id"] in AI_PROVIDER_KEY_FILES
+        or entry["id"] in AI_PROVIDER_RESERVED_IDS
         or type(entry.get("label")) is not str
         or not entry.get("label")
         or len(entry["label"]) > AI_PROVIDER_BASE_URL_MAX_LEN

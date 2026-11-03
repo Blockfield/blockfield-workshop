@@ -153,6 +153,22 @@ AI_PROVIDER_KEY_PRESETS = {
     "openrouter": ("openrouter.key", "ai-key.json", "ai-key"),
     "vercel-gateway": ("gateway.key", "ai-gateway-key.json", "ai-gateway-key"),
 }
+# Custom ids that would reuse a preset key file or status name stay reserved,
+# so a custom key can never overwrite (or satisfy) another provider's key.
+AI_PROVIDER_RESERVED_IDS = frozenset(
+    {
+        *AI_PROVIDER_KEY_PRESETS,
+        *(
+            filename.removesuffix(".key")
+            for filename, _, _ in AI_PROVIDER_KEY_PRESETS.values()
+        ),
+        *(
+            status.removesuffix("-key.json")
+            for _, status, _ in AI_PROVIDER_KEY_PRESETS.values()
+            if status.endswith("-key.json")
+        ),
+    }
+)
 
 
 def ai_provider_key_names(provider_id: str) -> tuple[str, str, str]:
@@ -2630,7 +2646,14 @@ class Controller:
             )
         if kind == "ai-provider-key":
             provider = document.get("provider")
-            if type(provider) is not str or AI_PROVIDER_ID.fullmatch(provider) is None:
+            if (
+                type(provider) is not str
+                or AI_PROVIDER_ID.fullmatch(provider) is None
+                or (
+                    provider not in AI_PROVIDER_KEY_PRESETS
+                    and provider in AI_PROVIDER_RESERVED_IDS
+                )
+            ):
                 raise ValueError("invalid ai-provider-key request")
             filename, status_name, _ = ai_provider_key_names(provider)
             return self._apply_ai_key(

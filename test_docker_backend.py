@@ -1234,6 +1234,20 @@ class DockerBackendTests(unittest.TestCase):
                 ],
             ),
             (
+                "reserved key stem",
+                [
+                    {
+                        "id": "gateway",
+                        "label": "x",
+                        "baseUrl": "https://x.example.com",
+                    }
+                ],
+            ),
+            (
+                "reserved status stem",
+                [{"id": "ai", "label": "x", "baseUrl": "https://x.example.com"}],
+            ),
+            (
                 "uppercase id",
                 [{"id": "Acme", "label": "x", "baseUrl": "https://x.example.com"}],
             ),
@@ -1316,6 +1330,40 @@ class DockerBackendTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
             self.backend._check_workshop_ai(spec)
+
+    def test_ai_site_settings_full_registry_fits_the_size_bound(self):
+        # Eight entries at the field limits plus the full settings must pass.
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        providers = [
+            {
+                "id": f"p{i}",
+                "label": "l" * 200,
+                "baseUrl": "https://x.example.com/" + "p" * 176,
+            }
+            for i in range(8)
+        ]
+        document = self._valid_site_settings() | {
+            "provider": "openrouter",
+            "generationProvider": "openrouter",
+            "guardProvider": "openrouter",
+            "transcriptionProvider": "openrouter",
+            "cleanupModel": "vendor/tidy-1",
+            "cleanupProvider": "openrouter",
+            "inputGuardEnabled": False,
+            "maxBlocks": 16384,
+            "blocksPerTick": 2048,
+            "minimumBuildTicks": 80,
+            "applyBudgetMs": 8,
+            "hourlyRequestLimit": 360,
+            "hourlyPlayerRequestLimit": 60,
+            "maxHourlyBuilders": 256,
+            "generationMaxPricePromptUsdPerM": 0.1,
+            "generationMaxPriceCompletionUsdPerM": 0.2,
+            "providers": providers,
+        }
+        self._write_site_settings(document)
+        self._write_key_file()
+        self.backend._check_workshop_ai(spec)
 
     def test_ai_site_settings_provider_key_review_cases(self):
         # An OpenRouter env key does not satisfy an enabled gateway setup.
@@ -1469,7 +1517,8 @@ class DockerBackendTests(unittest.TestCase):
                 ):
                     self.backend._check_workshop_ai(spec)
         path = self.backend.ai_settings_dir / "workshop-ai-settings.json"
-        path.write_bytes(json.dumps(valid).encode() + b" " * 5000)
+        # Past the registry size bound the document is still refused.
+        path.write_bytes(json.dumps(valid).encode() + b" " * 9000)
         with self.assertRaisesRegex(ValueError, "invalid workshop AI site settings"):
             self.backend._check_workshop_ai(spec)
         path.write_text(json.dumps(self._valid_site_settings(revision=2**53 - 1)))
