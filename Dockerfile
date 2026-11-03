@@ -4,6 +4,8 @@
 #
 # Pinned base: python 3.12.14-slim-bookworm. Refresh tag and digest together
 # with: docker buildx imagetools inspect python:3.12.14-slim-bookworm
+# Pinned tini: apt resolves it live at build time, so the base digest alone
+# does not pin it. Refresh the tini version with the base (#43).
 FROM python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,7 +24,7 @@ WORKDIR /app
 # Pinned toolchain: exact interpreter plus working standard zlib, asserted at
 # build time (the host install in docs/OPERATIONS.md runs the same check).
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends tini \
+RUN apt-get update && apt-get install -y --no-install-recommends tini=0.19.0-1+b3 \
     && rm -rf /var/lib/apt/lists \
     && groupadd -r -g 1000 workshop && useradd -r -u 1000 -g workshop workshop \
     && mkdir -p /app /state/gate /state/public /state/admin /state/inbox /data /locks \
