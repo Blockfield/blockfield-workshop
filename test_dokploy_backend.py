@@ -294,6 +294,21 @@ class BackendTests(unittest.TestCase):
         second = json.loads((self.lock / "workshop/profile.json").read_bytes())
         self.assertNotEqual(second["generation"], first["generation"])
 
+    def test_rotated_candidate_mints_fresh_generation(self):
+        # Same session, rotated candidate: the persisted generation belongs
+        # to the old candidate, so start() must mint a fresh one, while a
+        # retry of the same candidate reuses it.
+        self.backend.maps = mock.Mock()
+        session = str(uuid4())
+        self.backend.start(Goal("test", RELEASE, session, candidate="a" * 64))
+        first = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.backend.start(Goal("test", RELEASE, session, candidate="a" * 64))
+        same = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(same["generation"], first["generation"])
+        self.backend.start(Goal("test", RELEASE, session, candidate="b" * 64))
+        rotated = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertNotEqual(rotated["generation"], first["generation"])
+
     def test_unknown_release_fails_preflight_before_effects(self):
         with self.assertRaises(ValueError):
             self.backend.start(Goal("workshop", "v-absent", str(uuid4())))
