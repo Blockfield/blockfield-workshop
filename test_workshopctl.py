@@ -561,6 +561,48 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("immutable server imageDigest", error)
 
+    def test_desired_command_reports_owned_schema_2(self):
+        code, state = self.ctl("status")
+        self.assertEqual((code, state["state"]["phase"]), (0, "UNINITIALIZED"))
+        code, result = self.ctl("desired")
+        self.assertEqual((code, result["desired"]), (0, None))
+        session = str(uuid4())
+        self.assertEqual(
+            self.ctl(
+                "request", "workshop", "--session", session, "--release", "v1.0.0"
+            )[0],
+            0,
+        )
+        code, result = self.ctl("desired")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["desired"]["schema"], 2)
+        self.assertEqual(result["desired"]["workshop"]["release"], "v1.0.0")
+        self.assertEqual(result["desired"]["revision"], 1)
+        on_disk = json.loads((self.root / "controller" / "desired.json").read_text())
+        self.assertEqual(on_disk, result["desired"])
+
+    def test_desired_file_wiring(self):
+        kwargs = dict(
+            state_dir=str(self.root / "controller"),
+            gate_file=str(self.root / "gate" / "gate.json"),
+            public_file=str(self.root / "public" / "public.json"),
+            admin_dir=str(self.root / "admin"),
+            inbox_dir=str(self.root / "inbox"),
+        )
+        controller, _ = workshopctl.build_controller(
+            dict(os.environ), lambda: self.backend, **kwargs
+        )
+        self.assertEqual(
+            controller.desired_file, self.root / "controller" / "desired.json"
+        )
+        custom = self.root / "custom-desired.json"
+        controller, _ = workshopctl.build_controller(
+            {**os.environ, "BF_DESIRED_FILE": str(custom)},
+            lambda: self.backend,
+            **kwargs,
+        )
+        self.assertEqual(controller.desired_file, custom)
+
 
 if __name__ == "__main__":
     unittest.main()
