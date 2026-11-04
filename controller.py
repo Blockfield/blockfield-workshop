@@ -24,6 +24,7 @@ from typing import Callable, Protocol
 import unicodedata
 from uuid import UUID, uuid4
 
+import desired as desired_state
 import map_package
 import releases as release_catalog
 
@@ -289,6 +290,7 @@ class Controller:
         releases: dict | None = None,
         releases_path: Path | None = None,
         target_file: Path | None = None,
+        desired_file: Path | None = None,
     ):
         """A missed STARTING deadline restores a previous Workshop/test goal when available."""
         # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
@@ -314,6 +316,12 @@ class Controller:
         # release record. It survives with Game off; staging never reads live Game.
         self.target_file = (
             Path(target_file) if target_file else self.directory / "target.json"
+        )
+        # Controller-owned desired state (deploy tail schema 2): the approved
+        # Workshop release plus its revision/operation binding. The host
+        # game-deploy file keeps its schema-1 shape for its own readers.
+        self.desired_file = (
+            Path(desired_file) if desired_file else self.directory / "desired.json"
         )
         self.releases = dict(releases) if releases else {}
         # Hot catalog reload for the long-running loop: entrypoint builds the
@@ -602,6 +610,18 @@ class Controller:
             )
         return target
 
+    def _project_desired(self, state: dict) -> dict | None:
+        document = desired_state.build_from_state(state)
+        if document is None:
+            # A standalone file is not a committed selection or an initial
+            # import; like target.json, it is adopted only via request.
+            if desired_state.read_desired_state(self.desired_file) is not None:
+                raise ValueError(
+                    "desired state has no committed selection; import via request"
+                )
+            return None
+        return desired_state.project_desired_state(self.desired_file, document)
+
     def _write(self, state: dict, *, processes: list[Process] | None = None) -> None:
         self._validate_selection(state)
         data = json.dumps(
@@ -611,6 +631,7 @@ class Controller:
             raise ValueError("controller state exceeds its bounded reader")
         atomic_write(self.file, data)
         self._project_target(state)
+        self._project_desired(state)
         # processes reuses the step's observation: every export of a step shares
         # one observation, so a nested export can never be newer than the step's
         # trailing export (stale data must not overwrite fresh gate decisions).
@@ -678,6 +699,11 @@ class Controller:
         """Validated revision-bound projection of the durable selection journal."""
         with self._locked():
             return self._project_target(self._read())
+
+    def desired_state(self) -> dict | None:
+        """Validated owned desired-state document; repairs the projection."""
+        with self._locked():
+            return self._project_desired(self._read())
 
     def _select_release(self, release: str, state: dict) -> dict:
         if self.releases and release in self.releases:
@@ -1182,6 +1208,7 @@ class Controller:
         UUID(operation)
         state = self._read()
         self._project_target(state)
+        self._project_desired(state)
         request_intent = asdict(goal)
         request_session = json.loads(json.dumps(session, allow_nan=False))
         returning = goal.profile == "game"

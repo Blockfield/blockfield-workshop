@@ -155,6 +155,8 @@ a crash after state commit may leave a stale projection which is repaired on res
 operation is idempotent; changed intent/evidence or stale new revisions are rejected. A target acknowledgement is
 not configured-image or READY evidence; the runtime adapter/verifier must prove those separately.
 
+`desired.json` is the controller-owned desired state (deploy tail schema 2): the approved Workshop release plus `{revision,operation,selectionRevision,previousWorkshop}` bound to the state revision and selection operation that committed it. The embedded records reuse the schema-1 release-record shape, so the existing release validators keep working; a standalone schema-1 record is accepted as the initial import, while the host game-deploy file keeps its exact schema-1 shape for the deploy runner readers. The projection is repaired from the state journal under the controller lock on every state write and `desired` reads, and stays plain JSON with the controller dead. Rewriting the same committed (operation, revision) is a no-op; the same operation with different content at the same revision is rejected.
+
 ### Release mismatch recovery (controller/wave desync)
 
 Moving `:approved` and redeploying the Workshop without first selecting the release in the

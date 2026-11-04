@@ -72,6 +72,7 @@ def build_controller(
     admin_dir=None,
     inbox_dir=None,
     releases_file=None,
+    desired_file=None,
 ):
     """Shared construction for the CLI and the container entry point."""
     if backend_factory is None:
@@ -118,6 +119,13 @@ def build_controller(
         ),
         releases=release_catalog.load_catalog(releases_path),
         releases_path=releases_path,
+        desired_file=(
+            Path(desired_file)
+            if desired_file
+            else Path(env.get("BF_DESIRED_FILE", ""))
+            if env.get("BF_DESIRED_FILE", "")
+            else None
+        ),
     )
     if hasattr(backend, "maps"):
         backend.maps = controller.maps
@@ -332,6 +340,7 @@ def main(argv=None, backend_factory=None) -> int:
     commands.add_parser("step")
     commands.add_parser("status")
     commands.add_parser("target", help="show the last approved Workshop release target")
+    commands.add_parser("desired", help="show the controller-owned desired state")
     commands.add_parser(
         "wake", help="start a sleeping Workshop editor again (idempotent)"
     )
@@ -413,6 +422,8 @@ def main(argv=None, backend_factory=None) -> int:
             result = {"state": controller.status(), "members": controller.members()}
         elif args.command == "target":
             result = {"target": controller.approved_target()}
+        elif args.command == "desired":
+            result = {"desired": controller.desired_state()}
         elif args.command == "members":
             result = {
                 "members": controller.set_members(
