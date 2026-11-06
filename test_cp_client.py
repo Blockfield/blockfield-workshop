@@ -60,11 +60,11 @@ class FakeTransport:
         self.events_calls = 0
 
     def get_json(self, url, timeout):
-        return 200, json.dumps(self.snapshot_doc).encode()
+        return json.dumps(self.snapshot_doc).encode()
 
     def post_json(self, url, body, timeout):
         self.acks.append(body)
-        return 200, b"{}"
+        return b"{}"
 
     def get_events(self, url, timeout):
         self.events_calls += 1
@@ -475,7 +475,7 @@ class CPClientTests(unittest.TestCase):
 
         def get_json(url, timeout):
             calls["n"] += 1
-            return 200, json.dumps(docs[min(calls["n"], 2) - 1]).encode()
+            return json.dumps(docs[min(calls["n"], 2) - 1]).encode()
 
         transport.get_json = get_json
         config = CPConfig(
@@ -518,6 +518,290 @@ class CPClientTests(unittest.TestCase):
         result = client.sync(self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(calls["n"], 2)
+
+    # Bot-review round 2 below: each failed on the pre-fix code.
+
+    def test_acl_refreshes_after_members_apply(self):
+        newcomer = {"draslId": STRANGER, "name": "Stranger", "role": "builder"}
+        transport = FakeTransport(
+            snapshot_doc(),
+            [
+                frame(members_op(ADMIN, [ADMIN, newcomer]), 1),
+                frame(
+                    {
+                        "kind": "message",
+                        "actor": {"draslId": STRANGER, "name": "Stranger"},
+                        "message": "hello",
+                    },
+                    2,
+                ),
+            ],
+        )
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 2, "rejected": 0, "acked": 2})
+        self.assertEqual(self.controller.message, "hello")
+
+    def test_members_export_failure_still_commits(self):
+        from unittest import mock
+
+        newcomer = {"draslId": STRANGER, "name": "Stranger", "role": "builder"}
+        with mock.patch.object(
+            self.controller, "_export", side_effect=OSError("disk full")
+        ):
+            result = self.controller.apply_cp_operation(
+                str(uuid4()), members_op(ADMIN, [ADMIN, newcomer]), [ADMIN]
+            )
+        self.assertEqual(result, {"kind": "members", "count": 2})
+        self.assertEqual(len(self.controller.members()), 2)
+
+    def test_https_required_for_cp_url(self):
+        with self.assertRaisesRegex(ValueError, "https"):
+            CPConfig.from_env(
+                {
+                    "BLOCKFIELD_CP_URL": "http://cp.internal",
+                    "BLOCKFIELD_CP_AGENT_ID": AGENT,
+                    "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                }
+            )
+
+    def test_loopback_http_allowed_for_cp_url(self):
+        for base in ("http://127.0.0.1:9", "http://localhost:9"):
+            config = CPConfig.from_env(
+                {
+                    "BLOCKFIELD_CP_URL": base,
+                    "BLOCKFIELD_CP_AGENT_ID": AGENT,
+                    "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                }
+            )
+            self.assertEqual(config.base_url, base)
+
+    def test_redirect_refused_without_bearer(self):
+        import http.server
+        import os
+        import threading
+
+        saved = {}
+        for var in (
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "no_proxy",
+        ):
+            saved[var] = os.environ.pop(var, None)
+        os.environ["no_proxy"] = "127.0.0.1,localhost"
+        try:
+            outer_seen = {}
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path == "/cp":
+                        self.send_response(302)
+                        self.send_header(
+                            "Location",
+                            f"http://127.0.0.1:{self.server.server_port}/target",
+                        )
+                        self.end_headers()
+                    else:
+                        outer_seen[self.path] = self.headers.get("Authorization")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b"{}")
+
+                def log_message(self, *args):
+                    pass
+
+            server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.05}
+            )
+            thread.daemon = True
+            thread.start()
+            try:
+                from cp_client import CPHttpError, _UrllibTransport
+
+                transport = _UrllibTransport("secret-token")
+                with self.assertRaises(CPHttpError):
+                    transport.get_json(
+                        f"http://127.0.0.1:{server.server_port}/cp", timeout=5.0
+                    )
+                self.assertNotIn("/target", outer_seen)
+            finally:
+                server.shutdown()
+                thread.join(timeout=10)
+                server.server_close()
+        finally:
+            os.environ.pop("no_proxy", None)
+            for var, value in saved.items():
+                if value is not None:
+                    os.environ[var] = value
+
+    def test_request_body_raises_on_non_2xx(self):
+        from cp_client import CPHttpError, MAX_SNAPSHOT_BYTES, _request_body
+
+        class StubResponse:
+            def __init__(self, status, body):
+                self.status = status
+                self.body = body
+
+            def read(self, n=-1):
+                return self.body if n < 0 else self.body[:n]
+
+        class Ctx:
+            def __init__(self, response):
+                self.response = response
+
+            def __enter__(self):
+                return self.response
+
+            def __exit__(self, *args):
+                return False
+
+        class StubOpener:
+            def __init__(self, status, body):
+                self.status = status
+                self.body = body
+
+            def open(self, request, timeout=None):
+                return Ctx(StubResponse(self.status, self.body))
+
+        body = _request_body(
+            StubOpener(200, b'{"a": 1}'), None, 5.0, "snapshot", MAX_SNAPSHOT_BYTES
+        )
+        self.assertEqual(body, b'{"a": 1}')
+        with self.assertRaises(CPHttpError) as ctx:
+            _request_body(
+                StubOpener(503, b"oops"), None, 5.0, "snapshot", MAX_SNAPSHOT_BYTES
+            )
+        self.assertEqual(ctx.exception.status, 503)
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            _request_body(
+                StubOpener(200, b"x" * (MAX_SNAPSHOT_BYTES + 1)),
+                None,
+                5.0,
+                "snapshot",
+                MAX_SNAPSHOT_BYTES,
+            )
+
+    def test_failed_nack_holds_cursor(self):
+        from cp_client import CPHttpError
+
+        envelope = frame(
+            {"kind": "message", "actor": ADMIN, "message": "hi"},
+            1,
+            agent="someone-else",
+        )
+        transport = FakeTransport(snapshot_doc(), [envelope])
+
+        def boom(url, body, timeout):
+            raise CPHttpError("acks", 503)
+
+        transport.post_json = boom
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 0})
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+
+    def test_applied_ack_503_surfaces(self):
+        import http.server
+        import os
+        import threading
+
+        saved = {}
+        for var in (
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "no_proxy",
+        ):
+            saved[var] = os.environ.pop(var, None)
+        os.environ["no_proxy"] = "127.0.0.1,localhost"
+        try:
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    length = int(self.headers.get("Content-Length", 0))
+                    self.rfile.read(length)
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+
+                def log_message(self, *args):
+                    pass
+
+            server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.05}
+            )
+            thread.daemon = True
+            thread.start()
+            try:
+                from cp_client import CPHttpError, _UrllibTransport
+
+                envelope = frame(
+                    {"kind": "message", "actor": ADMIN, "message": "hi"}, 1
+                )
+                transport = FakeTransport(snapshot_doc(), [envelope])
+                real = _UrllibTransport("t")
+                acks_url = f"http://127.0.0.1:{server.server_port}/acks"
+                transport.post_json = lambda url, body, timeout: real.post_json(
+                    acks_url, body, timeout
+                )
+                with self.assertRaises(CPHttpError) as ctx:
+                    self.client(transport).sync(self.controller)
+                self.assertEqual(ctx.exception.status, 503)
+                state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+                self.assertEqual(state["cursor"], 0)
+            finally:
+                server.shutdown()
+                thread.join(timeout=10)
+                server.server_close()
+        finally:
+            os.environ.pop("no_proxy", None)
+            for var, value in saved.items():
+                if value is not None:
+                    os.environ[var] = value
+
+    def test_malformed_block_stops_read_keeps_prefix(self):
+        from cp_client import _read_sse
+
+        first = frame({"kind": "message", "actor": ADMIN, "message": "a"}, 1)
+        second = frame({"kind": "message", "actor": ADMIN, "message": "b"}, 2)
+        lines = [
+            "data: " + json.dumps(first),
+            "",
+            "data: {truncated",
+            "",
+            "data: " + json.dumps(second),
+            "",
+        ]
+
+        class StubResponse:
+            def __init__(self):
+                self.calls = 0
+
+            def readline(self, *args):
+                if self.calls < len(lines):
+                    line = lines[self.calls].encode()
+                    self.calls += 1
+                    return line + b"\n"
+                return b""
+
+        frames = _read_sse(StubResponse(), timeout=5.0)
+        self.assertEqual(frames, [first])
+        transport = FakeTransport(snapshot_doc(), frames)
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(self.controller.message, "a")
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 1)
 
 
 if __name__ == "__main__":

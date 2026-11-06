@@ -31,6 +31,7 @@ import os
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 from controller import member
 
@@ -49,6 +50,14 @@ class SnapshotRequired(Exception):
     """Stream epoch/cursor moved on: refetch the snapshot before applying."""
 
 
+class CPHttpError(ValueError):
+    """CP answered non-2xx: carries the status so callers can branch on it."""
+
+    def __init__(self, what: str, status: int):
+        super().__init__(f"cp {what} failed: http {status}")
+        self.status = status
+
+
 @dataclass(frozen=True)
 class CPConfig:
     base_url: str
@@ -64,6 +73,12 @@ class CPConfig:
         token = env.get("BLOCKFIELD_CP_AGENT_TOKEN") or ""
         if not base or not agent or not token:
             return None
+        scheme = urllib.parse.urlsplit(base).scheme.lower()
+        host = urllib.parse.urlsplit(base).hostname or ""
+        if scheme != "https" and not (
+            scheme == "http" and host in ("127.0.0.1", "localhost", "::1")
+        ):
+            raise ValueError("BLOCKFIELD_CP_URL must be https (http only for loopback)")
         try:
             timeout = float(env.get("BLOCKFIELD_CP_POLL_TIMEOUT_S", EVENT_TIMEOUT_S))
         except (TypeError, ValueError):
@@ -159,24 +174,59 @@ def _read_capped(response, cap: int, what: str) -> bytes:
     return body
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: following one would forward the agent bearer."""
+
+    def _refuse(self, req, fp, code, msg, headers):
+        raise urllib.error.HTTPError(
+            req.get_full_url(), code, f"cp refuses redirect ({code})", headers, fp
+        )
+
+    http_error_301 = _refuse
+    http_error_302 = _refuse
+    http_error_303 = _refuse
+    http_error_307 = _refuse
+    http_error_308 = _refuse
+    https_error_301 = _refuse
+    https_error_302 = _refuse
+    https_error_303 = _refuse
+    https_error_307 = _refuse
+    https_error_308 = _refuse
+
+
+def _request_body(opener, request, timeout: float, what: str, cap: int) -> bytes:
+    """One helper for whole-document CP calls: any non-2xx raises CPHttpError,
+    so no caller can mistake a failed call for a delivered one."""
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            body = _read_capped(response, cap, what)
+            status = response.status
+    except urllib.error.HTTPError as error:
+        try:
+            error.close()
+        except Exception:
+            pass
+        raise CPHttpError(what, error.code) from error
+    if not 200 <= status <= 299:
+        raise CPHttpError(what, status)
+    return body
+
+
 class _UrllibTransport:
     def __init__(self, token: str):
         self.token = token
+        self.opener = urllib.request.build_opener(_NoRedirect)
 
     def _headers(self, accept: str) -> dict:
         return {"Authorization": f"Bearer {self.token}", "Accept": accept}
 
-    def get_json(self, url: str, timeout: float) -> tuple[int, bytes]:
+    def get_json(self, url: str, timeout: float) -> bytes:
         request = urllib.request.Request(url, headers=self._headers("application/json"))
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, _read_capped(
-                    response, MAX_SNAPSHOT_BYTES, "snapshot"
-                )
-        except urllib.error.HTTPError as error:
-            return error.code, _read_capped(error, MAX_SNAPSHOT_BYTES, "snapshot")
+        return _request_body(
+            self.opener, request, timeout, "snapshot", MAX_SNAPSHOT_BYTES
+        )
 
-    def post_json(self, url: str, body: dict, timeout: float) -> tuple[int, bytes]:
+    def post_json(self, url: str, body: dict, timeout: float) -> bytes:
         data = canonical(body)
         request = urllib.request.Request(
             url,
@@ -187,32 +237,35 @@ class _UrllibTransport:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, _read_capped(response, MAX_FRAME_BYTES, "ack")
-        except urllib.error.HTTPError as error:
-            return error.code, _read_capped(error, MAX_FRAME_BYTES, "ack")
+        return _request_body(self.opener, request, timeout, "acks", MAX_FRAME_BYTES)
 
     def get_events(self, url: str, timeout: float) -> tuple[int, list[dict]]:
         request = urllib.request.Request(
             url, headers=self._headers("text/event-stream")
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 if response.status == 409:
                     raise SnapshotRequired("cp snapshot required")
+                if not 200 <= response.status <= 299:
+                    raise CPHttpError("events", response.status)
                 return response.status, _read_sse(response, timeout)
         except urllib.error.HTTPError as error:
             if error.code == 409:
-                raise SnapshotRequired("cp snapshot required")
-            return error.code, []
+                raise SnapshotRequired("cp snapshot required") from error
+            try:
+                error.close()
+            except Exception:
+                pass
+            raise CPHttpError("events", error.code) from error
 
 
 def _read_sse(response, timeout: float) -> list[dict]:
     """Read bounded SSE frames until the deadline; one JSON object per data block.
 
     A socket timeout after the last queued event ends the read with the
-    frames parsed so far instead of discarding them. Lines carry no
+    frames parsed so far instead of discarding them, and so does an
+    undecodable data block. Lines carry no
     per-line limit (a members frame can approach MAX_FRAME_BYTES); a single
     data block past that is an explicit error, never silent truncation.
     """
@@ -237,7 +290,13 @@ def _read_sse(response, timeout: float) -> list[dict]:
                 try:
                     document = json.loads("\n".join(data))
                 except ValueError:
-                    raise ValueError("invalid cp frame: bad data JSON")
+                    # Undecodable block: stop here and keep the frames parsed
+                    # so far. The cursor never jumps a hole (the server would
+                    # 409 a jumped cursor and loop), so later frames stay
+                    # queued; the next pass re-reads them over a fresh
+                    # connection, which heals transient truncation. Receipts
+                    # of applied frames persist in the receipts file.
+                    break
                 if isinstance(document, dict):
                     frames.append(document)
                 data = []
@@ -304,13 +363,16 @@ class CPClient:
         self._receipts_file.write_bytes(canonical(receipts))
 
     def snapshot(self) -> dict:
-        status, raw = self.transport.get_json(
-            self.config.snapshot_url(), timeout=self.config.poll_timeout_s
-        )
-        if status == 401 or status == 403:
-            raise ValueError("cp snapshot denied: check agent credential")
-        if status != 200:
-            raise ValueError(f"cp snapshot failed: http {status}")
+        try:
+            raw = self.transport.get_json(
+                self.config.snapshot_url(), timeout=self.config.poll_timeout_s
+            )
+        except CPHttpError as error:
+            if error.status in (401, 403):
+                raise ValueError(
+                    "cp snapshot denied: check agent credential"
+                ) from error
+            raise
         try:
             document = json.loads(raw.decode())
         except ValueError:
@@ -429,8 +491,9 @@ class CPClient:
     def _nack(self, controller, frame, state) -> tuple[int, int]:
         """Best-effort rejected receipt for an unauthenticatable frame.
 
-        Returns (rejected, acked) and advances the local cursor past it so
-        the stream can move on.
+        Returns (rejected, acked). The local cursor advances only past a
+        delivered nack, so a failed one is retried on the next pass instead
+        of being counted and skipped.
         """
         if not isinstance(frame, dict):
             return 0, 0
@@ -442,13 +505,11 @@ class CPClient:
         try:
             self._ack(controller, operation_id, state["epoch"], sequence, "rejected")
         except Exception:
-            acked = 0
-        else:
-            acked = 1
+            return 1, 0
         if type(state["cursor"]) is int and sequence > state["cursor"]:
             state["cursor"] = sequence
             self._store_state()
-        return 1, acked
+        return 1, 1
 
     def _reject_applied(self, controller, operation_id, sequence, state) -> None:
         self._store_receipt(operation_id, {"state": "rejected", "sequence": sequence})
@@ -525,6 +586,12 @@ class CPClient:
                     operation_id, {"state": terminal, "sequence": sequence}
                 )
                 self._ack(controller, operation_id, state["epoch"], sequence, terminal)
+                if result.get("kind") == "members":
+                    # Membership changed under us: refresh the snapshot ACL so
+                    # later frames in this pass check the new list, not the
+                    # stale snapshot (which lives up to the TTL otherwise).
+                    state["acl"] = controller.members()
+                    self._store_state()
                 applied += 1
                 acked += 1
             state["cursor"] = max(state["cursor"], sequence)
