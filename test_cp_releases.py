@@ -20,12 +20,16 @@ BUILDER = {
 }
 
 
-def snapshot_doc(cursor=0, acl=None, releases=None):
+def snapshot_doc(cursor=0, releases=None):
+    """Minimal real snapshot; releases stay accepted when present (tolerant read)."""
     doc = {
+        "schema": 2,
+        "audience": AGENT,
         "epoch": EPOCH,
         "generation": GENERATION,
         "cursor": cursor,
-        "acl": [ADMIN] if acl is None else acl,
+        "settings": [],
+        "hash": "0" * 64,
     }
     if releases is not None:
         doc["releases"] = releases
@@ -85,7 +89,10 @@ class CPReleaseTests(unittest.TestCase):
         on_disk = json.loads(self.releases_path.read_bytes())
         self.assertEqual(on_disk["v9.0.0"]["imageDigest"], record["imageDigest"])
         self.assertIn("v9.0.0", self.backend.releases)
-        self.assertEqual(transport.acks[0]["state"], "effective")
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
 
     def test_expired_release_select_refused(self):
         record = release_record("v9.0.0", "d")

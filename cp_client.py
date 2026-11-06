@@ -5,8 +5,13 @@ Consumes the frozen v2 wire contract (control-plane origin/main ``6df1f95``
 per-consumer SSE events, explicit ACKs. The wire (endpoints, envelope
 fields, ACK states ``received -> validated -> applied -> effective`` with
 terminal ``rejected``/``unknown``) is fixed by CP; this module only
-interprets the Workshop target payload (the existing inbox kinds) and the
-Workshop ACL carried in the snapshot.
+interprets the Workshop target payload (the existing inbox kinds).
+
+The snapshot carries target-scoped settings, not a Workshop ACL: membership
+is checked against the locally stored members, which only CP members
+operations (or the operator bootstrap) can change. Release records arrive
+inside the release.select operation itself and are verified against the
+local catalog.
 
 Trust model: frames arrive over the mutually authenticated CP channel
 (TLS + audience-bound bearer pinned to this agent id), so the payload
@@ -18,8 +23,8 @@ hash the same canonical form when committing the outbox row.
 Disabled unless ``BLOCKFIELD_CP_URL``, ``BLOCKFIELD_CP_AGENT_ID`` and
 ``BLOCKFIELD_CP_AGENT_TOKEN`` are all set. The file inbox keeps working unless BLOCKFIELD_CP_INGRESS=1 retires the
 CP-covered kinds (members/message/wake/cancel); map operations stay
-inbox-only. Release records arrive centrally: the agent snapshot may
-carry approved records and release.select commits one record.
+inbox-only. Release records arrive in the release.select operation and are
+verified against the local catalog before merging.
 """
 
 from __future__ import annotations
@@ -126,20 +131,28 @@ def check_frame(
     if frame_epoch != epoch:
         raise SnapshotRequired("cp stream epoch moved on")
     sequence = frame.get("sequence")
-    if type(sequence) is not int or sequence < 0:
+    if type(sequence) is not int or sequence < 1:
         raise ValueError("invalid cp frame: sequence")
+    _need(frame, "operationId", (str,), "operationId")
     frame_generation = _need(frame, "generation", (str,), "generation")
     if frame_generation != generation:
         raise ValueError("cp frame generation mismatch")
-    expires = frame.get("expiresAt")
-    if type(expires) is not int or expires <= 0:
+    revision = frame.get("revision")
+    if revision is not None and type(revision) is not int:
+        raise ValueError("invalid cp frame: revision")
+    try:
+        expires_at = datetime.fromisoformat(frame["expiresAt"])
+        if expires_at.tzinfo is None:
+            raise ValueError("naive expiry")
+        expires_ms = int(expires_at.timestamp() * 1000)
+    except (KeyError, TypeError, ValueError):
         raise ValueError("invalid cp frame: expiresAt")
-    if now_ms > expires:
+    if now_ms > expires_ms:
         raise ValueError("cp operation expired")
     want = _need(frame, "payloadHash", (str,), "payloadHash")
-    operation = frame.get("operation")
+    operation = frame.get("payload")
     if not isinstance(operation, dict):
-        raise ValueError("invalid cp frame: operation")
+        raise ValueError("invalid cp frame: payload")
     if payload_hash(operation) != want:
         raise ValueError("cp payload hash mismatch")
     return operation
@@ -301,6 +314,8 @@ class CPClient:
             raise ValueError("cp snapshot misses epoch/generation/cursor")
         if self.config.generation and generation != self.config.generation:
             raise ValueError("cp snapshot generation mismatch")
+        # The frozen snapshot carries settings, not a Workshop ACL or release
+        # list; absent keys stay None and sync() falls back to local state.
         acl = document.get("acl")
         if acl is not None:
             if not isinstance(acl, list) or len(acl) > MAX_ACL_ENTRIES:
@@ -336,26 +351,44 @@ class CPClient:
             return self.snapshot()
         return state
 
-    def _ack(
-        self, controller, operation_id: str, epoch: str, sequence: int, terminal: str
-    ) -> None:
-        try:
-            actual = controller._readiness_generation()
-        except Exception:
-            actual = None
-        self.transport.post_json(
+    def _post_ack(self, frame: dict, state: str, result: str = "ok") -> int:
+        """POST one v2 ACK with the envelope identity CP matches receipts by."""
+        status, _ = self.transport.post_json(
             self.config.acks_url(),
             {
-                "operationId": operation_id,
-                "epoch": epoch,
-                "sequence": sequence,
-                "state": terminal,
+                "epoch": frame.get("epoch"),
+                "sequence": frame.get("sequence"),
+                "generation": frame.get("generation"),
+                "revision": frame.get("revision"),
+                "payloadHash": frame.get("payloadHash"),
+                "state": state,
                 "actualAt": datetime.now(timezone.utc).isoformat(),
-                "actualGeneration": actual,
-                "result": "ok" if terminal in ("applied", "effective") else terminal,
+                "result": result,
             },
             timeout=self.config.poll_timeout_s,
         )
+        return status
+
+    @staticmethod
+    def _reject_result(frame: dict, generation: str) -> str:
+        if (
+            isinstance(frame.get("generation"), str)
+            and frame["generation"] != generation
+        ):
+            return "stale_generation"
+        return "invalid_schema"  # expired/unaddressed/corrupt: nothing closer fits
+
+    @staticmethod
+    def _acl(state, controller):
+        acl = state.get("acl")
+        if acl is None:
+            # The frozen snapshot carries settings, not a Workshop ACL: fall
+            # back to the local members, which only CP members operations or
+            # the operator bootstrap can change. Resolved per frame so a
+            # members op earlier in the same pass already guards the next one;
+            # without a bootstrap every kind fails closed below.
+            acl = controller.members()
+        return acl
 
     def sync(self, controller) -> dict:
         """One bounded pass: snapshot if needed, apply addressed frames, ACK.
@@ -404,21 +437,17 @@ class CPClient:
                 operation_id = frame.get("operationId")
                 sequence = frame.get("sequence")
                 if type(operation_id) is str and operation_id and type(sequence) is int:
+                    result = self._reject_result(frame, state["generation"])
                     self._store_receipt(
-                        operation_id, {"state": "rejected", "sequence": sequence}
+                        operation_id,
+                        {"state": "rejected", "sequence": sequence, "result": result},
                     )
                     try:
-                        self._ack(
-                            controller,
-                            operation_id,
-                            state["epoch"],
-                            sequence,
-                            "rejected",
-                        )
+                        status = self._post_ack(frame, "rejected", result)
                     except Exception:
                         pass
                     else:
-                        acked += 1
+                        acked += int(status == 200)
                     rejected += 1
                     if type(state["cursor"]) is int and sequence > state["cursor"]:
                         state["cursor"] = sequence
@@ -434,13 +463,13 @@ class CPClient:
                 "effective",
                 "rejected",
             ):
-                self._ack(
-                    controller,
-                    operation_id,
-                    state["epoch"],
-                    sequence,
+                status = self._post_ack(
+                    frame,
                     receipts[operation_id]["state"],
+                    receipts[operation_id].get("result", "ok"),
                 )
+                if status != 200:
+                    raise ValueError(f"cp ack failed: http {status}")
                 acked += 1
                 state["cursor"] = max(state["cursor"], sequence)
                 self._store_state()
@@ -450,23 +479,38 @@ class CPClient:
             )
             try:
                 result = controller.apply_cp_operation(
-                    operation_id, operation, state.get("acl")
+                    operation_id, operation, self._acl(state, controller)
                 )
             except ValueError:
                 self._store_receipt(
-                    operation_id, {"state": "rejected", "sequence": sequence}
+                    operation_id,
+                    {
+                        "state": "rejected",
+                        "sequence": sequence,
+                        "result": "invalid_schema",
+                    },
                 )
-                self._ack(
-                    controller, operation_id, state["epoch"], sequence, "rejected"
-                )
+                status = self._post_ack(frame, "rejected", "invalid_schema")
+                if status != 200:
+                    raise ValueError(f"cp ack failed: http {status}")
                 rejected += 1
                 acked += 1
             else:
+                # CP only advances the durable cursor across contiguous
+                # receipts in state order, so walk it explicitly.
                 terminal = "applied" if result.get("started") is True else "effective"
+                for progress in ("received", "validated", "applied"):
+                    status = self._post_ack(frame, progress)
+                    if status != 200:
+                        raise ValueError(f"cp ack failed: http {status}")
+                if terminal == "effective":
+                    status = self._post_ack(frame, "effective")
+                    if status != 200:
+                        raise ValueError(f"cp ack failed: http {status}")
                 self._store_receipt(
-                    operation_id, {"state": terminal, "sequence": sequence}
+                    operation_id,
+                    {"state": terminal, "sequence": sequence, "result": "ok"},
                 )
-                self._ack(controller, operation_id, state["epoch"], sequence, terminal)
                 applied += 1
                 acked += 1
             state["cursor"] = max(state["cursor"], sequence)

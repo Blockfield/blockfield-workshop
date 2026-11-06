@@ -1,10 +1,11 @@
-"""CP v2 subscribe/apply: addressed typed ops, CP ACL, generation ACKs (CP-S6a)."""
+"""CP v2 subscribe/apply: addressed typed ops, local ACL fallback, envelope ACKs (CP-S6a)."""
 
 from release_fixtures import catalog
 
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ AGENT = "workshop-1"
 EPOCH = "11111111-2222-3333-4444-555555555555"
 GENERATION = "gen-7"
 NOW_MS = 1796409600000
+IDENTITY_KEYS = ("epoch", "sequence", "generation", "revision", "payloadHash")
 
 
 def frame(
@@ -29,22 +31,28 @@ def frame(
     generation=GENERATION,
     expires_at=NOW_MS + 60000,
     tamper_hash=False,
+    executable=True,
+    revision=None,
 ):
+    """One real-shaped v2 envelope (delivery.batch fields, V2.md §Private delivery)."""
     body = dict(operation)
-    envelope = {
-        "schema": 1,
+    return {
+        "schema": 2,
         "epoch": epoch,
         "sequence": seq,
         "operationId": str(uuid4()),
         "audience": agent,
         "generation": generation,
-        "revision": seq,
+        "revision": revision,
         "payloadHash": "0" * 64 if tamper_hash else payload_hash(body),
-        "authEpoch": 1,
-        "expiresAt": expires_at,
-        "operation": body,
+        "authorizationEpoch": 1,
+        "expiresAt": datetime.fromtimestamp(
+            expires_at / 1000, tz=timezone.utc
+        ).isoformat(),
+        "executable": executable,
+        "reason": None if executable else "expired",
+        "payload": body if executable else None,
     }
-    return envelope
 
 
 def members_op(grantor, entries):
@@ -73,12 +81,16 @@ class FakeTransport:
         return 200, list(self.event_frames)
 
 
-def snapshot_doc(cursor=0, acl=None):
+def snapshot_doc(cursor=0):
+    """Minimal real snapshot: settings only, no ACL (sync falls back to local members)."""
     return {
+        "schema": 2,
+        "audience": AGENT,
         "epoch": EPOCH,
         "generation": GENERATION,
         "cursor": cursor,
-        "acl": [ADMIN] if acl is None else acl,
+        "settings": [],
+        "hash": "0" * 64,
     }
 
 
@@ -173,16 +185,24 @@ class CPClientTests(unittest.TestCase):
 
     def test_members_applied_from_cp(self):
         newcomer = {"draslId": STRANGER, "name": "Stranger", "role": "builder"}
-        transport = FakeTransport(
-            snapshot_doc(),
-            [frame(members_op(ADMIN, [ADMIN, newcomer]), 1)],
-        )
+        envelope = frame(members_op(ADMIN, [ADMIN, newcomer]), 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
         result = self.client(transport).sync(self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(len(self.controller.members()), 2)
-        ack = transport.acks[0]
-        self.assertEqual(ack["state"], "effective")
-        self.assertIsNone(ack["actualGeneration"])  # FakeBackend has no readiness probe
+        # CP advances the durable cursor across contiguous receipts in state
+        # order, so one terminal ACK is now 3-4 posts with the envelope id.
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
+        for ack in transport.acks:
+            self.assertEqual(
+                {key: ack[key] for key in IDENTITY_KEYS},
+                {key: envelope[key] for key in IDENTITY_KEYS},
+            )
+            self.assertEqual(ack["result"], "ok")
+            self.assertIn("actualAt", ack)
 
     def test_members_requires_cp_acl(self):
         with self.assertRaisesRegex(ValueError, "requires a CP ACL snapshot"):
@@ -219,6 +239,7 @@ class CPClientTests(unittest.TestCase):
         result = self.client(transport).sync(self.controller)
         self.assertEqual((result["applied"], result["rejected"]), (0, 1))
         self.assertEqual(transport.acks[0]["state"], "rejected")
+        self.assertEqual(transport.acks[0]["result"], "stale_generation")
 
     def test_expired_op_rejected(self):
         transport = FakeTransport(
@@ -291,27 +312,63 @@ class CPClientTests(unittest.TestCase):
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
         self.assertEqual(list(self.controller.members()), before)
 
-    def test_ack_carries_readiness_generation(self):
-        class ReadyBackend:
-            def readiness_generation(self, profile):
-                return "gen-7"
-
-        controller = Controller(
-            self.dir / "state2",
-            ReadyBackend(),
-            releases=catalog(),
-        )
-        controller.set_members([ADMIN])
-        transport = FakeTransport(
-            snapshot_doc(),
-            [frame({"kind": "message", "actor": ADMIN, "message": "yo"}, 1)],
-        )
-        result = self.client(transport).sync(controller)
+    def test_ack_carries_envelope_identity(self):
+        envelope = frame({"kind": "message", "actor": ADMIN, "message": "yo"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
         self.assertEqual(result["applied"], 1)
-        ack = transport.acks[0]
-        self.assertEqual(ack["state"], "effective")
-        self.assertEqual(ack["actualGeneration"], "gen-7")
-        self.assertIn("actualAt", ack)
+        received = transport.acks[0]
+        self.assertEqual(received["state"], "received")
+        self.assertEqual(
+            {key: received[key] for key in IDENTITY_KEYS},
+            {key: envelope[key] for key in IDENTITY_KEYS},
+        )
+        self.assertEqual(received["result"], "ok")
+        self.assertIn("actualAt", received)
+
+    def test_nonexecutable_frame_rejected_without_effect(self):
+        envelope = frame(
+            {"kind": "message", "actor": ADMIN, "message": "yo"}, 1, executable=False
+        )
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual(self.controller.message, self.controller.default_message)
+        self.assertEqual(transport.acks[0]["state"], "rejected")
+
+    def test_recorded_real_cp_frame_applies(self):
+        """Wire proof: real CP payload + hash from the live round trip
+        (.dev/cp-wi-c1/frames-raw.json, Boat VM 2026-11-06), re-keyed to the
+        test stream (audience/epoch/generation/sequence/expiry are envelope
+        routing, the hash covers the payload only)."""
+        envelope = {
+            "audience": AGENT,
+            "authorizationEpoch": 1,
+            "epoch": EPOCH,
+            "executable": True,
+            "expiresAt": datetime.fromtimestamp(
+                NOW_MS / 1000 + 60, tz=timezone.utc
+            ).isoformat(),
+            "generation": GENERATION,
+            "operationId": "9d32415a-b12d-474f-9eec-13a67a158637",
+            "payload": {
+                "actor": {
+                    "draslId": "e10438e4797b49718cfecec6a8fa171b",
+                    "name": "Nether",
+                },
+                "kind": "message",
+                "message": "Привет CP ✓ round-trip",
+            },
+            "payloadHash": "263b3dbc0a40afd019aaee2765f0195562795ceccb86bbca0b7de976f036767c",
+            "reason": None,
+            "revision": None,
+            "schema": 2,
+            "sequence": 1,
+        }
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(self.controller.message, "Привет CP ✓ round-trip")
 
     def test_cursor_persisted(self):
         transport = FakeTransport(
