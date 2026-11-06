@@ -1899,16 +1899,18 @@ class Controller:
         """
         if not isinstance(records, list) or len(records) > CP_RELEASE_LIMIT:
             raise ValueError("invalid cp release records")
-        merged = []
+        validated = {}
         for entry in records:
             record = release_catalog.validate_release_record(entry)
             release = record["release"]
-            known = self.releases.get(release)
+            known = validated.get(release, self.releases.get(release))
             if known is not None and known != record:
                 raise ValueError("published release identity changed")
-            if known is None:
-                merged.append(release)
-            self.releases[release] = record
+            validated[release] = record
+        # One commit point: a bad entry refuses the whole batch before
+        # anything is mutated, persisted, or handed to the backend.
+        merged = [release for release in validated if release not in self.releases]
+        self.releases.update(validated)
         if merged:
             if self.releases_path is not None:
                 atomic_write(
@@ -1963,30 +1965,32 @@ class Controller:
         if not isinstance(actor, dict):
             raise ValueError("invalid cp actor")
         principal = member({**actor, "role": "builder"})
-        if acl is not None:
-            matches = [
-                entry
-                for entry in acl
-                if isinstance(entry, dict)
-                and entry.get("draslId") == principal["draslId"]
-                and entry.get("name") == principal["name"]
-            ]
-            if not matches:
-                raise ValueError("cp actor is not a workshop member")
-            if kind in ("members", "release.select") and not all(
-                entry.get("role") == "admin" for entry in matches
-            ):
-                # Duplicate ACL identities with mixed roles fail closed.
-                if kind == "members":
-                    raise ValueError("cp grantor is not a workshop admin")
-                raise ValueError("cp actor is not a workshop admin")
+        if acl is None and kind in ("members", "release.select"):
+            raise ValueError(f"cp {kind} requires a CP ACL snapshot")
+        if acl is None:
+            # No snapshot list (direct calls; sync always passes one): check
+            # against the local members instead of skipping the check, so
+            # message/wake/cancel fail closed without an operator bootstrap.
+            acl = self.members()
+        matches = [
+            entry
+            for entry in acl
+            if isinstance(entry, dict)
+            and entry.get("draslId") == principal["draslId"]
+            and entry.get("name") == principal["name"]
+        ]
+        if not matches:
+            raise ValueError("cp actor is not a workshop member")
+        if kind in ("members", "release.select") and not all(
+            entry.get("role") == "admin" for entry in matches
+        ):
+            # Duplicate ACL identities with mixed roles fail closed.
+            if kind == "members":
+                raise ValueError("cp grantor is not a workshop admin")
+            raise ValueError("cp actor is not a workshop admin")
         if kind == "release.select":
-            if acl is None:
-                raise ValueError("cp release.select requires a CP ACL snapshot")
             return self._apply_cp_release_select(operation_id, payload)
         if kind == "members":
-            if acl is None:
-                raise ValueError("cp members requires a CP ACL snapshot")
             entries = payload.get("members")
             if not isinstance(entries, list):
                 raise ValueError("members must be a list")

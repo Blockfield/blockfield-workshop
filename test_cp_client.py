@@ -967,6 +967,49 @@ class CPClientTests(unittest.TestCase):
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         self.assertEqual(state["cursor"], 1)
 
+    def test_ack_failure_does_not_reapply(self):
+        from controller import Goal
+        from cp_client import CPHttpError
+
+        self.controller.request(
+            str(uuid4()), Goal("workshop", "v1.0.0", str(uuid4())), 0
+        )
+        self.assertEqual(self.controller.step()["phase"], "STARTING")
+        envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        calls = {"n": 0}
+        orig_post = transport.post_json
+
+        def flaky_post(url, body, timeout):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise CPHttpError("acks", 503)
+            return orig_post(url, body, timeout)
+
+        transport.post_json = flaky_post
+        with self.assertRaises(CPHttpError):
+            self.client(transport).sync(self.controller)
+        receipts = json.loads((self.dir / "state" / "cp_receipts.json").read_bytes())
+        self.assertEqual(receipts[envelope["operationId"]]["state"], "effective")
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        # Second pass: the stored receipt re-sends ACKs; cancel must not run
+        # again (it would raise "nothing to cancel" and record rejected).
+        transport.post_json = orig_post
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
+
+    def test_stranger_message_rejected_without_acl(self):
+        stranger = {
+            "kind": "message",
+            "actor": {"draslId": STRANGER, "name": "Stranger"},
+            "message": "hi",
+            "target": "*",
+        }
+        with self.assertRaisesRegex(ValueError, "not a workshop member"):
+            self.controller.apply_cp_operation(str(uuid4()), stranger, None)
+        self.assertEqual(self.controller.message, self.controller.default_message)
+
 
 if __name__ == "__main__":
     unittest.main()

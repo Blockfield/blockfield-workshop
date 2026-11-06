@@ -249,6 +249,19 @@ class CPReleaseTests(unittest.TestCase):
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertNotIn("v9.0.0", self.controller.releases)
 
+    def test_batch_refuses_conflict_without_partial_apply(self):
+        good = release_record("v9.0.0", "d")
+        rival = release_record("v9.0.0", "e")
+        before = (
+            self.releases_path.read_bytes() if self.releases_path.exists() else None
+        )
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            self.controller.apply_cp_releases([good, rival])
+        self.assertNotIn("v9.0.0", self.controller.releases)
+        self.assertNotIn("v9.0.0", self.backend.releases)
+        after = self.releases_path.read_bytes() if self.releases_path.exists() else None
+        self.assertEqual(before, after)
+
 
 if __name__ == "__main__":
     unittest.main()

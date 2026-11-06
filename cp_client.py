@@ -548,6 +548,27 @@ class CPClient:
             self._store_state()
         return 1, 1
 
+    def _replay_ack(self, frame, terminal: str, result: str = "ok") -> None:
+        """Re-send ACKs for an already-recorded op without re-applying it.
+
+        Walks the full progression so the replay converges whatever prefix
+        the server already holds (a failed first post leaves it empty; a
+        mid-walk failure leaves a prefix). A 409 means that state is already
+        recorded server-side; anything else raises.
+        """
+        if terminal == "rejected":
+            wanted = ("rejected",)
+        else:
+            wanted = ("received", "validated", "applied")
+            if terminal == "effective":
+                wanted += ("effective",)
+        for state in wanted:
+            try:
+                self._post_ack(frame, state, result if state == terminal else "ok")
+            except CPHttpError as error:
+                if error.status != 409:
+                    raise
+
     def sync(self, controller) -> dict:
         """One bounded pass: snapshot if needed, apply addressed frames, ACK.
 
@@ -596,7 +617,7 @@ class CPClient:
                 "effective",
                 "rejected",
             ):
-                self._post_ack(
+                self._replay_ack(
                     frame,
                     receipts[operation_id]["state"],
                     receipts[operation_id].get("result", "ok"),
@@ -632,14 +653,17 @@ class CPClient:
                 # CP only advances the durable cursor across contiguous
                 # receipts in state order, so walk it explicitly.
                 terminal = "applied" if result.get("started") is True else "effective"
-                for progress in ("received", "validated", "applied"):
-                    self._post_ack(frame, progress)
-                if terminal == "effective":
-                    self._post_ack(frame, "effective")
+                # Durable first: if an ACK post below fails, the replay path
+                # re-sends ACKs for this stored receipt instead of running the
+                # op again (cancel/wake are not idempotent).
                 self._store_receipt(
                     operation_id,
                     {"state": terminal, "sequence": sequence, "result": "ok"},
                 )
+                for progress in ("received", "validated", "applied"):
+                    self._post_ack(frame, progress)
+                if terminal == "effective":
+                    self._post_ack(frame, "effective")
                 if result.get("kind") == "members":
                     # Membership changed under us: refresh the snapshot ACL so
                     # later frames in this pass check the new list, not the
