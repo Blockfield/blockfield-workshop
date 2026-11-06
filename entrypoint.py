@@ -103,6 +103,12 @@ def run_loop(controller, stop, env=os.environ):
                 controller.process_inbox()
             except Exception as error:  # inbox must never block reconciliation
                 print(f"entrypoint: inbox pass failed: {error!r}", file=sys.stderr)
+            try:
+                cp = getattr(controller, "cp_client", None)
+                if cp is not None:
+                    cp.sync(controller)
+            except Exception as error:  # cp must never block reconciliation
+                print(f"entrypoint: cp pass failed: {error!r}", file=sys.stderr)
             result = controller.step()
             deadline = time.monotonic() + follow
             while (

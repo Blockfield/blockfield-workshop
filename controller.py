@@ -1861,6 +1861,62 @@ class Controller:
                 "started": True,
             }
 
+    def apply_cp_operation(
+        self, operation_id: str, payload: dict, acl: list | None = None
+    ) -> dict:
+        """Apply a CP-attested typed operation (unit CP-S6a).
+
+        The payload actor/grantor is attested by the control plane: CP
+        authorized the human before committing the outbox row, and the
+        frame arrived over our mutually authenticated agent channel. This
+        is the opposite of the file inbox, whose ``actor`` field is
+        self-asserted and therefore never a grant authority (E4).
+        Unknown kinds are rejected, never blind-applied; map operations
+        stay inbox-only until the S6b slice.
+        """
+        UUID(operation_id)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid cp operation")
+        kind = payload.get("kind")
+        if kind not in ("members", "message", "wake", "cancel"):
+            raise ValueError(f"unsupported cp operation kind: {kind!r}"[:64])
+        actor = payload.get("grantor") if kind == "members" else payload.get("actor")
+        if not isinstance(actor, dict):
+            raise ValueError("invalid cp actor")
+        principal = member({**actor, "role": "builder"})
+        if acl is not None:
+            matches = [
+                entry
+                for entry in acl
+                if isinstance(entry, dict)
+                and entry.get("draslId") == principal["draslId"]
+                and entry.get("name") == principal["name"]
+            ]
+            if not matches:
+                raise ValueError("cp actor is not a workshop member")
+            if kind == "members" and not all(
+                entry.get("role") == "admin" for entry in matches
+            ):
+                # Duplicate ACL identities with mixed roles fail closed.
+                raise ValueError("cp grantor is not a workshop admin")
+        if kind == "members":
+            if acl is None:
+                raise ValueError("cp members requires a CP ACL snapshot")
+            entries = payload.get("members")
+            if not isinstance(entries, list):
+                raise ValueError("members must be a list")
+            self.set_members(entries)
+            return {"kind": "members", "count": len(entries)}
+        if kind == "message":
+            self.set_message(payload.get("message"))
+            return {"kind": "message"}
+        if kind == "wake":
+            return self.wake(
+                operation_id,
+                {"draslId": principal["draslId"], "name": principal["name"]},
+            )
+        return {"kind": "cancel", "revision": self.cancel()["revision"]}
+
     def process_inbox(self, now_ms: int | None = None) -> int:
         """Apply admin requests from the site, oldest first; each one gets exactly one result file.
 
