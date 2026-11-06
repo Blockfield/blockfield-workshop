@@ -662,7 +662,17 @@ class Controller:
             atomic_write(
                 self.members_file, json.dumps(members, sort_keys=True).encode()
             )
-            self._export(self._read())
+            try:
+                self._export(self._read())
+            except Exception as error:
+                # The write above is the commit point: the new ACL is live
+                # even if the derived export fails. Report applied (the next
+                # state change re-exports and heals this) instead of escaping,
+                # which would tell CP the change failed while it is live.
+                print(
+                    f"controller: members export failed after commit: {error!r}",
+                    file=sys.stderr,
+                )
         return members
 
     @property
