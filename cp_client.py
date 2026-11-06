@@ -1,12 +1,17 @@
-"""Control-plane v2 subscriber for the Workshop controller (unit CP-S6a).
+"""Control-plane v2 subscriber for the Workshop controller (units CP-S6a/S6b).
 
 Consumes the frozen v2 wire contract (control-plane origin/main ``6df1f95``
 + ``cf660e4``, ``docs/V2.md`` "Private delivery"): target snapshot,
 per-consumer SSE events, explicit ACKs. The wire (endpoints, envelope
 fields, ACK states ``received -> validated -> applied -> effective`` with
 terminal ``rejected``/``unknown``) is fixed by CP; this module only
-interprets the Workshop target payload (the existing inbox kinds) and the
-Workshop ACL carried in the snapshot.
+interprets the Workshop target payload (the existing inbox kinds).
+
+The snapshot carries target-scoped settings, not a Workshop ACL: membership
+is checked against the locally stored members, which only CP members
+operations (or the operator bootstrap) can change. Release records arrive
+inside the release.select operation itself and are verified against the
+local catalog.
 
 Trust model: frames arrive over the mutually authenticated CP channel
 (TLS + audience-bound bearer pinned to this agent id), so the payload
@@ -16,8 +21,10 @@ JSON (sort_keys, compact separators); the CP-side Workshop producer must
 hash the same canonical form when committing the outbox row.
 
 Disabled unless ``BLOCKFIELD_CP_URL``, ``BLOCKFIELD_CP_AGENT_ID`` and
-``BLOCKFIELD_CP_AGENT_TOKEN`` are all set. The file inbox keeps working
-either way; it is retired by S6b, not here.
+``BLOCKFIELD_CP_AGENT_TOKEN`` are all set. The file inbox keeps working unless BLOCKFIELD_CP_INGRESS=1 retires the
+CP-covered kinds (members/message/wake/cancel); map operations stay
+inbox-only. Release records arrive in the release.select operation and are
+verified against the local catalog before merging.
 """
 
 from __future__ import annotations
@@ -33,7 +40,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-from controller import member
+from controller import CP_RELEASE_LIMIT, member
 
 AGENT_PATH = "/v2/agents/{agent}"
 SNAPSHOT_TTL_S = 3600
@@ -43,7 +50,7 @@ MAX_ACL_ENTRIES = 4096
 MAX_ACL_ENTRY_BYTES = 256
 MAX_SNAPSHOT_BYTES = MAX_ACL_ENTRIES * MAX_ACL_ENTRY_BYTES
 RECEIPT_LIMIT = 500
-CP_KINDS = ("members", "message", "wake", "cancel")
+CP_KINDS = ("members", "message", "wake", "cancel", "release.select")
 
 
 class SnapshotRequired(Exception):
@@ -142,21 +149,28 @@ def check_frame(
     if frame_epoch != epoch:
         raise SnapshotRequired("cp stream epoch moved on")
     sequence = frame.get("sequence")
-    if type(sequence) is not int or sequence < 0:
+    if type(sequence) is not int or sequence < 1:
         raise ValueError("invalid cp frame: sequence")
     _need(frame, "operationId", (str,), "operationId")
     frame_generation = _need(frame, "generation", (str,), "generation")
     if frame_generation != generation:
         raise SnapshotRequired("cp stream generation moved on")
-    expires = frame.get("expiresAt")
-    if type(expires) is not int or expires <= 0:
+    revision = frame.get("revision")
+    if revision is not None and type(revision) is not int:
+        raise ValueError("invalid cp frame: revision")
+    try:
+        expires_at = datetime.fromisoformat(frame["expiresAt"])
+        if expires_at.tzinfo is None:
+            raise ValueError("naive expiry")
+        expires_ms = int(expires_at.timestamp() * 1000)
+    except (KeyError, TypeError, ValueError):
         raise ValueError("invalid cp frame: expiresAt")
-    if now_ms > expires:
+    if now_ms > expires_ms:
         raise ValueError("cp operation expired")
     want = _need(frame, "payloadHash", (str,), "payloadHash")
-    operation = frame.get("operation")
+    operation = frame.get("payload")
     if not isinstance(operation, dict):
-        raise ValueError("invalid cp frame: operation")
+        raise ValueError("invalid cp frame: payload")
     if payload_hash(operation) != want:
         raise ValueError("cp payload hash mismatch")
     return operation
@@ -393,17 +407,28 @@ class CPClient:
             raise ValueError("cp snapshot misses epoch/generation/cursor")
         if self.config.generation and generation != self.config.generation:
             raise ValueError("cp snapshot generation mismatch")
+        # The frozen snapshot carries settings, not a Workshop ACL or release
+        # list; absent keys stay None and sync() falls back to local state.
         acl = document.get("acl")
         if acl is not None:
             if not isinstance(acl, list) or len(acl) > MAX_ACL_ENTRIES:
                 raise ValueError("cp snapshot acl is not a list")
             acl = [member(entry) for entry in acl]
+        releases = document.get("releases")
+        if releases is not None:
+            if (
+                not isinstance(releases, list)
+                or len(releases) > CP_RELEASE_LIMIT
+                or not all(isinstance(entry, dict) for entry in releases)
+            ):
+                raise ValueError("cp snapshot releases is not a list")
         state = {
             "schema": 1,
             "epoch": epoch,
             "generation": generation,
             "cursor": cursor,
             "acl": acl,
+            "releases": releases,
             "takenAt": self._now_ms(),
         }
         self._state = state
@@ -419,26 +444,47 @@ class CPClient:
             return self.snapshot()
         return state
 
-    def _ack(
-        self, controller, operation_id: str, epoch: str, sequence: int, terminal: str
-    ) -> None:
-        try:
-            actual = controller._readiness_generation()
-        except Exception:
-            actual = None
+    def _post_ack(self, frame: dict, state: str, result: str = "ok") -> None:
+        """POST one v2 ACK with the envelope identity CP matches receipts by.
+
+        Any non-2xx raises (CPHttpError via the transport helper) so the
+        cursor holds and the redelivery path runs on the next pass.
+        """
         self.transport.post_json(
             self.config.acks_url(),
             {
-                "operationId": operation_id,
-                "epoch": epoch,
-                "sequence": sequence,
-                "state": terminal,
+                "epoch": frame.get("epoch"),
+                "sequence": frame.get("sequence"),
+                "generation": frame.get("generation"),
+                "revision": frame.get("revision"),
+                "payloadHash": frame.get("payloadHash"),
+                "state": state,
                 "actualAt": datetime.now(timezone.utc).isoformat(),
-                "actualGeneration": actual,
-                "result": "ok" if terminal in ("applied", "effective") else terminal,
+                "result": result,
             },
             timeout=self.config.poll_timeout_s,
         )
+
+    @staticmethod
+    def _reject_result(frame: dict, generation: str) -> str:
+        if (
+            isinstance(frame.get("generation"), str)
+            and frame["generation"] != generation
+        ):
+            return "stale_generation"
+        return "invalid_schema"  # expired/unaddressed/corrupt: nothing closer fits
+
+    @staticmethod
+    def _acl(state, controller):
+        acl = state.get("acl")
+        if acl is None:
+            # The frozen snapshot carries settings, not a Workshop ACL: fall
+            # back to the local members, which only CP members operations or
+            # the operator bootstrap can change. Resolved per frame so a
+            # members op earlier in the same pass already guards the next one;
+            # without a bootstrap every kind fails closed below.
+            acl = controller.members()
+        return acl
 
     def _validated_operation(self, frame, state, controller):
         """check_frame with one snapshot refetch on a stream move.
@@ -476,19 +522,7 @@ class CPClient:
         except (SnapshotRequired, ValueError):
             return None, state
 
-    @staticmethod
-    def _acl(state, controller):
-        acl = state.get("acl")
-        if acl is None:
-            # A snapshot without an ACL list must not skip the membership
-            # check: fall back to the local members, which only CP members
-            # operations or the operator bootstrap can change. Resolved per
-            # frame so a members op earlier in the same pass already guards
-            # the next one; without a bootstrap every kind fails closed.
-            acl = controller.members()
-        return acl
-
-    def _nack(self, controller, frame, state) -> tuple[int, int]:
+    def _nack(self, frame, state) -> tuple[int, int]:
         """Best-effort rejected receipt for an unauthenticatable frame.
 
         Returns (rejected, acked). The local cursor advances only past a
@@ -501,9 +535,12 @@ class CPClient:
         sequence = frame.get("sequence")
         if not (type(operation_id) is str and operation_id and type(sequence) is int):
             return 0, 0
-        self._store_receipt(operation_id, {"state": "rejected", "sequence": sequence})
+        result = self._reject_result(frame, state["generation"])
+        self._store_receipt(
+            operation_id, {"state": "rejected", "sequence": sequence, "result": result}
+        )
         try:
-            self._ack(controller, operation_id, state["epoch"], sequence, "rejected")
+            self._post_ack(frame, "rejected", result)
         except Exception:
             return 1, 0
         if type(state["cursor"]) is int and sequence > state["cursor"]:
@@ -511,9 +548,26 @@ class CPClient:
             self._store_state()
         return 1, 1
 
-    def _reject_applied(self, controller, operation_id, sequence, state) -> None:
-        self._store_receipt(operation_id, {"state": "rejected", "sequence": sequence})
-        self._ack(controller, operation_id, state["epoch"], sequence, "rejected")
+    def _replay_ack(self, frame, terminal: str, result: str = "ok") -> None:
+        """Re-send ACKs for an already-recorded op without re-applying it.
+
+        Walks the full progression so the replay converges whatever prefix
+        the server already holds (a failed first post leaves it empty; a
+        mid-walk failure leaves a prefix). A 409 means that state is already
+        recorded server-side; anything else raises.
+        """
+        if terminal == "rejected":
+            wanted = ("rejected",)
+        else:
+            wanted = ("received", "validated", "applied")
+            if terminal == "effective":
+                wanted += ("effective",)
+        for state in wanted:
+            try:
+                self._post_ack(frame, state, result if state == terminal else "ok")
+            except CPHttpError as error:
+                if error.status != 409:
+                    raise
 
     def sync(self, controller) -> dict:
         """One bounded pass: snapshot if needed, apply addressed frames, ACK.
@@ -522,6 +576,15 @@ class CPClient:
         so the caller can log it without blocking reconciliation.
         """
         state = self._ensure_state()
+        pending = state.get("releases") or []
+        if pending:
+            try:
+                controller.apply_cp_releases(pending)
+            except ValueError:
+                # Snapshot records are advisory availability; the explicit
+                # release.select operation carries its own ACK, so a bad
+                # snapshot entry must not block other operations.
+                pass
         try:
             _, frames = self.transport.get_events(
                 self.config.events_url(state["epoch"], state["cursor"]),
@@ -540,7 +603,7 @@ class CPClient:
                 # Unauthenticatable frame (foreign audience, stale generation
                 # or epoch, expired, hash mismatch): never execute, but still
                 # nack by envelope id so the stream can move on.
-                delta_rejected, delta_acked = self._nack(controller, frame, state)
+                delta_rejected, delta_acked = self._nack(frame, state)
                 rejected += delta_rejected
                 acked += delta_acked
                 continue
@@ -554,12 +617,10 @@ class CPClient:
                 "effective",
                 "rejected",
             ):
-                self._ack(
-                    controller,
-                    operation_id,
-                    state["epoch"],
-                    sequence,
+                self._replay_ack(
+                    frame,
                     receipts[operation_id]["state"],
+                    receipts[operation_id].get("result", "ok"),
                 )
                 acked += 1
                 state["cursor"] = max(state["cursor"], sequence)
@@ -577,15 +638,32 @@ class CPClient:
                 # retry the whole pass later instead of skipping this frame.
                 break
             except Exception:
-                self._reject_applied(controller, operation_id, sequence, state)
+                self._store_receipt(
+                    operation_id,
+                    {
+                        "state": "rejected",
+                        "sequence": sequence,
+                        "result": "invalid_schema",
+                    },
+                )
+                self._post_ack(frame, "rejected", "invalid_schema")
                 rejected += 1
                 acked += 1
             else:
+                # CP only advances the durable cursor across contiguous
+                # receipts in state order, so walk it explicitly.
                 terminal = "applied" if result.get("started") is True else "effective"
+                # Durable first: if an ACK post below fails, the replay path
+                # re-sends ACKs for this stored receipt instead of running the
+                # op again (cancel/wake are not idempotent).
                 self._store_receipt(
-                    operation_id, {"state": terminal, "sequence": sequence}
+                    operation_id,
+                    {"state": terminal, "sequence": sequence, "result": "ok"},
                 )
-                self._ack(controller, operation_id, state["epoch"], sequence, terminal)
+                for progress in ("received", "validated", "applied"):
+                    self._post_ack(frame, progress)
+                if terminal == "effective":
+                    self._post_ack(frame, "effective")
                 if result.get("kind") == "members":
                     # Membership changed under us: refresh the snapshot ACL so
                     # later frames in this pass check the new list, not the
