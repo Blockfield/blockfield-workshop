@@ -130,6 +130,12 @@ def build_controller(
     if hasattr(backend, "maps"):
         backend.maps = controller.maps
     os.chmod(directory, 0o700)
+    import cp_client
+
+    cp_config = cp_client.CPConfig.from_env(env)
+    controller.cp_client = (
+        cp_client.CPClient(cp_config, directory) if cp_config is not None else None
+    )
     return controller, backend
 
 
