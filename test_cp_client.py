@@ -55,8 +55,8 @@ def frame(
     }
 
 
-def members_op(grantor, entries):
-    return {"kind": "members", "grantor": grantor, "members": entries}
+def members_op(grantor, entries, target="*"):
+    return {"kind": "members", "grantor": grantor, "members": entries, "target": target}
 
 
 class FakeTransport:
@@ -215,7 +215,7 @@ class CPClientTests(unittest.TestCase):
             snapshot_doc(),
             [
                 frame(
-                    {"kind": "message", "actor": ADMIN, "message": "hi"},
+                    {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"},
                     1,
                     agent="someone-else",
                 )
@@ -230,7 +230,7 @@ class CPClientTests(unittest.TestCase):
             snapshot_doc(),
             [
                 frame(
-                    {"kind": "message", "actor": ADMIN, "message": "hi"},
+                    {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"},
                     1,
                     generation="gen-666",
                 )
@@ -246,7 +246,7 @@ class CPClientTests(unittest.TestCase):
             snapshot_doc(),
             [
                 frame(
-                    {"kind": "message", "actor": ADMIN, "message": "hi"},
+                    {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"},
                     1,
                     expires_at=NOW_MS - 1,
                 )
@@ -260,7 +260,7 @@ class CPClientTests(unittest.TestCase):
             snapshot_doc(),
             [
                 frame(
-                    {"kind": "message", "actor": ADMIN, "message": "hi"},
+                    {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"},
                     1,
                     tamper_hash=True,
                 )
@@ -273,7 +273,7 @@ class CPClientTests(unittest.TestCase):
     def test_unsupported_kind_rejected(self):
         transport = FakeTransport(
             snapshot_doc(),
-            [frame({"kind": "map-create", "actor": ADMIN}, 1)],
+            [frame({"kind": "map-create", "actor": ADMIN, "target": "*"}, 1)],
         )
         result = self.client(transport).sync(self.controller)
         self.assertEqual((result["applied"], result["rejected"]), (0, 1))
@@ -281,7 +281,12 @@ class CPClientTests(unittest.TestCase):
     def test_epoch_mismatch_refetches_snapshot(self):
         transport = FakeTransport(
             snapshot_doc(),
-            [frame({"kind": "message", "actor": ADMIN, "message": "hi"}, 1)],
+            [
+                frame(
+                    {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"},
+                    1,
+                )
+            ],
             fail_events_once=True,
         )
         result = self.client(transport).sync(self.controller)
@@ -290,7 +295,9 @@ class CPClientTests(unittest.TestCase):
         self.assertEqual(self.controller.message, "hi")
 
     def test_duplicate_op_not_reapplied(self):
-        envelope = frame({"kind": "message", "actor": ADMIN, "message": "hi"}, 1)
+        envelope = frame(
+            {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"}, 1
+        )
         transport = FakeTransport(snapshot_doc(), [envelope, envelope])
         result = self.client(transport).sync(self.controller)
         self.assertEqual(result["applied"], 1)
@@ -313,7 +320,9 @@ class CPClientTests(unittest.TestCase):
         self.assertEqual(list(self.controller.members()), before)
 
     def test_ack_carries_envelope_identity(self):
-        envelope = frame({"kind": "message", "actor": ADMIN, "message": "yo"}, 1)
+        envelope = frame(
+            {"kind": "message", "actor": ADMIN, "message": "yo", "target": "*"}, 1
+        )
         transport = FakeTransport(snapshot_doc(), [envelope])
         result = self.client(transport).sync(self.controller)
         self.assertEqual(result["applied"], 1)
@@ -328,7 +337,9 @@ class CPClientTests(unittest.TestCase):
 
     def test_nonexecutable_frame_rejected_without_effect(self):
         envelope = frame(
-            {"kind": "message", "actor": ADMIN, "message": "yo"}, 1, executable=False
+            {"kind": "message", "actor": ADMIN, "message": "yo", "target": "*"},
+            1,
+            executable=False,
         )
         transport = FakeTransport(snapshot_doc(), [envelope])
         result = self.client(transport).sync(self.controller)
@@ -338,9 +349,10 @@ class CPClientTests(unittest.TestCase):
 
     def test_recorded_real_cp_frame_applies(self):
         """Wire proof: real CP payload + hash from the live round trip
-        (.dev/cp-wi-c1/frames-raw.json, Boat VM 2026-11-06), re-keyed to the
-        test stream (audience/epoch/generation/sequence/expiry are envelope
-        routing, the hash covers the payload only)."""
+        against cp#23 (frames2.json, Boat VM 2026-11-06), re-keyed to the
+        test stream (audience/epoch/generation/expiry are envelope routing,
+        the hash covers the payload only). The payload carries the new
+        target field; the actor is bootstrapped as a local member."""
         envelope = {
             "audience": AGENT,
             "authorizationEpoch": 1,
@@ -350,30 +362,39 @@ class CPClientTests(unittest.TestCase):
                 NOW_MS / 1000 + 60, tz=timezone.utc
             ).isoformat(),
             "generation": GENERATION,
-            "operationId": "9d32415a-b12d-474f-9eec-13a67a158637",
+            "operationId": "ed2f93a8-aaa3-44f1-8bcc-9d6f52506771",
             "payload": {
                 "actor": {
-                    "draslId": "e10438e4797b49718cfecec6a8fa171b",
-                    "name": "Nether",
+                    "draslId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "name": "Helper",
                 },
                 "kind": "message",
-                "message": "Привет CP ✓ round-trip",
+                "message": "Целевое сообщение *",
+                "target": "*",
             },
-            "payloadHash": "263b3dbc0a40afd019aaee2765f0195562795ceccb86bbca0b7de976f036767c",
+            "payloadHash": "d1155838d0f967f976763f41d97d21474982a1ce41ac12aa64cb852cb92ffc75",
             "reason": None,
             "revision": None,
             "schema": 2,
             "sequence": 1,
         }
+        self.controller.set_members(
+            [ADMIN, {"draslId": "a" * 32, "name": "Helper", "role": "builder"}]
+        )
         transport = FakeTransport(snapshot_doc(), [envelope])
         result = self.client(transport).sync(self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
-        self.assertEqual(self.controller.message, "Привет CP ✓ round-trip")
+        self.assertEqual(self.controller.message, "Целевое сообщение *")
 
     def test_cursor_persisted(self):
         transport = FakeTransport(
             snapshot_doc(),
-            [frame({"kind": "message", "actor": ADMIN, "message": "a"}, 1)],
+            [
+                frame(
+                    {"kind": "message", "actor": ADMIN, "message": "a", "target": "*"},
+                    1,
+                )
+            ],
         )
         self.client(transport).sync(self.controller)
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
@@ -402,12 +423,15 @@ class CPClientTests(unittest.TestCase):
             "kind": "message",
             "actor": {"draslId": STRANGER, "name": "Stranger"},
             "message": "hi",
+            "target": "*",
         }
         transport = FakeTransport(doc, [frame(stranger, 1)])
         result = self.client(transport).sync(self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.message, self.controller.default_message)
-        mine = frame({"kind": "message", "actor": ADMIN, "message": "yo"}, 2)
+        mine = frame(
+            {"kind": "message", "actor": ADMIN, "message": "yo", "target": "*"}, 2
+        )
         result = self.client(FakeTransport(doc, [mine])).sync(self.controller)
         self.assertEqual(result["applied"], 1)
         self.assertEqual(self.controller.message, "yo")
@@ -470,8 +494,12 @@ class CPClientTests(unittest.TestCase):
     def test_apply_runtime_error_rejected_and_advances(self):
         from unittest import mock
 
-        first = frame({"kind": "message", "actor": ADMIN, "message": "a"}, 1)
-        second = frame({"kind": "message", "actor": ADMIN, "message": "b"}, 2)
+        first = frame(
+            {"kind": "message", "actor": ADMIN, "message": "a", "target": "*"}, 1
+        )
+        second = frame(
+            {"kind": "message", "actor": ADMIN, "message": "b", "target": "*"}, 2
+        )
         transport = FakeTransport(snapshot_doc(), [first, second])
         real_apply = self.controller.apply_cp_operation
         calls = []
@@ -492,7 +520,9 @@ class CPClientTests(unittest.TestCase):
     def test_apply_blocking_error_retries_next_pass(self):
         from unittest import mock
 
-        envelope = frame({"kind": "message", "actor": ADMIN, "message": "a"}, 1)
+        envelope = frame(
+            {"kind": "message", "actor": ADMIN, "message": "a", "target": "*"}, 1
+        )
         transport = FakeTransport(snapshot_doc(), [envelope])
         with mock.patch.object(
             self.controller, "apply_cp_operation", side_effect=BlockingIOError("busy")
@@ -505,7 +535,9 @@ class CPClientTests(unittest.TestCase):
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
 
     def test_frame_without_operation_id_rejected(self):
-        envelope = frame({"kind": "message", "actor": ADMIN, "message": "hi"}, 1)
+        envelope = frame(
+            {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"}, 1
+        )
         del envelope["operationId"]
         transport = FakeTransport(snapshot_doc(), [envelope])
         result = self.client(transport).sync(self.controller)
@@ -522,7 +554,7 @@ class CPClientTests(unittest.TestCase):
             docs[0],
             [
                 frame(
-                    {"kind": "message", "actor": ADMIN, "message": "hi"},
+                    {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"},
                     1,
                     generation=gen2,
                 )
@@ -552,7 +584,7 @@ class CPClientTests(unittest.TestCase):
             doc,
             [
                 frame(
-                    {"kind": "message", "actor": ADMIN, "message": "hi"},
+                    {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"},
                     1,
                     generation="gen-9",
                 )
@@ -575,6 +607,76 @@ class CPClientTests(unittest.TestCase):
         result = client.sync(self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(calls["n"], 2)
+
+    def test_scoped_target_accepted(self):
+        envelope = frame(
+            {
+                "kind": "message",
+                "actor": ADMIN,
+                "message": "hub news",
+                "target": "hub",
+            },
+            1,
+        )
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(self.controller.message, "hub news")
+
+    def test_foreign_target_rejected(self):
+        envelope = frame(
+            {
+                "kind": "message",
+                "actor": ADMIN,
+                "message": "hi",
+                "target": "other-resource",
+            },
+            1,
+        )
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual(self.controller.message, self.controller.default_message)
+        self.assertEqual(transport.acks[0]["state"], "rejected")
+
+    def test_missing_target_rejected(self):
+        envelope = frame({"kind": "message", "actor": ADMIN, "message": "hi"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual(self.controller.message, self.controller.default_message)
+
+    def test_members_foreign_target_rejected(self):
+        newcomer = {"draslId": STRANGER, "name": "Stranger", "role": "builder"}
+        transport = FakeTransport(
+            snapshot_doc(),
+            [frame(members_op(ADMIN, [ADMIN, newcomer], target="other-resource"), 1)],
+        )
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual(self.controller.members(), [ADMIN])
+
+    def test_scoped_members_maps_rejected(self):
+        entries = [
+            dict(ADMIN),
+            {"draslId": STRANGER, "name": "Stranger", "maps": ["hub"]},
+        ]
+        transport = FakeTransport(
+            snapshot_doc(), [frame(members_op(ADMIN, entries, target="hub"), 1)]
+        )
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual(self.controller.members(), [ADMIN])
+
+    def test_scoped_members_without_maps_applied(self):
+        newcomer = {"draslId": STRANGER, "name": "Stranger", "role": "builder"}
+        transport = FakeTransport(
+            snapshot_doc(),
+            [frame(members_op(ADMIN, [ADMIN, newcomer], target="hub"), 1)],
+        )
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(len(self.controller.members()), 2)
 
 
 if __name__ == "__main__":

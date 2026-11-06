@@ -1924,7 +1924,9 @@ class Controller:
         is the opposite of the file inbox, whose ``actor`` field is
         self-asserted and therefore never a grant authority (E4).
         Unknown kinds are rejected, never blind-applied; map operations
-        stay inbox-only; release selection is release.select.
+        stay inbox-only; release selection is release.select. The payload
+        target must be global or a resource this workshop serves, and scoped
+        members operations must not attest map ids.
         """
         UUID(operation_id)
         if not isinstance(payload, dict):
@@ -1932,6 +1934,10 @@ class Controller:
         kind = payload.get("kind")
         if kind not in ("members", "message", "wake", "cancel", "release.select"):
             raise ValueError(f"unsupported cp operation kind: {kind!r}"[:64])
+        served = self._map_ids() | {"hub"}
+        target = payload.get("target")
+        if not isinstance(target, str) or (target != "*" and target not in served):
+            raise ValueError("cp operation targets another resource")
         actor = payload.get("grantor") if kind == "members" else payload.get("actor")
         if not isinstance(actor, dict):
             raise ValueError("invalid cp actor")
@@ -1963,11 +1969,14 @@ class Controller:
             entries = payload.get("members")
             if not isinstance(entries, list):
                 raise ValueError("members must be a list")
-            if not any(
-                member(entry, scopes=self._map_ids() | {"hub"})["role"] == "admin"
-                for entry in entries
-            ):
+            validated = [member(entry, scopes=served) for entry in entries]
+            if not any(item["role"] == "admin" for item in validated):
                 raise ValueError("members must keep at least one admin")
+            if target != "*" and any(
+                isinstance(entry, dict) and entry.get("maps") for entry in entries
+            ):
+                # Map ids are outside any scoped grant: only a global op can attest them.
+                raise ValueError("members maps need a global target")
             self.set_members(entries)
             return {"kind": "members", "count": len(entries)}
         if kind == "message":

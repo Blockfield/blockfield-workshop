@@ -36,8 +36,13 @@ def snapshot_doc(cursor=0, releases=None):
     return doc
 
 
-def select_op(release, record=None):
-    operation = {"kind": "release.select", "actor": dict(ADMIN), "release": release}
+def select_op(release, record=None, target="*"):
+    operation = {
+        "kind": "release.select",
+        "actor": dict(ADMIN),
+        "release": release,
+        "target": target,
+    }
     if record is not None:
         operation["record"] = record
     return operation
@@ -233,6 +238,16 @@ class CPReleaseTests(unittest.TestCase):
         controller, _ = workshopctl.build_controller(env, lambda: FakeBackend())
         self.assertTrue(controller.inbox_retired)
         self.assertIsNotNone(controller.cp_client)
+
+    def test_release_select_foreign_target_rejected(self):
+        record = release_record("v9.0.0", "d")
+        transport = FakeTransport(
+            snapshot_doc(),
+            [frame(select_op("v9.0.0", record, target="other-resource"), 1)],
+        )
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertNotIn("v9.0.0", self.controller.releases)
 
 
 if __name__ == "__main__":
