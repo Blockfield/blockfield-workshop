@@ -99,6 +99,7 @@ def build_controller(
         if env.get("BF_RELEASES_FILE", "")
         else directory / "releases.json"
     )
+    inbox_retired = env.get("BLOCKFIELD_CP_INGRESS", "").strip() == "1"
     controller = Controller(
         directory,
         backend,
@@ -119,6 +120,7 @@ def build_controller(
         ),
         releases=release_catalog.load_catalog(releases_path),
         releases_path=releases_path,
+        inbox_retired=inbox_retired,
         desired_file=(
             Path(desired_file)
             if desired_file
@@ -133,6 +135,8 @@ def build_controller(
     import cp_client
 
     cp_config = cp_client.CPConfig.from_env(env)
+    if inbox_retired and cp_config is None:
+        raise ValueError("BLOCKFIELD_CP_INGRESS=1 needs CP agent credentials")
     controller.cp_client = (
         cp_client.CPClient(cp_config, directory) if cp_config is not None else None
     )

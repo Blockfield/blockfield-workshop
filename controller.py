@@ -127,6 +127,9 @@ INBOX_MAX_BYTES = 65536
 INBOX_MERGE_MAX_BYTES = 8 << 20
 INBOX_BATCH = 20
 INBOX_TTL_MS = 10 * 60 * 1000
+CP_RELEASE_LIMIT = 256
+CP_COVERED_INBOX_KINDS = frozenset({"members", "message", "wake", "cancel"})
+CP_INBOX_RETIRED_ERROR = "inbox retired: control-plane is the mutation ingress"
 RESULTS_KEPT = 200
 # Cold Workshop (unreleased section 2): the always-on editor sleeps after 15 min
 # with no builders and no active work, and wakes on demand through the proxy/site.
@@ -291,6 +294,7 @@ class Controller:
         releases_path: Path | None = None,
         target_file: Path | None = None,
         desired_file: Path | None = None,
+        inbox_retired: bool = False,
     ):
         """A missed STARTING deadline restores a previous Workshop/test goal when available."""
         # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
@@ -331,6 +335,8 @@ class Controller:
         self.default_message = message.strip()[:500] or DEFAULT_MESSAGE
         self.admin_dir = Path(admin_dir) if admin_dir else None
         self.inbox_dir = Path(inbox_dir) if inbox_dir else None
+        # S6b switch: CP-covered inbox kinds are denied closed (map ops stay).
+        self.inbox_retired = bool(inbox_retired)
         self.workshop_data_dir = (
             Path(workshop_data_dir) if workshop_data_dir is not None else None
         )
@@ -1861,6 +1867,52 @@ class Controller:
                 "started": True,
             }
 
+    def apply_cp_releases(self, records) -> list:
+        """Merge CP-attested approved-release records into the catalog (S6b).
+
+        Records arrive in the agent snapshot or a release.select operation,
+        over the mutually authenticated CP channel -- unlike releases.json,
+        which is an operator file, and unlike the inbox, whose fields are
+        self-asserted. Each record passes the same provenance validation as
+        the file catalog; a tag whose identity changed is refused.
+        """
+        if not isinstance(records, list) or len(records) > CP_RELEASE_LIMIT:
+            raise ValueError("invalid cp release records")
+        merged = []
+        for entry in records:
+            record = release_catalog.validate_release_record(entry)
+            release = record["release"]
+            known = self.releases.get(release)
+            if known is not None and known != record:
+                raise ValueError("published release identity changed")
+            if known is None:
+                merged.append(release)
+            self.releases[release] = record
+        if merged:
+            if self.releases_path is not None:
+                atomic_write(
+                    self.releases_path,
+                    json.dumps(self.releases, sort_keys=True, allow_nan=False).encode(),
+                )
+                self._releases_fingerprint = self._fingerprint_releases()
+            if hasattr(self.backend, "releases"):
+                self.backend.releases = dict(self.releases)
+        return merged
+
+    def _apply_cp_release_select(self, operation_id: str, payload: dict) -> dict:
+        """Commit a central approved-release record; activation stays journal-bound."""
+        release = payload.get("release")
+        if not isinstance(release, str) or not release:
+            raise ValueError("invalid cp release selection")
+        record = payload.get("record")
+        if record is not None:
+            if not isinstance(record, dict) or record.get("release") != release:
+                raise ValueError("cp release record does not match selection")
+            self.apply_cp_releases([record])
+        with self._locked():
+            resolved = self._select_release(release, self._read())
+        return {"kind": "release.select", "release": resolved["release"]}
+
     def apply_cp_operation(
         self, operation_id: str, payload: dict, acl: list | None = None
     ) -> dict:
@@ -1872,13 +1924,13 @@ class Controller:
         is the opposite of the file inbox, whose ``actor`` field is
         self-asserted and therefore never a grant authority (E4).
         Unknown kinds are rejected, never blind-applied; map operations
-        stay inbox-only until the S6b slice.
+        stay inbox-only; release selection is release.select.
         """
         UUID(operation_id)
         if not isinstance(payload, dict):
             raise ValueError("invalid cp operation")
         kind = payload.get("kind")
-        if kind not in ("members", "message", "wake", "cancel"):
+        if kind not in ("members", "message", "wake", "cancel", "release.select"):
             raise ValueError(f"unsupported cp operation kind: {kind!r}"[:64])
         actor = payload.get("grantor") if kind == "members" else payload.get("actor")
         if not isinstance(actor, dict):
@@ -1894,11 +1946,17 @@ class Controller:
             ]
             if not matches:
                 raise ValueError("cp actor is not a workshop member")
-            if kind == "members" and not all(
+            if kind in ("members", "release.select") and not all(
                 entry.get("role") == "admin" for entry in matches
             ):
                 # Duplicate ACL identities with mixed roles fail closed.
-                raise ValueError("cp grantor is not a workshop admin")
+                if kind == "members":
+                    raise ValueError("cp grantor is not a workshop admin")
+                raise ValueError("cp actor is not a workshop admin")
+        if kind == "release.select":
+            if acl is None:
+                raise ValueError("cp release.select requires a CP ACL snapshot")
+            return self._apply_cp_release_select(operation_id, payload)
         if kind == "members":
             if acl is None:
                 raise ValueError("cp members requires a CP ACL snapshot")
@@ -1967,6 +2025,11 @@ class Controller:
                             raise ValueError("invalid actor")
                         if document.get("id") != request_id:
                             raise ValueError("id does not match file name")
+                        if (
+                            self.inbox_retired
+                            and document.get("kind") in CP_COVERED_INBOX_KINDS
+                        ):
+                            raise ValueError(CP_INBOX_RETIRED_ERROR)
                         # An operation already accepted (e.g. recovery step was busy) is finished, not expired.
                         if (
                             type(document.get("createdAt")) is not int

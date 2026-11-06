@@ -1,4 +1,4 @@
-"""Control-plane v2 subscriber for the Workshop controller (unit CP-S6a).
+"""Control-plane v2 subscriber for the Workshop controller (units CP-S6a/S6b).
 
 Consumes the frozen v2 wire contract (control-plane origin/main ``6df1f95``
 + ``cf660e4``, ``docs/V2.md`` "Private delivery"): target snapshot,
@@ -16,8 +16,10 @@ JSON (sort_keys, compact separators); the CP-side Workshop producer must
 hash the same canonical form when committing the outbox row.
 
 Disabled unless ``BLOCKFIELD_CP_URL``, ``BLOCKFIELD_CP_AGENT_ID`` and
-``BLOCKFIELD_CP_AGENT_TOKEN`` are all set. The file inbox keeps working
-either way; it is retired by S6b, not here.
+``BLOCKFIELD_CP_AGENT_TOKEN`` are all set. The file inbox keeps working unless BLOCKFIELD_CP_INGRESS=1 retires the
+CP-covered kinds (members/message/wake/cancel); map operations stay
+inbox-only. Release records arrive centrally: the agent snapshot may
+carry approved records and release.select commits one record.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ import time
 import urllib.request
 import urllib.error
 
-from controller import member
+from controller import CP_RELEASE_LIMIT, member
 
 AGENT_PATH = "/v2/agents/{agent}"
 SNAPSHOT_TTL_S = 3600
@@ -40,7 +42,7 @@ EVENT_TIMEOUT_S = 5.0
 MAX_FRAME_BYTES = 65536
 MAX_ACL_ENTRIES = 4096
 RECEIPT_LIMIT = 500
-CP_KINDS = ("members", "message", "wake", "cancel")
+CP_KINDS = ("members", "message", "wake", "cancel", "release.select")
 
 
 class SnapshotRequired(Exception):
@@ -304,12 +306,21 @@ class CPClient:
             if not isinstance(acl, list) or len(acl) > MAX_ACL_ENTRIES:
                 raise ValueError("cp snapshot acl is not a list")
             acl = [member(entry) for entry in acl]
+        releases = document.get("releases")
+        if releases is not None:
+            if (
+                not isinstance(releases, list)
+                or len(releases) > CP_RELEASE_LIMIT
+                or not all(isinstance(entry, dict) for entry in releases)
+            ):
+                raise ValueError("cp snapshot releases is not a list")
         state = {
             "schema": 1,
             "epoch": epoch,
             "generation": generation,
             "cursor": cursor,
             "acl": acl,
+            "releases": releases,
             "takenAt": self._now_ms(),
         }
         self._state = state
@@ -353,6 +364,15 @@ class CPClient:
         so the caller can log it without blocking reconciliation.
         """
         state = self._ensure_state()
+        pending = state.get("releases") or []
+        if pending:
+            try:
+                controller.apply_cp_releases(pending)
+            except ValueError:
+                # Snapshot records are advisory availability; the explicit
+                # release.select operation carries its own ACK, so a bad
+                # snapshot entry must not block other operations.
+                pass
         try:
             _, frames = self.transport.get_events(
                 self.config.events_url(state["epoch"], state["cursor"]),
