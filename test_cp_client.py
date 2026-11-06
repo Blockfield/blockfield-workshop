@@ -325,6 +325,200 @@ class CPClientTests(unittest.TestCase):
             (EPOCH, GENERATION, 1),
         )
 
+    # Bot-review findings below: each failed on the pre-fix code.
+
+    def test_cp_members_keeps_admin(self):
+        only_builders = [
+            {"draslId": DRASL, "name": "Nether", "role": "builder"},
+            {"draslId": STRANGER, "name": "Stranger", "role": "builder"},
+        ]
+        transport = FakeTransport(
+            snapshot_doc(), [frame(members_op(ADMIN, only_builders), 1)]
+        )
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual(self.controller.members(), [ADMIN])
+
+    def test_stranger_message_rejected_without_snapshot_acl(self):
+        doc = {"epoch": EPOCH, "generation": GENERATION, "cursor": 0}
+        stranger = {
+            "kind": "message",
+            "actor": {"draslId": STRANGER, "name": "Stranger"},
+            "message": "hi",
+        }
+        transport = FakeTransport(doc, [frame(stranger, 1)])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual(self.controller.message, self.controller.default_message)
+        mine = frame({"kind": "message", "actor": ADMIN, "message": "yo"}, 2)
+        result = self.client(FakeTransport(doc, [mine])).sync(self.controller)
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(self.controller.message, "yo")
+
+    def test_sse_timeout_keeps_parsed_frames(self):
+        import socket
+
+        from cp_client import _read_sse
+
+        lines = [b'data: {"a": 1}\n', b"\n", b'data: {"b": 2}\n', b"\n"]
+
+        class Stub:
+            def __init__(self):
+                self.calls = 0
+
+            def readline(self, *args):
+                if self.calls < len(lines):
+                    line = lines[self.calls]
+                    self.calls += 1
+                    return line
+                raise socket.timeout("timed out")
+
+        self.assertEqual(_read_sse(Stub(), timeout=5.0), [{"a": 1}, {"b": 2}])
+
+    def test_oversize_snapshot_is_explicit_error(self):
+        from cp_client import MAX_SNAPSHOT_BYTES, _read_capped
+
+        class Stub:
+            def __init__(self, body):
+                self.body = body
+
+            def read(self, n=-1):
+                return self.body if n < 0 else self.body[:n]
+
+        self.assertEqual(
+            _read_capped(Stub(b'{"a": 1}'), MAX_SNAPSHOT_BYTES, "snapshot"),
+            b'{"a": 1}',
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            _read_capped(
+                Stub(b"x" * (MAX_SNAPSHOT_BYTES + 1)), MAX_SNAPSHOT_BYTES, "snapshot"
+            )
+
+    def test_oversize_sse_frame_is_explicit_error(self):
+        from cp_client import _read_sse
+
+        big = b"data: " + b"x" * 70000 + b"\n"
+
+        class Stub:
+            def __init__(self):
+                self.calls = 0
+
+            def readline(self, *args):
+                self.calls += 1
+                return big if self.calls == 1 else b""
+
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            _read_sse(Stub(), timeout=5.0)
+
+    def test_apply_runtime_error_rejected_and_advances(self):
+        from unittest import mock
+
+        first = frame({"kind": "message", "actor": ADMIN, "message": "a"}, 1)
+        second = frame({"kind": "message", "actor": ADMIN, "message": "b"}, 2)
+        transport = FakeTransport(snapshot_doc(), [first, second])
+        real_apply = self.controller.apply_cp_operation
+        calls = []
+
+        def flaky(operation_id, operation, acl):
+            calls.append(operation.get("message"))
+            if len(calls) == 1:
+                raise RuntimeError("preflight exploded")
+            return real_apply(operation_id, operation, acl)
+
+        with mock.patch.object(
+            self.controller, "apply_cp_operation", side_effect=flaky
+        ):
+            result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 1, "rejected": 1, "acked": 2})
+        self.assertEqual(self.controller.message, "b")
+
+    def test_apply_blocking_error_retries_next_pass(self):
+        from unittest import mock
+
+        envelope = frame({"kind": "message", "actor": ADMIN, "message": "a"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        with mock.patch.object(
+            self.controller, "apply_cp_operation", side_effect=BlockingIOError("busy")
+        ):
+            result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
+
+    def test_frame_without_operation_id_rejected(self):
+        envelope = frame({"kind": "message", "actor": ADMIN, "message": "hi"}, 1)
+        del envelope["operationId"]
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result["applied"], 0)
+        self.assertEqual(self.controller.message, self.controller.default_message)
+
+    def test_generation_mismatch_refetches_snapshot(self):
+        gen2 = "gen-8"
+        docs = [
+            {"epoch": EPOCH, "generation": GENERATION, "cursor": 0, "acl": [ADMIN]},
+            {"epoch": EPOCH, "generation": gen2, "cursor": 0, "acl": [ADMIN]},
+        ]
+        transport = FakeTransport(
+            docs[0],
+            [
+                frame(
+                    {"kind": "message", "actor": ADMIN, "message": "hi"},
+                    1,
+                    generation=gen2,
+                )
+            ],
+        )
+        calls = {"n": 0}
+
+        def get_json(url, timeout):
+            calls["n"] += 1
+            return 200, json.dumps(docs[min(calls["n"], 2) - 1]).encode()
+
+        transport.get_json = get_json
+        config = CPConfig(
+            base_url="https://cp.invalid", agent_id=AGENT, token="t", generation=""
+        )
+        client = CPClient(
+            config, self.dir / "state", transport=transport, now_ms=lambda: NOW_MS
+        )
+        result = client.sync(self.controller)
+        self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(self.controller.message, "hi")
+
+    def test_persistent_generation_mismatch_rejected(self):
+        doc = {"epoch": EPOCH, "generation": GENERATION, "cursor": 0, "acl": [ADMIN]}
+        transport = FakeTransport(
+            doc,
+            [
+                frame(
+                    {"kind": "message", "actor": ADMIN, "message": "hi"},
+                    1,
+                    generation="gen-9",
+                )
+            ],
+        )
+        calls = {"n": 0}
+        orig_get = transport.get_json
+
+        def get_json(url, timeout):
+            calls["n"] += 1
+            return orig_get(url, timeout)
+
+        transport.get_json = get_json
+        config = CPConfig(
+            base_url="https://cp.invalid", agent_id=AGENT, token="t", generation=""
+        )
+        client = CPClient(
+            config, self.dir / "state", transport=transport, now_ms=lambda: NOW_MS
+        )
+        result = client.sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual(calls["n"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

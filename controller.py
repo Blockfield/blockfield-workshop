@@ -1905,6 +1905,11 @@ class Controller:
             entries = payload.get("members")
             if not isinstance(entries, list):
                 raise ValueError("members must be a list")
+            if not any(
+                member(entry, scopes=self._map_ids() | {"hub"})["role"] == "admin"
+                for entry in entries
+            ):
+                raise ValueError("members must keep at least one admin")
             self.set_members(entries)
             return {"kind": "members", "count": len(entries)}
         if kind == "message":

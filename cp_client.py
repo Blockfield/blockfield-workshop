@@ -39,6 +39,8 @@ SNAPSHOT_TTL_S = 3600
 EVENT_TIMEOUT_S = 5.0
 MAX_FRAME_BYTES = 65536
 MAX_ACL_ENTRIES = 4096
+MAX_ACL_ENTRY_BYTES = 256
+MAX_SNAPSHOT_BYTES = MAX_ACL_ENTRIES * MAX_ACL_ENTRY_BYTES
 RECEIPT_LIMIT = 500
 CP_KINDS = ("members", "message", "wake", "cancel")
 
@@ -113,7 +115,8 @@ def check_frame(
     """Validate one SSE envelope against the frozen v2 fields.
 
     Returns the typed operation payload. Raises SnapshotRequired when the
-    stream moved on, ValueError for anything that must never execute.
+    stream epoch or generation moved on, ValueError for anything that must
+    never execute.
     """
     if not isinstance(frame, dict):
         raise ValueError("invalid cp frame: not an object")
@@ -126,9 +129,10 @@ def check_frame(
     sequence = frame.get("sequence")
     if type(sequence) is not int or sequence < 0:
         raise ValueError("invalid cp frame: sequence")
+    _need(frame, "operationId", (str,), "operationId")
     frame_generation = _need(frame, "generation", (str,), "generation")
     if frame_generation != generation:
-        raise ValueError("cp frame generation mismatch")
+        raise SnapshotRequired("cp stream generation moved on")
     expires = frame.get("expiresAt")
     if type(expires) is not int or expires <= 0:
         raise ValueError("invalid cp frame: expiresAt")
@@ -143,6 +147,18 @@ def check_frame(
     return operation
 
 
+def _read_capped(response, cap: int, what: str) -> bytes:
+    """Read a whole document to EOF under an explicit cap.
+
+    Oversize is an error, never silent truncation: a cut snapshot would fail
+    downstream as invalid JSON and wedge the stream on every refresh.
+    """
+    body = response.read(cap + 1)
+    if len(body) > cap:
+        raise ValueError(f"cp {what} exceeds {cap} bytes")
+    return body
+
+
 class _UrllibTransport:
     def __init__(self, token: str):
         self.token = token
@@ -154,9 +170,11 @@ class _UrllibTransport:
         request = urllib.request.Request(url, headers=self._headers("application/json"))
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, response.read(MAX_FRAME_BYTES)
+                return response.status, _read_capped(
+                    response, MAX_SNAPSHOT_BYTES, "snapshot"
+                )
         except urllib.error.HTTPError as error:
-            return error.code, error.read(MAX_FRAME_BYTES)
+            return error.code, _read_capped(error, MAX_SNAPSHOT_BYTES, "snapshot")
 
     def post_json(self, url: str, body: dict, timeout: float) -> tuple[int, bytes]:
         data = canonical(body)
@@ -171,9 +189,9 @@ class _UrllibTransport:
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, response.read(MAX_FRAME_BYTES)
+                return response.status, _read_capped(response, MAX_FRAME_BYTES, "ack")
         except urllib.error.HTTPError as error:
-            return error.code, error.read(MAX_FRAME_BYTES)
+            return error.code, _read_capped(error, MAX_FRAME_BYTES, "ack")
 
     def get_events(self, url: str, timeout: float) -> tuple[int, list[dict]]:
         request = urllib.request.Request(
@@ -191,13 +209,23 @@ class _UrllibTransport:
 
 
 def _read_sse(response, timeout: float) -> list[dict]:
-    """Read bounded SSE frames until the deadline; one JSON object per data block."""
+    """Read bounded SSE frames until the deadline; one JSON object per data block.
+
+    A socket timeout after the last queued event ends the read with the
+    frames parsed so far instead of discarding them. Lines carry no
+    per-line limit (a members frame can approach MAX_FRAME_BYTES); a single
+    data block past that is an explicit error, never silent truncation.
+    """
     frames: list[dict] = []
     data: list[str] = []
+    data_len = 0
     deadline = time.monotonic() + timeout
     total = 0
     while time.monotonic() < deadline and len(frames) < 20:
-        line = response.readline(MAX_FRAME_BYTES)
+        try:
+            line = response.readline()
+        except TimeoutError:
+            break
         if not line:
             break
         total += len(line)
@@ -213,8 +241,12 @@ def _read_sse(response, timeout: float) -> list[dict]:
                 if isinstance(document, dict):
                     frames.append(document)
                 data = []
+                data_len = 0
         elif text.startswith("data:"):
             data.append(text[5:].lstrip())
+            data_len += len(line)
+            if data_len > MAX_FRAME_BYTES:
+                raise ValueError(f"cp frame exceeds {MAX_FRAME_BYTES} bytes")
         # "id:" (epoch:sequence) and retry/comments carry no payload here.
     return frames
 
@@ -346,6 +378,82 @@ class CPClient:
             timeout=self.config.poll_timeout_s,
         )
 
+    def _validated_operation(self, frame, state, controller):
+        """check_frame with one snapshot refetch on a stream move.
+
+        Returns (operation, state); (None, state) when the frame must never
+        execute. A generation/epoch mismatch refetches once; a persistent
+        mismatch fails closed below instead of dropping the frame silently.
+        """
+        try:
+            return (
+                check_frame(
+                    frame,
+                    agent_id=self.config.agent_id,
+                    epoch=state["epoch"],
+                    generation=state["generation"],
+                    now_ms=self._now_ms(),
+                ),
+                state,
+            )
+        except SnapshotRequired:
+            state = self.snapshot()
+        except ValueError:
+            return None, state
+        try:
+            return (
+                check_frame(
+                    frame,
+                    agent_id=self.config.agent_id,
+                    epoch=state["epoch"],
+                    generation=state["generation"],
+                    now_ms=self._now_ms(),
+                ),
+                state,
+            )
+        except (SnapshotRequired, ValueError):
+            return None, state
+
+    @staticmethod
+    def _acl(state, controller):
+        acl = state.get("acl")
+        if acl is None:
+            # A snapshot without an ACL list must not skip the membership
+            # check: fall back to the local members, which only CP members
+            # operations or the operator bootstrap can change. Resolved per
+            # frame so a members op earlier in the same pass already guards
+            # the next one; without a bootstrap every kind fails closed.
+            acl = controller.members()
+        return acl
+
+    def _nack(self, controller, frame, state) -> tuple[int, int]:
+        """Best-effort rejected receipt for an unauthenticatable frame.
+
+        Returns (rejected, acked) and advances the local cursor past it so
+        the stream can move on.
+        """
+        if not isinstance(frame, dict):
+            return 0, 0
+        operation_id = frame.get("operationId")
+        sequence = frame.get("sequence")
+        if not (type(operation_id) is str and operation_id and type(sequence) is int):
+            return 0, 0
+        self._store_receipt(operation_id, {"state": "rejected", "sequence": sequence})
+        try:
+            self._ack(controller, operation_id, state["epoch"], sequence, "rejected")
+        except Exception:
+            acked = 0
+        else:
+            acked = 1
+        if type(state["cursor"]) is int and sequence > state["cursor"]:
+            state["cursor"] = sequence
+            self._store_state()
+        return 1, acked
+
+    def _reject_applied(self, controller, operation_id, sequence, state) -> None:
+        self._store_receipt(operation_id, {"state": "rejected", "sequence": sequence})
+        self._ack(controller, operation_id, state["epoch"], sequence, "rejected")
+
     def sync(self, controller) -> dict:
         """One bounded pass: snapshot if needed, apply addressed frames, ACK.
 
@@ -366,43 +474,14 @@ class CPClient:
             )
         applied = rejected = acked = 0
         for frame in frames:
-            try:
-                operation = check_frame(
-                    frame,
-                    agent_id=self.config.agent_id,
-                    epoch=state["epoch"],
-                    generation=state["generation"],
-                    now_ms=self._now_ms(),
-                )
-            except SnapshotRequired:
-                state = self.snapshot()
-                continue
-            except ValueError:
-                # Unauthenticatable frame (foreign audience, stale
-                # generation, expired, hash mismatch): never execute, but
-                # still nack by envelope id so the stream can move on.
-                operation_id = frame.get("operationId")
-                sequence = frame.get("sequence")
-                if type(operation_id) is str and operation_id and type(sequence) is int:
-                    self._store_receipt(
-                        operation_id, {"state": "rejected", "sequence": sequence}
-                    )
-                    try:
-                        self._ack(
-                            controller,
-                            operation_id,
-                            state["epoch"],
-                            sequence,
-                            "rejected",
-                        )
-                    except Exception:
-                        pass
-                    else:
-                        acked += 1
-                    rejected += 1
-                    if type(state["cursor"]) is int and sequence > state["cursor"]:
-                        state["cursor"] = sequence
-                        self._store_state()
+            operation, state = self._validated_operation(frame, state, controller)
+            if operation is None:
+                # Unauthenticatable frame (foreign audience, stale generation
+                # or epoch, expired, hash mismatch): never execute, but still
+                # nack by envelope id so the stream can move on.
+                delta_rejected, delta_acked = self._nack(controller, frame, state)
+                rejected += delta_rejected
+                acked += delta_acked
                 continue
             operation_id = frame["operationId"]
             sequence = frame["sequence"]
@@ -430,15 +509,14 @@ class CPClient:
             )
             try:
                 result = controller.apply_cp_operation(
-                    operation_id, operation, state.get("acl")
+                    operation_id, operation, self._acl(state, controller)
                 )
-            except ValueError:
-                self._store_receipt(
-                    operation_id, {"state": "rejected", "sequence": sequence}
-                )
-                self._ack(
-                    controller, operation_id, state["epoch"], sequence, "rejected"
-                )
+            except BlockingIOError:
+                # Transient controller lock contention: hold the cursor and
+                # retry the whole pass later instead of skipping this frame.
+                break
+            except Exception:
+                self._reject_applied(controller, operation_id, sequence, state)
                 rejected += 1
                 acked += 1
             else:
