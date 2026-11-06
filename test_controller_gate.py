@@ -361,6 +361,53 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.controller.step()["phase"], "ERROR")
         self.assertEqual(self.gate("game")["gate"], "public")
         self.assertEqual(self.public("game")["mode"], "game")
+
+    def test_unobserved_game_preserves_status_game_entry(self):
+        # Site admin reads status.json, not the gate: an unobserved Game with
+        # a preserved public entry must still report game/public there, or the
+        # admin shows "readiness unconfirmed" while a match runs (site#82).
+        controller = Controller(
+            self.dir / "state2",
+            self.backend,
+            gate_file=self.dir / "gate.json",
+            public_file=self.dir / "public.json",
+            admin_dir=self.dir / "admin",
+            releases=catalog(),
+        )
+        self.backend.processes = []
+        controller.gate_file.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "revision": 77,
+                    "gate": "public",
+                    "message": "",
+                    "backend": "game",
+                    "allowed": [],
+                    "backends": {
+                        "game": {"gate": "public", "message": "", "allowed": []},
+                        "workshop": {"gate": "sleeping", "message": "m", "allowed": []},
+                    },
+                }
+            )
+        )
+        controller.public_file.write_text(
+            json.dumps(
+                {
+                    "mode": "game",
+                    "message": "",
+                    "since": 1,
+                    "workshop": {"mode": "sleeping", "message": "m"},
+                }
+            )
+        )
+        controller.request(str(uuid4()), self.goal, 0)
+        self.backend.fail_start = True
+        self.assertEqual(controller.step()["phase"], "ERROR")
+        status = json.loads((self.dir / "admin" / "status.json").read_text())
+        self.assertEqual(
+            status["game"], {"phase": "game", "gate": "public", "release": None}
+        )
         self.assertEqual(self.gate()["gate"], "closed")
 
     def test_legacy_sleeping_error_preserves_game_entry(self):
