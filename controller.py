@@ -1107,6 +1107,17 @@ class Controller:
             preserved = self._last_game_entry()
             if preserved is not None:
                 game_gate, mode = preserved
+                if game_gate["gate"] == "public":
+                    # The site admin reads the status game entry, not the
+                    # gate: repeat the preserved public verdict there too.
+                    # Release is unknown to an unobserving controller (null,
+                    # accepted by the site readiness check); direct liveness
+                    # stays cross-checked by the site rooms query.
+                    game_status = {
+                        "phase": "game",
+                        "gate": "public",
+                        "release": None,
+                    }
         gate_doc = {
             "schema": 1,
             "revision": state["revision"],
