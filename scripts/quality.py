@@ -14,14 +14,16 @@ from toolchain import canonical_python, child_env, download, native, python_args
 def wire_hooks(root=ROOT):
     """Point this checkout at the versioned hooks so pushes run the fast checks.
 
-    Only sets core.hooksPath when it is unset; an explicit choice is left
-    alone. Best-effort: a checkout without git or hooks must not break lint.
+    Only sets the repo-local core.hooksPath when it is unset; an explicit
+    repo choice is left alone. Best-effort: a checkout without git or hooks
+    must not break lint. Never touches an outer repo: subtrees without their
+    own .git are left alone.
     """
-    if not (root / ".githooks").is_dir():
+    if not (root / ".git").exists() or not (root / ".githooks").is_dir():
         return False
     try:
-        current = subprocess.run(
-            ["git", "config", "--get", "core.hooksPath"],
+        local = subprocess.run(
+            ["git", "config", "--local", "--get", "core.hooksPath"],
             cwd=root,
             env=child_env(),
             stdout=subprocess.PIPE,
@@ -30,11 +32,27 @@ def wire_hooks(root=ROOT):
         ).stdout.strip()
     except OSError:
         return False
-    if current:
+    if local:
         return False
     try:
+        outer = subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"],
+            cwd=root,
+            env=child_env(),
+            stdout=subprocess.PIPE,
+            text=True,
+            check=False,
+        ).stdout.strip()
+    except OSError:
+        outer = ""
+    if outer:
+        print(
+            f"warning: outer core.hooksPath {outer!r} does not apply here; "
+            "wiring versioned .githooks"
+        )
+    try:
         subprocess.run(
-            ["git", "config", "core.hooksPath", ".githooks"],
+            ["git", "config", "--local", "core.hooksPath", ".githooks"],
             cwd=root,
             check=True,
             env=child_env(),
@@ -259,15 +277,39 @@ def staged_files():
 
 def format_staged():
     """Format the staged files with the same pinned formatters `format-check`
-    uses, and re-stage them. Staged files only; no Gradle.
+    uses, and re-stage them. Files with unstaged edits are skipped with a
+    warning (formatting the worktree copy would stage unreviewed hunks), so
+    only fully staged files are re-added. No Gradle.
 
-    Whole-file writers (prettier, ruff, GJF, ...) run only on staged files;
+    Per-file writers (prettier, ruff, GJF, ...) run only on staged files;
     repo-wide steps (npm format, cargo fmt, just --fmt) run only when a file
-    in their scope is staged, so unstaged work is never touched.
+    in their scope is staged. Repo-wide steps may reformat other worktree
+    files of the same type, but those are never staged by this hook.
     """
     files = staged_files()
     if not files:
         return
+    try:
+        worktree = run(
+            "git",
+            "diff",
+            "--name-only",
+            "-z",
+            "--",
+            capture=True,
+        )
+    except subprocess.CalledProcessError:
+        worktree = ""
+    dirty = {n for n in worktree.split("\0") if n} & set(files)
+    if dirty:
+        print(
+            "pre-commit: skipping partially staged files "
+            "(format them after staging, or unstage first):\n"
+            + "\n".join(f"  {n}" for n in sorted(dirty))
+        )
+        files = [f for f in files if f not in dirty]
+        if not files:
+            return
     staged = set(files)
     eol()
     each(
@@ -443,6 +485,8 @@ def main():
                 "a", encoding="utf-8", newline="\n"
             ) as output:
                 output.write(str(ROOT / ".cache/quality/npm/node_modules/.bin") + "\n")
+        if (ROOT / ".githooks").is_dir() and not wire_hooks():
+            raise SystemExit(f"just setup: cannot wire versioned hooks in {ROOT}")
         return
     if mode in ("dev", "start", "test-postgres"):
         if (ROOT / "package.json").is_file():
