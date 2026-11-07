@@ -1,5 +1,6 @@
 """Versioned pre-commit hook: format staged files before the commit lands."""
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -139,32 +140,37 @@ class PreCommitHook(unittest.TestCase):
             )
             self.assertEqual(probe.stdout.strip(), "/outer/hooks")
 
-    def test_wire_hooks_warns_every_time_it_supersedes_outer_hooks(self):
+    def test_wire_hooks_keeps_global_hooks_path(self):
+        with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
+            root = Path(tmp) / "repo"
+            subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+            (root / ".githooks").mkdir()
+            gitconfig = Path(tmp) / "gitconfig"
+            gitconfig.write_text("[core]\n\thooksPath = /global/hooks\n")
+            with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(gitconfig)}):
+                self.assertFalse(quality.wire_hooks(root))
+            local = subprocess.run(
+                ["git", "config", "--local", "--get", "core.hooksPath"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(local.stdout, "")
+
+    def test_wire_hooks_keeps_active_hooks(self):
         with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init", "--quiet", tmp], check=True)
             (root / ".githooks").mkdir()
-            subprocess.run(
-                ["git", "config", "core.hooksPath", ".githooks"],
+            (root / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
+            self.assertFalse(quality.wire_hooks(root))
+            local = subprocess.run(
+                ["git", "config", "--local", "--get", "core.hooksPath"],
                 cwd=root,
-                check=True,
+                capture_output=True,
+                text=True,
             )
-            calls = []
-
-            def fake_run(args, **kwargs):
-                calls.append(args)
-                if "--local" in args:
-                    return subprocess.CompletedProcess(args, 0, stdout=".githooks\n")
-                if "--global" in args:
-                    return subprocess.CompletedProcess(args, 0, stdout=".outer\n")
-                return subprocess.CompletedProcess(args, 1, stdout="")
-
-            with patch.object(HQ_MOD.subprocess, "run", side_effect=fake_run):
-                self.assertTrue(HQ_MOD.wire_hooks(root))
-            self.assertEqual(len(calls), 2)
-            self.assertFalse(
-                any("--local" in c and c[-1] == ".githooks" for c in calls)
-            )
+            self.assertEqual(local.stdout, "")
 
     def test_commit_leaves_partially_staged_files_alone(self):
         # Fail-before: the old hook formatted the worktree copy and staged it
