@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -137,6 +138,33 @@ class PreCommitHook(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(probe.stdout.strip(), "/outer/hooks")
+
+    def test_wire_hooks_warns_every_time_it_supersedes_outer_hooks(self):
+        with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet", tmp], check=True)
+            (root / ".githooks").mkdir()
+            subprocess.run(
+                ["git", "config", "core.hooksPath", ".githooks"],
+                cwd=root,
+                check=True,
+            )
+            calls = []
+
+            def fake_run(args, **kwargs):
+                calls.append(args)
+                if "--local" in args:
+                    return subprocess.CompletedProcess(args, 0, stdout=".githooks\n")
+                if "--global" in args:
+                    return subprocess.CompletedProcess(args, 0, stdout=".outer\n")
+                return subprocess.CompletedProcess(args, 1, stdout="")
+
+            with patch.object(HQ_MOD.subprocess, "run", side_effect=fake_run):
+                self.assertTrue(HQ_MOD.wire_hooks(root))
+            self.assertEqual(len(calls), 2)
+            self.assertFalse(
+                any("--local" in c and c[-1] == ".githooks" for c in calls)
+            )
 
     def test_commit_leaves_partially_staged_files_alone(self):
         # Fail-before: the old hook formatted the worktree copy and staged it
