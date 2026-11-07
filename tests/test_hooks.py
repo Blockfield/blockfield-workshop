@@ -275,3 +275,21 @@ class WireHooksStrict(unittest.TestCase):
                     config.write(b"[core]\n\thooksPath = /hooks\xff\n")
                 with contextlib.redirect_stderr(io.StringIO()):
                     self.assertFalse(module.wire_hooks(root))
+
+    def test_setup_fails_when_git_config_cannot_be_read(self):
+        import contextlib
+        import io
+
+        for module in (quality,):
+            with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
+                root = Path(tmp)
+                subprocess.run(["git", "init", "--quiet", tmp], check=True)
+                (root / ".githooks").mkdir()
+                # An unreadable hooks dir: wiring state unknown, so setup must stop.
+                with (
+                    patch.object(Path, "iterdir", side_effect=PermissionError),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertFalse(module.wire_hooks(root))
+                    with self.assertRaises(SystemExit):
+                        module.wire_hooks(root, strict=True)

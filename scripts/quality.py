@@ -26,8 +26,8 @@ def wire_hooks(root=ROOT, strict=False):
     Wires only when git would run no other hooks here: core.hooksPath unset at
     every scope and no active hook in the hooks dir. Otherwise warns and leaves
     git alone. Returns True when `.githooks` is the hooks path afterwards.
-    With strict, a failed write exits: `just setup` must not pass without
-    the hooks (pre-push runs the secret scan).
+    With strict, failing to read or write git config exits: `just setup`
+    must not pass without the hooks (pre-push runs the secret scan).
     Notices go to stderr: callers capture the stdout of `quality.py run`.
     """
     if not (root / ".git").exists() or not (root / ".githooks").is_dir():
@@ -70,12 +70,6 @@ def wire_hooks(root=ROOT, strict=False):
                 file=sys.stderr,
             )
             return False
-    except (OSError, subprocess.CalledProcessError) as error:
-        print(
-            f"warning: cannot wire versioned hooks in {root}: {error}", file=sys.stderr
-        )
-        return False
-    try:
         git("config", "--local", "core.hooksPath", ".githooks", check=True)
     except (OSError, subprocess.CalledProcessError) as error:
         if strict:
