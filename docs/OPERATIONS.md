@@ -526,7 +526,7 @@ when the host configuration is `enabled: true`, the site settings
 `<BF_WORKSHOP_DATA>/blockfield-workshop/openrouter.key` exists, or the legacy environment key is assigned.
 With nothing configured the ordinary service path is preserved. While configured, every strict mount/path/RO-view
 check above still applies: the site settings file is validated (closed schema
-`{schema,revision,enabled,generationModel,guardModel,transcriptionModel}`, regular single hardlink, no
+`{schema,revision,enabled,generationModel,transcriptionModel}`, retired guard-model keys ignored; regular single hardlink, no
 symlinks, at most 4096 bytes) when present, and the key file is validated (regular, 0600, UID/GID 1000,
 single hardlink, no symlinks, at most 2048 bytes; its content is never read) when present. A key source
 (key file or environment key) is required only while AI is enabled; the environment key alone no longer
@@ -564,12 +564,11 @@ exclusive advisory lock. Writes force the file and parent directory around an at
 paid HTTP begins. Missing initialized usage, corruption, conflicting ownership or uncertain disk writes
 close further reservations. **Never delete or reset the ledger or its lock marker to restore an allowance.**
 
-Before the input guard, generation reserves the whole job according to
+Generation reserves the whole job according to
 `effectiveCells = min(config.maxBlocks, selection volume)`: at most 4096 cells selects `max_tokens: 4096`
 and `111053` microUSD ($0.111053); 4097–16384 cells selects `8192` and `111872` microUSD ($0.111872);
 larger values select the hard output cap `16384` and `113511` microUSD ($0.113511).
-These conservative bounds cover full-context generation input, output including `minimal` reasoning,
-and two guard calls at unchanged tariffs. The `maxBlocks` hard limit remains 32768, with selection axes
+These conservative bounds cover full-context generation input and output including `minimal` reasoning. The `maxBlocks` hard limit remains 32768, with selection axes
 at most 128; a full 128³ selection cannot cause unbounded output growth. An allowance below the whole
 reservation denies the job before a paid request, including for owners. These reservations are not
 actual spend. Old unknown `111053` microUSD liabilities remain held without repricing or reset.

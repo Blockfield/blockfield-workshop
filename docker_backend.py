@@ -63,7 +63,6 @@ AI_PROVIDERS_MAX = 8
 AI_PROVIDER_BASE_URL_MAX_LEN = 200
 AI_PROVIDER_MODEL_FIELDS = (
     "generationProvider",
-    "guardProvider",
     "transcriptionProvider",
 )
 # Inbox-managed key: <workshop data>/blockfield-workshop/openrouter.key, 0600 1000:1000.
@@ -166,9 +165,6 @@ def _ai_referenced_providers(document: dict) -> set[str]:
     for field in ("generationProvider", "transcriptionProvider"):
         value = document.get(field)
         referenced.add(default if value is None else value)
-    guard = document.get("guardProvider")
-    if document.get("inputGuardEnabled", False):
-        referenced.add(default if guard is None else guard)
     if document.get("cleanupModel"):
         cleanup = document.get("cleanupProvider")
         if cleanup is None:
@@ -814,9 +810,11 @@ class DockerBackend:
         """Validated site settings; None when the file is absent. Invalid refuses.
 
         Known keys are validated (types/shape); unknown keys are ignored so a newer
-        site never bricks the gate. Missing provider/inputGuardEnabled/limits fall
-        back to the pre-provider defaults; schema, enabled and the 3 model ids are
-        required. Never logs values.
+        site never bricks the gate, and so are the retired guard-model keys
+        (guardModel, guardProvider, inputGuardEnabled) an older site still wrote.
+        Missing provider/limits fall back to the pre-provider defaults; schema,
+        enabled and the generation and transcription model ids are required.
+        Never logs values.
         """
         path = self.ai_settings_dir / AI_SITE_SETTINGS_FILE
         try:
@@ -856,9 +854,8 @@ class DockerBackend:
             os.close(fd)
         if not isinstance(document, dict):
             raise ValueError("invalid workshop AI site settings")
-        generation, guard, transcription = (
+        generation, transcription = (
             document.get("generationModel"),
-            document.get("guardModel"),
             document.get("transcriptionModel"),
         )
         providers = document.get("providers", [])
@@ -875,9 +872,6 @@ class DockerBackend:
         generation_provider = document.get("generationProvider")
         if generation_provider is None:
             generation_provider = default
-        guard_provider = document.get("guardProvider")
-        if guard_provider is None:
-            guard_provider = default
         transcription_provider = document.get("transcriptionProvider")
         if transcription_provider is None:
             transcription_provider = default
@@ -892,9 +886,7 @@ class DockerBackend:
             or not 0 <= document["revision"] <= AI_SITE_SETTINGS_REVISION_MAX
             or type(document.get("enabled")) is not bool
             or document.get("provider", "openrouter") not in known_providers
-            or type(document.get("inputGuardEnabled", False)) is not bool
             or not _valid_model(generation, generation_provider in custom_ids)
-            or not _valid_model(guard, guard_provider in custom_ids)
             or not _valid_model(transcription, transcription_provider in custom_ids)
             or any(
                 document.get(field) is not None
