@@ -216,5 +216,23 @@ class PreCommitHook(unittest.TestCase):
             )
 
 
+class WireHooksStdout(unittest.TestCase):
+    def test_wiring_notice_stays_off_stdout(self):
+        # CI captures `quality.py run ... ` stdout into $GITHUB_OUTPUT; a notice there broke it.
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
+            subprocess.run(["git", "init", "--quiet", tmp], check=True)
+            (Path(tmp) / ".githooks").mkdir()
+            out = io.StringIO()
+            with (
+                contextlib.redirect_stdout(out),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertTrue(quality.wire_hooks(Path(tmp)))
+        self.assertEqual(out.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
