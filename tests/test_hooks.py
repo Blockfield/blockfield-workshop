@@ -115,6 +115,29 @@ class PreCommitHook(unittest.TestCase):
             )
             self.assertTrue(HQ_MOD.wire_hooks(root))
 
+    def test_wire_hooks_leaves_outer_repo_alone_on_invalid_gitdir(self):
+        with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
+            outer = Path(tmp)
+            subprocess.run(["git", "init", "--quiet", tmp], check=True)
+            subprocess.run(
+                ["git", "config", "core.hooksPath", "/outer/hooks"],
+                cwd=outer,
+                check=True,
+            )
+            sub = outer / "sub"
+            sub.mkdir()
+            (sub / ".git").mkdir()  # invalid git dir: git would resolve upward
+            (sub / ".githooks").mkdir()
+            self.assertFalse(HQ_MOD.wire_hooks(sub))
+            probe = subprocess.run(
+                ["git", "config", "--local", "--get", "core.hooksPath"],
+                cwd=outer,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(probe.stdout.strip(), "/outer/hooks")
+
     def test_commit_leaves_partially_staged_files_alone(self):
         # Fail-before: the old hook formatted the worktree copy and staged it
         # whole, committing hunks the user never staged.

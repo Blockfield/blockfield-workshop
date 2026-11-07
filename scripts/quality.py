@@ -11,6 +11,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from toolchain import canonical_python, child_env, download, native, python_args, tool  # noqa: E402
 
 
+def _git(root, *args):
+    """git bound to this checkout's git dir.
+
+    An invalid `.git` entry makes git fail instead of silently resolving to
+    an outer repository (whose config we must never touch).
+    """
+    return ["git", f"--git-dir={root / '.git'}", *args]
+
+
 def wire_hooks(root=ROOT):
     """Point this checkout at the versioned hooks so pushes run the fast checks.
 
@@ -23,14 +32,14 @@ def wire_hooks(root=ROOT):
         return False
     try:
         local = subprocess.run(
-            ["git", "config", "--local", "--get", "core.hooksPath"],
+            _git(root, "config", "--local", "--get", "core.hooksPath"),
             cwd=root,
             env=child_env(),
             stdout=subprocess.PIPE,
             text=True,
             check=False,
         ).stdout.strip()
-    except OSError:
+    except (OSError, subprocess.CalledProcessError):
         return False
     if local == ".githooks":
         return True
@@ -42,23 +51,23 @@ def wire_hooks(root=ROOT):
         return False
     try:
         outer = subprocess.run(
-            ["git", "config", "--get", "core.hooksPath"],
+            _git(root, "config", "--get", "core.hooksPath"),
             cwd=root,
             env=child_env(),
             stdout=subprocess.PIPE,
             text=True,
             check=False,
         ).stdout.strip()
-    except OSError:
+    except (OSError, subprocess.CalledProcessError):
         outer = ""
     if outer:
         print(
-            f"warning: outer core.hooksPath {outer!r} does not apply here; "
-            "wiring versioned .githooks"
+            f"warning: superseding outer core.hooksPath {outer!r} with "
+            "versioned .githooks for this checkout"
         )
     try:
         subprocess.run(
-            ["git", "config", "--local", "core.hooksPath", ".githooks"],
+            _git(root, "config", "--local", "core.hooksPath", ".githooks"),
             cwd=root,
             check=True,
             env=child_env(),
@@ -496,14 +505,14 @@ def main():
             if (ROOT / ".git").exists():
                 try:
                     current = subprocess.run(
-                        ["git", "config", "--local", "--get", "core.hooksPath"],
+                        _git(ROOT, "config", "--local", "--get", "core.hooksPath"),
                         cwd=ROOT,
                         env=child_env(),
                         stdout=subprocess.PIPE,
                         text=True,
                         check=False,
                     ).stdout.strip()
-                except OSError:
+                except (OSError, subprocess.CalledProcessError):
                     current = ""
             if not current and (ROOT / ".git").exists():
                 raise SystemExit(f"just setup: cannot wire versioned hooks in {ROOT}")
