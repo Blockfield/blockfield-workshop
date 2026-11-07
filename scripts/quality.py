@@ -20,12 +20,14 @@ def _git(root, *args):
     return ["git", f"--git-dir={root / '.git'}", *args]
 
 
-def wire_hooks(root=ROOT):
+def wire_hooks(root=ROOT, strict=False):
     """Point this checkout at the versioned hooks in `.githooks`.
 
     Wires only when git would run no other hooks here: core.hooksPath unset at
     every scope and no active hook in the hooks dir. Otherwise warns and leaves
     git alone. Returns True when `.githooks` is the hooks path afterwards.
+    With strict, a failed write exits: `just setup` must not pass without
+    the hooks (pre-push runs the secret scan).
     Notices go to stderr: callers capture the stdout of `quality.py run`.
     """
     if not (root / ".git").exists() or not (root / ".githooks").is_dir():
@@ -67,8 +69,18 @@ def wire_hooks(root=ROOT):
                 file=sys.stderr,
             )
             return False
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(
+            f"warning: cannot wire versioned hooks in {root}: {error}", file=sys.stderr
+        )
+        return False
+    try:
         git("config", "--local", "core.hooksPath", ".githooks", check=True)
     except (OSError, subprocess.CalledProcessError) as error:
+        if strict:
+            raise SystemExit(
+                f"just setup: cannot wire versioned hooks in {root}: {error}"
+            )
         print(
             f"warning: cannot wire versioned hooks in {root}: {error}", file=sys.stderr
         )
@@ -486,6 +498,7 @@ def main():
     wire_hooks()
 
     if mode == "setup":
+        wire_hooks(strict=True)
         if (ROOT / "package.json").is_file():
             if (ROOT / "pnpm-lock.yaml").is_file():
                 run("pnpm", "install", "--frozen-lockfile")

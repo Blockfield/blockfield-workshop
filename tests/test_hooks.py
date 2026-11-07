@@ -242,3 +242,22 @@ class WireHooksStdout(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WireHooksStrict(unittest.TestCase):
+    def test_setup_fails_when_the_hooks_path_cannot_be_written(self):
+        # pre-push runs the secret scan: `just setup` must not pass without it.
+        import contextlib
+        import io
+
+        for module in (quality,):
+            with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
+                root = Path(tmp)
+                subprocess.run(["git", "init", "--quiet", tmp], check=True)
+                (root / ".githooks").mkdir()
+                # Left behind by an interrupted git: config writes fail.
+                (root / ".git" / "config.lock").write_text("")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertFalse(module.wire_hooks(root))
+                    with self.assertRaises(SystemExit):
+                        module.wire_hooks(root, strict=True)

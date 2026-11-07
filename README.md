@@ -21,6 +21,7 @@ staged-файлы теми же закреплёнными форматтера�
 (обход только через `--no-verify`).
 Если git уже берёт хуки из другого места (`core.hooksPath` в любом конфиге или
 активные хуки в `.git/hooks`), `just` их не трогает и только предупреждает.
+Если записать `core.hooksPath` не удалось, `just setup` завершается ошибкой.
 
 Linux проверяет весь контроллер. Windows проверяет переносимые ZIP-validator
 и journal; production-controller требует Linux, Docker Swarm и `flock`.
