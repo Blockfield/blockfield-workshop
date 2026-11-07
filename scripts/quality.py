@@ -30,6 +30,8 @@ def wire_hooks(root=ROOT, strict=False):
     must not pass without the hooks (pre-push runs the secret scan).
     Notices go to stderr: callers capture the stdout of `quality.py run`.
     """
+    # No `.githooks` (an older branch): nothing versioned to wire, so even
+    # strict setup has nothing to enforce here.
     if not (root / ".git").exists() or not (root / ".githooks").is_dir():
         return False
 
