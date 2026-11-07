@@ -1139,7 +1139,6 @@ class DockerBackendTests(unittest.TestCase):
             "revision": 3,
             "enabled": True,
             "generationModel": "meta/muse-spark-1.3-contributor",
-            "guardModel": "typesafe/jev-1.13",
             "transcriptionModel": "elevenlabs/scribe-v2",
         }
         document.update(overrides)
@@ -1189,7 +1188,6 @@ class DockerBackendTests(unittest.TestCase):
     def test_ai_site_settings_mixed_providers_per_model(self):
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
         document = self._valid_site_settings() | {
-            "inputGuardEnabled": True,
             "providers": [
                 {
                     "id": "acme-stt",
@@ -1198,21 +1196,39 @@ class DockerBackendTests(unittest.TestCase):
                 }
             ],
             "generationProvider": "openrouter",
-            "guardProvider": "vercel-gateway",
             "transcriptionProvider": "acme-stt",
         }
         self._write_site_settings(document)
         # Every referenced provider needs its own key file.
         self._write_key_file(filename="openrouter.key")
-        self._write_key_file(filename="gateway.key")
         with self.assertRaisesRegex(ValueError, "own server key"):
             self.backend._check_workshop_ai(spec)
         self._write_key_file(filename="acme-stt.key")
         self.backend._check_workshop_ai(spec)
-        # A missing guard key is refused too when the guard model is enabled.
-        (self.data["workshop"] / "blockfield-workshop/gateway.key").unlink()
-        with self.assertRaisesRegex(ValueError, "own server key"):
-            self.backend._check_workshop_ai(spec)
+
+    def test_ai_site_settings_retired_guard_fields_are_ignored(self):
+        # ws#53: an older site still writes the guard model; its keys are neither
+        # validated nor turned into a key-file requirement.
+        _, spec = self._setup_ai_fixture(enabled=False, key=False)
+        self._write_key_file()
+        self._write_site_settings(
+            self._valid_site_settings()
+            | {
+                "guardModel": "not a model!",
+                "guardProvider": "nowhere",
+                "inputGuardEnabled": "yes",
+            }
+        )
+        self.backend._check_workshop_ai(spec)
+        self._write_site_settings(
+            self._valid_site_settings()
+            | {
+                "guardModel": "typesafe/jev-1.13",
+                "guardProvider": "vercel-gateway",
+                "inputGuardEnabled": True,
+            }
+        )
+        self.backend._check_workshop_ai(spec)
 
     def test_ai_site_settings_unknown_referenced_provider_is_refused(self):
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
@@ -1316,8 +1332,6 @@ class DockerBackendTests(unittest.TestCase):
                 "providers": providers,
                 "generationProvider": "acme",
                 "generationModel": "gpt-4o-mini",
-                "guardProvider": "acme",
-                "guardModel": "gpt-4o-mini",
                 "transcriptionProvider": "acme",
                 "transcriptionModel": "gpt-4o-mini",
                 "cleanupModel": "gpt-4o-mini",
@@ -1339,7 +1353,6 @@ class DockerBackendTests(unittest.TestCase):
             "preset native generation": self._valid_site_settings(
                 generationModel="gpt-4o-mini"
             ),
-            "preset native guard": self._valid_site_settings(guardModel="gpt-4o-mini"),
             "preset native transcription": self._valid_site_settings(
                 transcriptionModel="gpt-4o-mini"
             ),
@@ -1410,11 +1423,9 @@ class DockerBackendTests(unittest.TestCase):
         document = self._valid_site_settings() | {
             "provider": "openrouter",
             "generationProvider": "openrouter",
-            "guardProvider": "openrouter",
             "transcriptionProvider": "openrouter",
             "cleanupModel": "vendor/tidy-1",
             "cleanupProvider": "openrouter",
-            "inputGuardEnabled": False,
             "maxBlocks": 16384,
             "blocksPerTick": 2048,
             "minimumBuildTicks": 80,
@@ -1497,12 +1508,11 @@ class DockerBackendTests(unittest.TestCase):
                 self.backend._check_workshop_ai(spec)
 
     def test_ai_site_settings_tolerant_schema(self):
-        # The site writes 17 keys; the gate validates known keys and ignores the rest.
+        # The gate validates known keys and ignores the rest.
         _, spec = self._setup_ai_fixture(enabled=False, key=False)
         self._write_key_file()
         site_document = self._valid_site_settings() | {
             "provider": "openrouter",
-            "inputGuardEnabled": False,
             "maxBlocks": 16384,
             "blocksPerTick": 2048,
             "minimumBuildTicks": 80,
@@ -1513,7 +1523,7 @@ class DockerBackendTests(unittest.TestCase):
             "generationMaxPricePromptUsdPerM": 0.1,
             "generationMaxPriceCompletionUsdPerM": 0.2,
         }
-        self.assertEqual(len(site_document), 17)
+        self.assertEqual(len(site_document), 15)
         self._write_site_settings(site_document)
         self.backend._check_workshop_ai(spec)
         # Unknown keys from a newer site never brick the gate.
@@ -1522,12 +1532,9 @@ class DockerBackendTests(unittest.TestCase):
         # Pre-provider documents still pass with the default provider's key.
         self._write_site_settings(self._valid_site_settings())
         self.backend._check_workshop_ai(spec)
-        # Free-form models: no transcription/guard family allowlists.
+        # Free-form models: no transcription family allowlist.
         self._write_site_settings(
-            self._valid_site_settings(
-                guardModel="custom/guard-1",
-                transcriptionModel="custom/stt-2",
-            )
+            self._valid_site_settings(transcriptionModel="custom/stt-2")
         )
         self.backend._check_workshop_ai(spec)
         valid = site_document
@@ -1543,7 +1550,6 @@ class DockerBackendTests(unittest.TestCase):
             "revision bool": self._valid_site_settings(revision=True),
             "enabled string": self._valid_site_settings(enabled="true"),
             "unknown provider": dict(valid, provider="cliproxy"),
-            "input guard string": dict(valid, inputGuardEnabled="false"),
             "generation without slash": self._valid_site_settings(
                 generationModel="gpt-4"
             ),
@@ -1556,9 +1562,6 @@ class DockerBackendTests(unittest.TestCase):
             ),
             "generation too long": self._valid_site_settings(
                 generationModel="a" * 64 + "/" + "b" * 64
-            ),
-            "guard too long": self._valid_site_settings(
-                guardModel="typesafe/jev-" + "x" * 120
             ),
             "maxBlocks 0": dict(valid, maxBlocks=0),
             "maxBlocks float": dict(valid, maxBlocks=16.5),
