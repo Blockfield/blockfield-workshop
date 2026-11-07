@@ -14,6 +14,12 @@ just format
 just python workshopctl.py --help
 ```
 
+Версионированные хуки (`.githooks` через `core.hooksPath`): pre-commit форматирует
+staged-файлы теми же закреплёнными форматтерами (`just format-staged`, без Gradle)
+и пере-stage'ит их, поэтому коммит всегда отформатирован. Хуки включаются
+автоматически при любом `just`-вызове: свежий клон получает хуки на первом `just`
+(обход только через `--no-verify`).
+
 Linux проверяет весь контроллер. Windows проверяет переносимые ZIP-validator
 и journal; production-controller требует Linux, Docker Swarm и `flock`.
 Запуск стенда — только через workspace и с проверкой владельцев процессов.
