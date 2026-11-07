@@ -28,6 +28,11 @@ format *args:
     sys.argv = ["scripts/quality.py", "format", *sys.argv[1:]]
     runpy.run_path("scripts/quality.py", run_name="__main__")
 
+format-staged *args:
+    import runpy, sys
+    sys.argv = ["scripts/quality.py", "format-staged", *sys.argv[1:]]
+    runpy.run_path("scripts/quality.py", run_name="__main__")
+
 test *args:
     import runpy, sys
     sys.argv = ["scripts/quality.py", "test", *sys.argv[1:]]

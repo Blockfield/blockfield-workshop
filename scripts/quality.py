@@ -11,6 +11,75 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from toolchain import canonical_python, child_env, download, native, python_args, tool  # noqa: E402
 
 
+def _git(root, *args):
+    """git bound to this checkout's git dir.
+
+    An invalid `.git` entry makes git fail instead of silently resolving to
+    an outer repository (whose config we must never touch).
+    """
+    return ["git", f"--git-dir={root / '.git'}", *args]
+
+
+def wire_hooks(root=ROOT):
+    """Point this checkout at the versioned hooks in `.githooks`.
+
+    Wires only when git would run no other hooks here: core.hooksPath unset at
+    every scope and no active hook in the hooks dir. Otherwise warns and leaves
+    git alone. Returns True when `.githooks` is the hooks path afterwards.
+    Notices go to stderr: callers capture the stdout of `quality.py run`.
+    """
+    if not (root / ".git").exists() or not (root / ".githooks").is_dir():
+        return False
+
+    def git(*args, check=False):
+        return subprocess.run(
+            _git(root, *args),
+            cwd=root,
+            env=child_env(),
+            stdout=subprocess.PIPE,
+            text=True,
+            check=check,
+        )
+
+    try:
+        current = git("config", "--get", "core.hooksPath").stdout.strip()
+        if current == ".githooks":
+            return True
+        if current:
+            print(
+                f"warning: keeping core.hooksPath {current!r}; "
+                "versioned .githooks not wired",
+                file=sys.stderr,
+            )
+            return False
+        hooks = (
+            root / git("rev-parse", "--git-path", "hooks", check=True).stdout.strip()
+        )
+        active = (
+            sorted(p.name for p in hooks.iterdir() if not p.name.endswith(".sample"))
+            if hooks.is_dir()
+            else []
+        )
+        if active:
+            print(
+                f"warning: keeping active hooks {', '.join(active)} in {hooks}; "
+                "versioned .githooks not wired",
+                file=sys.stderr,
+            )
+            return False
+        git("config", "--local", "core.hooksPath", ".githooks", check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(
+            f"warning: cannot wire versioned hooks in {root}: {error}", file=sys.stderr
+        )
+        return False
+    print(
+        "commits and pushes now run the versioned .githooks (bypass: --no-verify)",
+        file=sys.stderr,
+    )
+    return True
+
+
 def run(*args, capture=False, input=None, cwd=ROOT):
     name = str(args[0])
     if name in (
@@ -205,6 +274,114 @@ def formatting(files, write=False):
         run("just", "--fmt", *([] if write else ["--check"]))
 
 
+def staged_files():
+    """Staged, still-present worktree files, repo-relative (empty outside commits)."""
+    try:
+        staged = run(
+            "git",
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMR",
+            "--",
+            capture=True,
+        )
+    except subprocess.CalledProcessError:
+        return []
+    return sorted({n for n in staged.split("\0") if n and (ROOT / n).is_file()})
+
+
+def format_staged():
+    """Format the staged files with the same pinned formatters `format-check`
+    uses, and re-stage them. Files with unstaged edits are skipped with a
+    warning (formatting the worktree copy would stage unreviewed hunks), so
+    only fully staged files are re-added. No Gradle.
+
+    Per-file writers (prettier, ruff, GJF, ...) run only on staged files;
+    repo-wide steps (npm format, cargo fmt, just --fmt) run only when a file
+    in their scope is staged. Repo-wide steps may reformat other worktree
+    files of the same type, but those are never staged by this hook.
+    """
+    files = staged_files()
+    if not files:
+        return
+    # Fail closed: if the worktree diff cannot be read, the hook must stop
+    # the commit rather than risk staging unreviewed hunks.
+    worktree = run(
+        "git",
+        "diff",
+        "--name-only",
+        "-z",
+        "--",
+        capture=True,
+    )
+    dirty = {n for n in worktree.split("\0") if n} & set(files)
+    if dirty:
+        print(
+            "pre-commit: skipping partially staged files "
+            "(format them after staging, or unstage first):\n"
+            + "\n".join(f"  {n}" for n in sorted(dirty))
+        )
+        files = [f for f in files if f not in dirty]
+        if not files:
+            return
+    staged = set(files)
+    eol()
+    each(
+        ["ruff", "format"],
+        [f for f in files if f.endswith(".py")],
+    )
+    java = [f for f in files if f.endswith(".java")]
+    if java:
+        jar = download(
+            "google-java-format-1.36.1-all-deps.jar",
+            "https://repo.maven.apache.org/maven2/com/google/googlejavaformat/google-java-format/1.36.1/google-java-format-1.36.1-all-deps.jar",
+            "25b400f003089d23cc5320cdaf1a16cabee19b8aa3434d0ff021b3d9f42154b4",
+        )
+        each(
+            ["java", "-jar", jar, "--aosp", "--replace"],
+            java,
+        )
+    each(
+        ["shfmt", "-i", "4", "-ci", "-w"],
+        [f for f in files if f.endswith(".sh")],
+    )
+    kotlin([f for f in files if f.endswith((".kt", ".kts"))], format=True)
+    if (ROOT / "go.mod").is_file():
+        each(
+            ["gofmt", "-w"],
+            [f for f in files if f.endswith(".go")],
+        )
+    if (ROOT / "Cargo.toml").is_file() and any(
+        f.endswith((".rs", ".toml")) for f in files
+    ):
+        run("cargo", "fmt", "--all")
+    if (ROOT / "package.json").is_file() and any(
+        f.endswith((".js", ".mjs", ".ts", ".tsx", ".css", ".json")) for f in files
+    ):
+        import json
+
+        if "format" in json.loads((ROOT / "package.json").read_text())["scripts"]:
+            manager = "pnpm" if (ROOT / "pnpm-lock.yaml").is_file() else "npm"
+            run(manager, "run", "format")
+    docs = [
+        f
+        for f in files
+        if f.endswith(".md")
+        or (f.startswith(".github/") and f.endswith((".yml", ".yaml")))
+    ]
+    docs.extend(
+        f
+        for f in (".mcp.json", "pnpm-workspace.yaml")
+        if f in staged and (ROOT / f).is_file()
+    )
+    each(["prettier", "--write"], docs)
+    if (ROOT / "justfile").is_file() and "justfile" in staged:
+        run("just", "--fmt")
+    run("git", "add", "--", *files)
+
+
 def gradle_command(wrapper, windows=None):
     windows = os.name == "nt" if windows is None else windows
     return wrapper.with_name("gradlew.bat") if windows else wrapper
@@ -303,6 +480,11 @@ def main():
         run(*sys.argv[2:])
         return
     files = sources()
+    # Every just entry point wires the versioned hooks first, so a fresh
+    # clone gets them on first use even when `just setup` never ran.
+    # Only sets core.hooksPath when it is unset; never fails the command.
+    wire_hooks()
+
     if mode == "setup":
         if (ROOT / "package.json").is_file():
             if (ROOT / "pnpm-lock.yaml").is_file():
@@ -372,6 +554,9 @@ def main():
         formatting(files)
     if mode == "format":
         formatting(files, write=True)
+    if mode == "format-staged":
+        format_staged()
+        return
     if mode in ("test", "check"):
         tests()
     if mode in ("compile", "check"):

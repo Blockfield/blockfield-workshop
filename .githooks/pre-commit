@@ -1,0 +1,15 @@
+#!/bin/sh
+# Versioned pre-commit formatter: formats the staged files with the repo's own
+# pinned formatters (the same ones `just format-check` uses) and re-stages
+# them, so a commit is always formatted. Staged files only, no Gradle.
+# Installed via any `just` command (git core.hooksPath). Bypass: --no-verify.
+set -eu
+cd "$(dirname "$0")/.."
+if [ -z "$(git diff --cached --name-only)" ]; then
+    exit 0
+fi
+command -v just >/dev/null 2>&1 || {
+    echo "pre-commit: 'just' not found on PATH; run just setup first" >&2
+    exit 1
+}
+just format-staged
