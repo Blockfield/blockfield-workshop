@@ -261,3 +261,17 @@ class WireHooksStrict(unittest.TestCase):
                     self.assertFalse(module.wire_hooks(root))
                     with self.assertRaises(SystemExit):
                         module.wire_hooks(root, strict=True)
+
+    def test_non_utf8_hooks_path_only_warns(self):
+        import contextlib
+        import io
+
+        for module in (quality,):
+            with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
+                root = Path(tmp)
+                subprocess.run(["git", "init", "--quiet", tmp], check=True)
+                (root / ".githooks").mkdir()
+                with (root / ".git" / "config").open("ab") as config:
+                    config.write(b"[core]\n\thooksPath = /hooks\xff\n")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertFalse(module.wire_hooks(root))
