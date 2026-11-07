@@ -32,7 +32,13 @@ def wire_hooks(root=ROOT):
         ).stdout.strip()
     except OSError:
         return False
+    if local == ".githooks":
+        return True
     if local:
+        print(
+            f"warning: keeping explicit core.hooksPath {local!r}; "
+            "versioned .githooks not wired"
+        )
         return False
     try:
         outer = subprocess.run(
@@ -57,9 +63,10 @@ def wire_hooks(root=ROOT):
             check=True,
             env=child_env(),
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"warning: cannot wire versioned hooks in {root}: {error}")
         return False
-    print("git pushes now run the versioned pre-commit hook (bypass: --no-verify)")
+    print("commits run the versioned pre-commit hook (bypass: --no-verify)")
     return True
 
 
@@ -289,17 +296,16 @@ def format_staged():
     files = staged_files()
     if not files:
         return
-    try:
-        worktree = run(
-            "git",
-            "diff",
-            "--name-only",
-            "-z",
-            "--",
-            capture=True,
-        )
-    except subprocess.CalledProcessError:
-        worktree = ""
+    # Fail closed: if the worktree diff cannot be read, the hook must stop
+    # the commit rather than risk staging unreviewed hunks.
+    worktree = run(
+        "git",
+        "diff",
+        "--name-only",
+        "-z",
+        "--",
+        capture=True,
+    )
     dirty = {n for n in worktree.split("\0") if n} & set(files)
     if dirty:
         print(
@@ -486,7 +492,21 @@ def main():
             ) as output:
                 output.write(str(ROOT / ".cache/quality/npm/node_modules/.bin") + "\n")
         if (ROOT / ".githooks").is_dir() and not wire_hooks():
-            raise SystemExit(f"just setup: cannot wire versioned hooks in {ROOT}")
+            current = ""
+            if (ROOT / ".git").exists():
+                try:
+                    current = subprocess.run(
+                        ["git", "config", "--local", "--get", "core.hooksPath"],
+                        cwd=ROOT,
+                        env=child_env(),
+                        stdout=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    ).stdout.strip()
+                except OSError:
+                    current = ""
+            if not current and (ROOT / ".git").exists():
+                raise SystemExit(f"just setup: cannot wire versioned hooks in {ROOT}")
         return
     if mode in ("dev", "start", "test-postgres"):
         if (ROOT / "package.json").is_file():
