@@ -223,6 +223,59 @@ class WorkshopctlTests(unittest.TestCase):
         gate = json.loads((self.root / "gate/gate.json").read_bytes())
         self.assertEqual(gate["backends"]["game"]["gate"], "public")
 
+    def test_step_runs_cp_sync_when_configured(self):
+        self.ctl("request", "game", "--release", "v1.0.0")
+        calls = []
+
+        class FakeSync:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def sync(self, controller):
+                calls.append(controller)
+                return {"applied": 0, "rejected": 0, "acked": 0}
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "BLOCKFIELD_CP_URL": "https://cp.invalid",
+                    "BLOCKFIELD_CP_AGENT_ID": "workshop-test",
+                    "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                },
+            ),
+            mock.patch("cp_client.CPClient", FakeSync),
+        ):
+            code, state = self.ctl("step")
+        self.assertEqual((code, state["phase"]), (0, "STARTING"))
+        self.assertEqual(len(calls), 1)
+
+    def test_cp_failure_does_not_block_reconcile(self):
+        self.ctl("request", "game", "--release", "v1.0.0")
+
+        class BrokenSync:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def sync(self, controller):
+                raise RecursionError("boom")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "BLOCKFIELD_CP_URL": "https://cp.invalid",
+                    "BLOCKFIELD_CP_AGENT_ID": "workshop-test",
+                    "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                },
+            ),
+            mock.patch("cp_client.CPClient", BrokenSync),
+        ):
+            code, state = self.ctl("step")
+        self.assertEqual((code, state["phase"]), (0, "STARTING"))
+        gate = json.loads((self.root / "gate/gate.json").read_bytes())
+        self.assertEqual(gate["backends"]["game"]["gate"], "public")
+
     def test_step_requires_explicit_initial_target_import(self):
         self.assertEqual(self.ctl("step")[1]["phase"], "UNINITIALIZED")
         self.assertEqual(self.backend.events, [])
