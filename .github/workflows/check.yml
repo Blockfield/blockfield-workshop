@@ -15,8 +15,8 @@ on:
   # Merge-tree note: review runs test the head tree, not the merge ref. That
   # is safe only paired with branch protection "require up to date" (an
   # up-to-date merge == the head tree) plus the main-push same-tree check,
-  # which runs full CI whenever a merge produces a tree no green PR run
-  # tested.
+  # which runs full CI whenever a merge produces a tree no green run
+  # tested. The controller image workflow stays unconditional.
   pull_request_review:
     types: [submitted]
   # Maintainer-only manual override (no bot verdict needed): run it from the
@@ -33,6 +33,7 @@ on:
   workflow_call:
 permissions:
   contents: read
+  actions: read # decide looks up the green check run for this tree
   pull-requests: read # bot-gate reads blockfield-review-bot verdicts on the head SHA
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
@@ -103,14 +104,41 @@ jobs:
             echo "sha_match=$sha_match"
             echo "sha=$HEAD_SHA"
           } >> "$GITHUB_OUTPUT"
+  decide:
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'decide (skipped review)' || 'decide' }}
+    # Same gate as bot-gate: a non-approving or non-bot review must not start
+    # a runner here either. Push, manual-dispatch and reusable-call runs always run.
+    if: github.event_name != 'pull_request_review' || (github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tested: ${{ steps.same.outputs.tested }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Main pushes usually merge a tree a green review run already tested.
+      # Review runs check out the head SHA, so the recorded tree is the head tree.
+      # The branch filter keeps the release merge (next->main) inside the
+      # run-list window; anything else failing the lookup runs full CI.
+      - name: Check for green run of the same tree
+        id: same
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tested=$(scripts/ci-same-tree.sh check.yml next)
+          echo "tested=$tested" >> "$GITHUB_OUTPUT"
   check:
     name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'check (skipped review)' || 'check' }}
     # Main pushes, maintainer dispatches and reusable-workflow calls always
     # run; PR heads run only on a gate permit for the exact head SHA.
+    # Main pushes additionally skip re-verification when a green run already
+    # tested this tree (the release merge next->main is the common case).
     # `always()` keeps push/call CI working even though `bot-gate` is skipped
     # off review events.
-    needs: [bot-gate]
-    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (needs.bot-gate.outputs.verdict == 'permit' && needs.bot-gate.outputs.sha_match == 'true'))
+    needs: [bot-gate, decide]
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (needs.bot-gate.outputs.verdict == 'permit' && needs.bot-gate.outputs.sha_match == 'true')) && needs.decide.outputs.tested != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -134,3 +162,21 @@ jobs:
       - run: python -I -X utf8 scripts/toolchain.py --ci
       - run: just setup
       - run: just check
+      # Records the exact tree this green run tested, so a merge whose tree a
+      # green review run already tested can skip re-verification (the lookup
+      # compares trees, so all shapes dedupe correctly).
+      - name: Record tested merge tree
+        id: tree
+        if: github.event_name == 'pull_request_review' || github.event_name == 'workflow_dispatch'
+        run: |
+          tree=$(git rev-parse "HEAD^{tree}")
+          echo "$tree" > tested-tree.txt
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+      - name: Upload tested merge tree
+        if: github.event_name == 'pull_request_review' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tested-tree-${{ steps.tree.outputs.tree }}
+          path: tested-tree.txt
+          retention-days: 7
+          if-no-files-found: error
