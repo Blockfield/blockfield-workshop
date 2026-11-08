@@ -1006,6 +1006,52 @@ class CPClientTests(unittest.TestCase):
         result = self.client(transport).sync(self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
 
+    def test_failed_gate_report_blocks_effective_ack(self):
+        """A members op whose gate leg cannot be delivered is applied locally
+        but never ACKed effective; the retry delivers and ACKs."""
+        from controller import member as member_fn
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        op = members_op(
+            {"draslId": DRASL, "name": "Nether"},
+            [dict(ADMIN), {"draslId": STRANGER, "name": "Stranger", "role": "builder"}],
+        )
+        envelope = frame(op, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        # Held: applied locally, nothing ACKed, cursor unmoved.
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        self.assertTrue(self.controller.gate_report_pending())
+        self.assertTrue((self.dir / "state" / "gate_pending.json").exists())
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        # Members are committed even though the ACK is held.
+        self.assertEqual(
+            {m["draslId"] for m in self.controller.members()},
+            {
+                member_fn({**ADMIN, "role": "builder"})["draslId"],
+                STRANGER,
+            },
+        )
+        # Next pass with a working reporter delivers the leg, then ACKs
+        # the retried op effective.
+        gate = GateStubTransport(revision=0)
+        self.controller.gate_reporter = GateReporter(
+            "https://cp.invalid", "gate-token", transport=gate
+        )
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertIn("effective", [ack["state"] for ack in transport.acks])
+        self.assertFalse(self.controller.gate_report_pending())
+        self.assertFalse((self.dir / "state" / "gate_pending.json").exists())
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 1)
+
     def test_stranger_message_rejected_without_acl(self):
         stranger = {
             "kind": "message",

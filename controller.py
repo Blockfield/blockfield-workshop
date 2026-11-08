@@ -346,6 +346,13 @@ class Controller:
                 os.chmod(path, 0o755)
             ensure_workshop_key(self.admin_dir / "workshop.key")
         self.backend = backend
+        # Gate-report delivery state (unit CPP3-R2): _export only stages the
+        # desired CP leg; delivery runs after the controller lock is released.
+        # The sidecar persists the undelivered leg across restarts (members
+        # live in a sidecar too; state.json carries no export-only fields).
+        self._gate_pending_file = self.directory / "gate_pending.json"
+        self._pending_gate_leg: dict | None = None
+        self._last_delivered_gate_leg: dict | None = None
 
     def _now_ms(self) -> int:
         return int(self._now() * 1000)
@@ -404,6 +411,13 @@ class Controller:
             yield
         finally:
             os.close(fd)
+        # After the file lock is released: deliver any staged gate leg. The
+        # report is blocking HTTPS and must never run under the lock, or a
+        # stalled CP stalls request/cancel/step with BUSY.
+        try:
+            self._flush_gate_report()
+        except Exception as error:
+            print(f"controller: gate flush failed: {error!r}", file=sys.stderr)
 
     def _read(self) -> dict:
         # Every state observation sees catalog updates: the long-running loop
@@ -1173,30 +1187,138 @@ class Controller:
             self._replace_if_changed(
                 self.admin_dir / "status.json", status, keep=("updatedAt",)
             )
-        self._report_gate(workshop_gate)
+        self._stage_gate_report(workshop_gate)
 
-    def _report_gate(self, workshop_gate: dict) -> None:
-        """Report the gate leg to CP when a gate reporter is configured.
+    @staticmethod
+    def _project_gate_leg(workshop_gate: dict) -> dict:
+        """CP-projected leg (state/message/plain members, no roles or maps)."""
+        return {
+            "state": workshop_gate["gate"],
+            "message": workshop_gate["message"],
+            "allowed": [
+                {"draslId": entry["draslId"], "name": entry["name"]}
+                for entry in workshop_gate["allowed"]
+            ],
+        }
 
-        Best-effort: a failed report never breaks the file exports, and the
-        reporter sends no write when the leg is unchanged. CP only accepts
-        the projected shape (state/message/plain members, no roles or maps).
-        """
+    def _stage_gate_report(self, workshop_gate: dict) -> None:
+        """Stage the desired leg under the lock; delivery happens after unlock."""
         if getattr(self, "gate_reporter", None) is None:
             return
+        leg = self._project_gate_leg(workshop_gate)
+        if leg == self._last_delivered_gate_leg:
+            self._pending_gate_leg = None
+            self._unlink_pending_gate_file_if(leg)
+            return
+        if leg == self._pending_gate_leg:
+            return
+        self._pending_gate_leg = leg
         try:
-            self.gate_reporter.report(
-                {
-                    "state": workshop_gate["gate"],
-                    "message": workshop_gate["message"],
-                    "allowed": [
-                        {"draslId": entry["draslId"], "name": entry["name"]}
-                        for entry in workshop_gate["allowed"]
-                    ],
-                }
+            atomic_write(
+                self._gate_pending_file,
+                json.dumps(leg, ensure_ascii=False, sort_keys=True).encode(),
             )
-        except Exception as error:
-            print(f"controller: gate report failed: {error!r}", file=sys.stderr)
+        except OSError as error:
+            print(f"controller: gate pending write failed: {error!r}", file=sys.stderr)
+
+    def gate_report_pending(self) -> bool:
+        """True while a desired leg is staged but not yet delivered to CP."""
+        if getattr(self, "gate_reporter", None) is None:
+            return False
+        if self._pending_gate_leg is not None:
+            return True
+        return self._read_pending_gate_file() is not None
+
+    def _read_pending_gate_file(self) -> dict | None:
+        try:
+            document = json.loads(self._gate_pending_file.read_bytes()[:65536])
+        except (OSError, ValueError):
+            return None
+        if (
+            not isinstance(document, dict)
+            or type(document.get("state")) is not str
+            or type(document.get("message")) is not str
+            or not isinstance(document.get("allowed"), list)
+            or any(
+                not isinstance(entry, dict)
+                or type(entry.get("draslId")) is not str
+                or type(entry.get("name")) is not str
+                for entry in document["allowed"]
+            )
+        ):
+            try:
+                self._gate_pending_file.unlink()
+            except OSError:
+                pass
+            return None
+        return {
+            "state": document["state"],
+            "message": document["message"],
+            "allowed": [
+                {"draslId": entry["draslId"], "name": entry["name"]}
+                for entry in document["allowed"]
+            ],
+        }
+
+    def _unlink_pending_gate_file_if(self, leg: dict) -> None:
+        """Remove the sidecar only when it still holds the delivered leg."""
+        try:
+            if json.loads(self._gate_pending_file.read_bytes()[:65536]) != leg:
+                return
+            self._gate_pending_file.unlink()
+        except (OSError, ValueError):
+            pass
+
+    def _flush_gate_report(self) -> None:
+        """Deliver the staged leg. Callers must not hold the controller lock.
+
+        The last-delivered cache skips the transport entirely when the leg is
+        unchanged. A failed report keeps the pending marker (retried on the
+        next step); a concurrent stage mid-report loops so the newest leg is
+        delivered last and the server converges on it.
+        """
+        force = False
+        while True:
+            leg = self._pending_gate_leg
+            if leg is None:
+                leg = self._read_pending_gate_file()
+                if leg is None:
+                    return
+                self._pending_gate_leg = leg
+            if leg == self._last_delivered_gate_leg and not force:
+                self._pending_gate_leg = None
+                self._unlink_pending_gate_file_if(leg)
+                return
+            reporter = getattr(self, "gate_reporter", None)
+            if reporter is None:
+                # Reporting disabled: nothing to deliver to; drop the marker
+                # so CP ops are not held forever.
+                self._pending_gate_leg = None
+                try:
+                    self._gate_pending_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return
+            last_before = self._last_delivered_gate_leg
+            try:
+                reporter.report(leg)
+            except Exception as error:
+                print(f"controller: gate report failed: {error!r}", file=sys.stderr)
+                return
+            current = self._pending_gate_leg
+            if current == leg and self._last_delivered_gate_leg == last_before:
+                self._last_delivered_gate_leg = leg
+                self._pending_gate_leg = None
+                self._unlink_pending_gate_file_if(leg)
+                return
+            newest = current if current is not None else self._last_delivered_gate_leg
+            self._last_delivered_gate_leg = leg
+            if newest is None:
+                self._pending_gate_leg = None
+                self._unlink_pending_gate_file_if(leg)
+                return
+            self._pending_gate_leg = newest
+            force = True
 
     @staticmethod
     def _replace_if_changed(path: Path, document, keep: tuple) -> None:
@@ -1470,6 +1592,11 @@ class Controller:
         STARTING has a deadline and may restore a previous Workshop/test goal. A missing
         process after a durable start never proves that the accepted start was cancelled.
         """
+        # Retry an undelivered gate leg before anything else, outside the lock.
+        try:
+            self._flush_gate_report()
+        except Exception as error:
+            print(f"controller: gate flush failed: {error!r}", file=sys.stderr)
         with self._locked():
             try:
                 state = self._read()
@@ -2036,7 +2163,15 @@ class Controller:
                 operation_id,
                 {"draslId": principal["draslId"], "name": principal["name"]},
             )
-        return {"kind": "cancel", "revision": self.cancel()["revision"]}
+        try:
+            return {"kind": "cancel", "revision": self.cancel()["revision"]}
+        except ValueError as error:
+            if "nothing to cancel" not in str(error):
+                raise
+            # Idempotent retry: a previous pass already cancelled (its gate
+            # report may still be pending); a first-attempt no-op is a vacuous
+            # success, like a no-op wake.
+            return {"kind": "cancel", "revision": self._read()["revision"]}
 
     def process_inbox(self, now_ms: int | None = None) -> int:
         """Apply admin requests from the site, oldest first; each one gets exactly one result file.

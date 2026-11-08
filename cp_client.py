@@ -769,6 +769,15 @@ class CPClient:
                 rejected += 1
                 acked += 1
             else:
+                # Fail-closed gate delivery: a members/gate op whose leg is
+                # still undelivered is never ACKed effective. Hold the cursor
+                # and retry the whole pass later (like lock contention above),
+                # so a narrowing change cannot read effective while CP still
+                # admits the old leg.
+                if result.get("kind") in ("members", "message", "wake", "cancel"):
+                    pending_gate = getattr(controller, "gate_report_pending", None)
+                    if callable(pending_gate) and pending_gate():
+                        break
                 # CP only advances the durable cursor across contiguous
                 # receipts in state order, so walk it explicitly.
                 terminal = "applied" if result.get("started") is True else "effective"

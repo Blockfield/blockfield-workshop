@@ -574,6 +574,88 @@ class GateReportTests(unittest.TestCase):
         document = json.loads((self.dir / "gate.json").read_text())
         self.assertEqual(document["backends"]["workshop"]["gate"], "starting")
 
+    def test_slow_report_does_not_hold_lock(self):
+        """A stalled gate report must not hold controller.lock: a second
+        request commits while the first report is still in flight."""
+        calls = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        class SlowReporter:
+            def report(self, leg):
+                calls.append(dict(leg))
+                if len(calls) == 1:
+                    entered.set()
+                    assert release.wait(10), "stalled report released too early"
+                return {"reported": True, "revision": len(calls)}
+
+        self.controller.gate_reporter = SlowReporter()
+        worker = threading.Thread(
+            target=self.controller.set_members,
+            args=(
+                [
+                    {
+                        "draslId": DRASL,
+                        "name": "Builder1",
+                        "role": "builder",
+                        "maps": ["hub"],
+                    }
+                ],
+            ),
+        )
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(10))
+            # The members change committed and is now stalled in HTTPS outside
+            # the lock: a request still goes through while it is stalled.
+            self.controller.request(
+                str(uuid4()), self.goal, self.controller.status()["revision"]
+            )
+            self.assertTrue(worker.is_alive())
+            wanted = {
+                "state": "starting",
+                "message": self.controller.message,
+                "allowed": [{"draslId": DRASL, "name": "Builder1"}],
+            }
+            self.assertEqual(calls[-1], wanted)
+        finally:
+            release.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        # The newest leg is delivered last, so the server converges on it.
+        self.assertEqual(calls[-1], wanted)
+        self.assertFalse(self.controller.gate_report_pending())
+        self.assertFalse((self.dir / "state" / "gate_pending.json").exists())
+
+    def test_unchanged_leg_skips_transport(self):
+        from test_cp_client import GateStubTransport
+
+        from cp_client import GateReporter
+
+        leg = {"state": "starting", "message": DEFAULT_MESSAGE, "allowed": []}
+        transport = GateStubTransport(revision=7, value=dict(leg))
+        gets = {"n": 0}
+        orig_get = transport.get_json
+
+        def counting_get(url, timeout):
+            gets["n"] += 1
+            return orig_get(url, timeout)
+
+        transport.get_json = counting_get
+        self.controller.gate_reporter = GateReporter(
+            "https://cp.invalid", "gate-token", transport=transport
+        )
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.assertEqual(gets["n"], 1)
+        self.assertEqual(transport.patches, [])
+        # Stable steps re-export without touching the transport at all.
+        self.controller.step()
+        self.controller.step()
+        self.assertEqual(gets["n"], 1)
+        self.assertFalse(self.controller.gate_report_pending())
+
 
 if __name__ == "__main__":
     unittest.main()
