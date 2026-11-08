@@ -717,10 +717,14 @@ class Controller:
                 state = self._read()
             except Exception as read_error:
                 # state.json unreadable or invalid: the members commit above
-                # is live but the desired leg is unknown. Fail closed: stage
-                # a closed leg so the pending marker holds any effective ACK
-                # until it is delivered. A staging failure is commit-then-fail
-                # (hold and converge on retry, never rejected or effective).
+                # is live but the desired leg is unknown. Fail closed: narrow
+                # the local gate first (a removed member must stop being
+                # admitted even before the closed leg is delivered), then
+                # stage a closed leg so the pending marker holds any
+                # effective ACK until it is delivered. A staging failure is
+                # commit-then-fail (hold and converge on retry, never
+                # rejected or effective).
+                self._narrow_unreadable_gate_best_effort()
                 try:
                     self._stage_closed_gate_report()
                 except OSError as stage_error:
@@ -785,7 +789,14 @@ class Controller:
             # is commit-then-fail (message re-apply is idempotent, so the op
             # holds and converges on retry, never rejected or effective); a
             # local-write failure parks ERROR visibly.
-            state = self._read()
+            try:
+                state = self._read()
+            except Exception as read_error:
+                # The message commit above is live but the desired leg is
+                # unknown: hold and converge on retry, never rejected.
+                raise CommitIncompleteError(
+                    f"message commit is live but state could not be read: {read_error}"
+                ) from read_error
             try:
                 self._export(state)
             except CommitIncompleteError:
@@ -1333,6 +1344,22 @@ class Controller:
         except Exception:
             pass
 
+    def _narrow_unreadable_gate_best_effort(self) -> None:
+        """Narrow the on-disk gate for the unreadable-state path. Best
+        effort: never raises. Forces the workshop entry closed (Game entry
+        preserved) so a just-removed member stops being admitted locally."""
+        try:
+            gate_doc = json.loads(self.gate_file.read_bytes()[:65536])
+        except Exception:
+            gate_doc = None
+        try:
+            public = json.loads(self.public_file.read_bytes()[:65536])
+        except Exception:
+            public = None
+        if not isinstance(gate_doc, dict) or not isinstance(public, dict):
+            return
+        self._write_closed_gate_best_effort(gate_doc, public)
+
     def _drive_error_after_commit(self, state: dict, error: Exception) -> None:
         """Persist ERROR after a post-commit derivative failure. Best effort:
         never raises. Writes state.json directly: routing through _write
@@ -1741,8 +1768,19 @@ class Controller:
                 # commit-then-fail): the first attempt may have committed
                 # without staging. Re-export so the retry stages instead of
                 # ACKing an undelivered leg; the stage dedups an identical
-                # already-staged leg, so this never churns seqs.
-                self._export(state)
+                # already-staged leg, so this never churns seqs. A staging
+                # failure is commit-then-fail (the committed selection
+                # stands): hold, never a bare OSError that sync would store
+                # as terminal rejected.
+                try:
+                    self._export(state)
+                except CommitIncompleteError:
+                    raise
+                except OSError as error:
+                    raise CommitIncompleteError(
+                        f"committed {operation!r} selection already stored"
+                        f" but its gate leg was not staged: {error}"
+                    ) from error
             return state
         if type(expected_revision) is not int or expected_revision != state["revision"]:
             raise ValueError("stale state revision")

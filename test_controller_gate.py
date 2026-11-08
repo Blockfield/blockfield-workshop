@@ -785,6 +785,105 @@ class GateReportTests(unittest.TestCase):
             {"state": "closed", "message": self.controller.message, "allowed": []},
         )
 
+    def test_unreadable_state_narrows_local_gate_before_staging(self):
+        """Edge (a) / I1: members commit live but state.json unreadable. The
+        staged closed leg alone is not enough: gate.json/public.json must
+        narrow BEFORE staging, or a just-removed member is still admitted
+        locally until the next successful export. Fail-before: the old code
+        stages without touching the local gate (builder still admitted)."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        admin = {
+            "draslId": DRASL,
+            "name": "Nether",
+            "role": "admin",
+            "maps": ["hub"],
+        }
+        builder = {
+            "draslId": "bb" * 16,
+            "name": "Builder1",
+            "role": "builder",
+            "maps": ["hub"],
+        }
+        self.controller.set_members([admin, builder])
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.controller.step()
+        self.backend.ready(self.goal)
+        self.controller.step()
+        gate = json.loads((self.dir / "gate.json").read_text())
+        self.assertIn(
+            "bb" * 16,
+            {entry["draslId"] for entry in gate["backends"]["workshop"]["allowed"]},
+        )
+        # Corrupt the state file, then remove the member while CP is down.
+        (self.dir / "state" / "state.json").write_bytes(b"{corrupt")
+        self.controller.set_members([admin])
+        gate = json.loads((self.dir / "gate.json").read_text())
+        self.assertNotIn(
+            "bb" * 16,
+            {entry["draslId"] for entry in gate["backends"]["workshop"]["allowed"]},
+        )
+        public = json.loads((self.dir / "public.json").read_text())
+        self.assertEqual(public["workshop"]["mode"], "maintenance")
+        # The closed leg is still staged (the hold below effective).
+        self.assertTrue(self.controller.gate_report_pending())
+        record = json.loads((self.dir / "state" / "gate_pending.json").read_text())
+        self.assertEqual(
+            record["leg"],
+            {"state": "closed", "message": self.controller.message, "allowed": []},
+        )
+
+    def test_duplicate_request_staging_failure_raises_commit_incomplete(self):
+        """Edge (b) / I3: same-op retry re-exports to stage the committed
+        selection. A staging OSError there is commit-then-fail (the first
+        attempt's selection stands): CommitIncompleteError so sync holds,
+        never a bare OSError that sync would store as terminal rejected.
+        Fail-before: the old code lets the OSError escape."""
+        from controller import CommitIncompleteError
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        operation = str(uuid4())
+        revision = self.controller.status()["revision"]
+        real_atomic_write = Controller._stage_gate_leg.__globals__["atomic_write"]
+
+        def fail_pending(path, *args, **kwargs):
+            if Path(path).name == "gate_pending.json":
+                raise OSError("ENOSPC")
+            return real_atomic_write(path, *args, **kwargs)
+
+        with mock.patch("controller.atomic_write", side_effect=fail_pending):
+            # First attempt commits the selection, then fails staging.
+            with self.assertRaises(CommitIncompleteError):
+                self.controller.request(operation, self.goal, revision)
+            # Same-op retry re-exports the committed selection: a still-bad
+            # staging write must hold too, never escape as a bare OSError.
+            with self.assertRaises(CommitIncompleteError):
+                self.controller.request(operation, self.goal, revision)
+
+    def test_set_message_read_failure_holds_after_commit(self):
+        """Edge (c) / I3: message.json committed but state.json unreadable.
+        The op holds (CommitIncompleteError; message re-apply is idempotent)
+        instead of escaping as a read ValueError/OSError that sync would
+        store as terminal rejected. Fail-before: the old code raises the
+        raw read error."""
+        from controller import CommitIncompleteError
+
+        self.controller.set_message("hello")
+        (self.dir / "state" / "state.json").write_bytes(b"{corrupt")
+        with self.assertRaises(CommitIncompleteError):
+            self.controller.set_message("again")
+        self.assertEqual(self.controller.message, "again")
+
     def test_delivered_leg_replaces_stale_sidecar(self):
         """leg == delivered.leg with a stale pending record: staging replaces
         it with the delivered leg under gate_state.lock (the stale leg is
