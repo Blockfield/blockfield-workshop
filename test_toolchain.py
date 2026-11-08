@@ -67,15 +67,16 @@ class ToolchainScript(unittest.TestCase):
 
 class JavaHome(unittest.TestCase):
     def test_shim_ahead_of_jdk_picks_jdk(self):
+        java_name = "java.exe" if os.name == "nt" else "java"
         with tempfile.TemporaryDirectory() as tmp:
             shim = Path(tmp) / "shim"
             shim.mkdir()
-            fake = shim / "java"
+            fake = shim / java_name
             fake.write_text("#!/bin/sh\nexit 3\n")
             fake.chmod(0o755)
             home = Path(tmp) / "jdk"
             (home / "bin").mkdir(parents=True)
-            real = home / "bin" / "java"
+            real = home / "bin" / java_name
             real.write_text("#!/bin/sh\nexit 0\n")
             real.chmod(0o755)
             (home / "release").write_text('JAVA_VERSION="21"\n')
@@ -88,14 +89,15 @@ class JavaHome(unittest.TestCase):
     def test_launcher_in_bin_ahead_of_jdk_picks_jdk(self):
         # A non-symlink launcher in some other bin/ (chocolatey bin\java.exe,
         # ~/.local/bin/java) has a bin/java beside it but no JDK `release`.
+        java_name = "java.exe" if os.name == "nt" else "java"
         with tempfile.TemporaryDirectory() as tmp:
             launcher = Path(tmp) / "local" / "bin"
             launcher.mkdir(parents=True)
-            (launcher / "java").write_text("#!/bin/sh\nexit 3\n")
-            (launcher / "java").chmod(0o755)
+            (launcher / java_name).write_text("#!/bin/sh\nexit 3\n")
+            (launcher / java_name).chmod(0o755)
             home = Path(tmp) / "jdk"
             (home / "bin").mkdir(parents=True)
-            real = home / "bin" / "java"
+            real = home / "bin" / java_name
             real.write_text("#!/bin/sh\nexit 0\n")
             real.chmod(0o755)
             (home / "release").write_text('JAVA_VERSION="21"\n')
@@ -104,3 +106,19 @@ class JavaHome(unittest.TestCase):
             env.pop("JAVA_HOME", None)
             with unittest.mock.patch.dict(os.environ, env, clear=True):
                 self.assertEqual(java_home(), real.resolve().parents[1])
+
+    def test_wrapper_only_path_returns_none(self):
+        # Wrapper scripts with no JDK `release` on PATH: the vendored core
+        # runs the wrapper from the filtered PATH with JAVA_HOME unset.
+        java_name = "java.exe" if os.name == "nt" else "java"
+        with tempfile.TemporaryDirectory() as tmp:
+            shims = Path(tmp) / "shims"
+            shims.mkdir()
+            wrapper = shims / java_name
+            wrapper.write_text("#!/bin/sh\nexit 0\n")
+            wrapper.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = str(shims)
+            env.pop("JAVA_HOME", None)
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                self.assertIsNone(java_home())

@@ -15,6 +15,7 @@ module next to it.
 import base64
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -168,12 +169,25 @@ def child_env():
     return env
 
 
+def without_java_home(environment):
+    """No JDK home: drop JAVA_HOME and the $JAVA_HOME/bin entry child_env() put first on PATH."""
+    home = environment.pop("JAVA_HOME", None)
+    if home:
+        # Only the entry child_env() prepended; the same dir may also be a real host PATH entry.
+        parts = environment.get("PATH", "").split(os.pathsep)
+        if parts and parts[0] == str(Path(home) / "bin"):
+            environment["PATH"] = os.pathsep.join(parts[1:])
+    return environment
+
+
 def jdk_env():
     """Env with the pinned Temurin 21 first: every Gradle/Java entrypoint uses
     this instead of inheriting whatever java the host PATH happens to carry."""
     environment = child_env()
-    sdk = str(java_home())
-    environment["JAVA_HOME"] = sdk
+    sdk = java_home()
+    if sdk is None:
+        return without_java_home(environment)
+    environment["JAVA_HOME"] = str(sdk)
     entries = [str(Path(sdk) / "bin"), *environment.get("PATH", "").split(os.pathsep)]
     environment["PATH"] = os.pathsep.join(
         dict.fromkeys(part for part in entries if part)
@@ -195,15 +209,24 @@ def native(name):
     ):
         sdk = java_home()
         environment = child_env()
-        environment["JAVA_HOME"] = str(sdk)
-        environment["PATH"] = os.pathsep.join(
-            dict.fromkeys([str(sdk / "bin"), *environment["PATH"].split(os.pathsep)])
-        )
-        os.environ.clear()
-        os.environ.update(environment)
-        if java_tool not in ("gradlew", "gradlew.bat"):
-            extension = ".exe" if host()[0] == "windows" else ""
-            name = sdk / "bin" / (java_tool.removesuffix(".exe") + extension)
+        if sdk is None:
+            # A repo module returns None for java from a wrapper without a JDK
+            # layout (asdf shims): run it from the filtered PATH, no JAVA_HOME.
+            without_java_home(environment)
+            os.environ.clear()
+            os.environ.update(environment)
+        else:
+            environment["JAVA_HOME"] = str(sdk)
+            environment["PATH"] = os.pathsep.join(
+                dict.fromkeys(
+                    [str(sdk / "bin"), *environment["PATH"].split(os.pathsep)]
+                )
+            )
+            os.environ.clear()
+            os.environ.update(environment)
+            if java_tool not in ("gradlew", "gradlew.bat"):
+                extension = ".exe" if host()[0] == "windows" else ""
+                name = sdk / "bin" / (java_tool.removesuffix(".exe") + extension)
     executable = shutil.which(str(name), path=child_env()["PATH"])
     if executable is None:
         raise RuntimeError(
@@ -259,8 +282,13 @@ def retried(fetch, attempts=3):
 
 
 def read_url(url):
-    with urllib.request.urlopen(url, timeout=60) as response:
-        return response.read()
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            return response.read()
+    except http.client.HTTPException as error:
+        # IncompleteRead and friends are not OSError: map them so retried()
+        # backs off and fetch() falls through to the next source.
+        raise OSError(f"{url}: {error!r}") from error
 
 
 def replace(target, data, mode=None):
@@ -654,7 +682,10 @@ def main(argv):
                 ) as output:
                     output.write("\n".join([*pinned_bins(), str(python.parent)]) + "\n")
     else:
-        call(canonical_python(), "-I", "-X", "utf8", *argv)
+        # Inherit stdout (JSON/MCP callers read it) and return the child's status.
+        return subprocess.run(
+            [native(canonical_python()), "-I", "-X", "utf8", *argv], env=child_env()
+        ).returncode
 
 
 if __name__ == "__main__":

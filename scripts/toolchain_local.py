@@ -56,9 +56,9 @@ def java_home():
         home = Path(java).resolve().parents[1]
         if (home / "release").is_file():
             return home
-    raise RuntimeError(
-        "Missing native java; install the repository's documented SDK prerequisites"
-    )
+    # No JDK layout on PATH (wrapper scripts): the vendored core runs the
+    # wrapper java from the filtered PATH with JAVA_HOME unset.
+    return None
 
 
 def python_args(args):
