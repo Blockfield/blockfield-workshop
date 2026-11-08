@@ -351,6 +351,7 @@ class Controller:
         # The sidecar persists the undelivered leg across restarts (members
         # live in a sidecar too; state.json carries no export-only fields).
         self._gate_pending_file = self.directory / "gate_pending.json"
+        self._gate_report_lock_file = self.directory / "gate_report.lock"
         self._pending_gate_leg: dict | None = None
         self._last_delivered_gate_leg: dict | None = None
 
@@ -1107,6 +1108,9 @@ class Controller:
                 "message": self.message,
                 "allowed": self.members() if members_gate else [],
             }
+        # Stage before any file write below: a failed write must still leave
+        # the leg pending (and the op below effective) instead of skipping it.
+        self._stage_gate_report(workshop_gate)
         game_gate = {
             "gate": game_status["gate"],
             "message": "" if game_status["gate"] == "public" else self.default_message,
@@ -1187,7 +1191,6 @@ class Controller:
             self._replace_if_changed(
                 self.admin_dir / "status.json", status, keep=("updatedAt",)
             )
-        self._stage_gate_report(workshop_gate)
 
     @staticmethod
     def _project_gate_leg(workshop_gate: dict) -> dict:
@@ -1208,7 +1211,12 @@ class Controller:
         leg = self._project_gate_leg(workshop_gate)
         if leg == self._last_delivered_gate_leg:
             self._pending_gate_leg = None
-            self._unlink_pending_gate_file_if(leg)
+            # Unconditional: CP already holds this leg, so any sidecar is a
+            # stale newer leg that must not be PATCHed back over it.
+            try:
+                self._gate_pending_file.unlink(missing_ok=True)
+            except OSError:
+                pass
             return
         if leg == self._pending_gate_leg:
             return
@@ -1272,20 +1280,47 @@ class Controller:
     def _flush_gate_report(self) -> None:
         """Deliver the staged leg. Callers must not hold the controller lock.
 
-        The last-delivered cache skips the transport entirely when the leg is
-        unchanged. A failed report keeps the pending marker (retried on the
-        next step); a concurrent stage mid-report loops so the newest leg is
-        delivered last and the server converges on it.
+        Serialized across processes by gate_report.lock (never the
+        controller lock): one report in flight at a time. A busy lock skips
+        instead of waiting, so a stalled report never stalls request/step;
+        the pending marker is retried by the next flush. The sidecar is the
+        cross-process truth and is re-read under the lock, so the reporter
+        sends the latest staged leg, never a stale in-memory one. A stage
+        landing mid-report leaves a newer file behind; the loop delivers it
+        last so the server converges on it.
         """
-        force = False
+        try:
+            fd = os.open(
+                self._gate_report_lock_file,
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError as error:
+            print(f"controller: gate flush failed: {error!r}", file=sys.stderr)
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # Another process is delivering; the marker stays for retry.
+                return
+            try:
+                self._flush_gate_report_locked()
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _flush_gate_report_locked(self) -> None:
+        """One drain pass; the caller holds gate_report.lock."""
         while True:
-            leg = self._pending_gate_leg
+            file_leg = self._read_pending_gate_file()
+            leg = file_leg if file_leg is not None else self._pending_gate_leg
             if leg is None:
-                leg = self._read_pending_gate_file()
-                if leg is None:
-                    return
-                self._pending_gate_leg = leg
-            if leg == self._last_delivered_gate_leg and not force:
+                self._pending_gate_leg = None
+                return
+            self._pending_gate_leg = leg
+            if leg == self._last_delivered_gate_leg:
                 self._pending_gate_leg = None
                 self._unlink_pending_gate_file_if(leg)
                 return
@@ -1299,26 +1334,18 @@ class Controller:
                 except OSError:
                     pass
                 return
-            last_before = self._last_delivered_gate_leg
             try:
                 reporter.report(leg)
             except Exception as error:
                 print(f"controller: gate report failed: {error!r}", file=sys.stderr)
                 return
-            current = self._pending_gate_leg
-            if current == leg and self._last_delivered_gate_leg == last_before:
-                self._last_delivered_gate_leg = leg
-                self._pending_gate_leg = None
-                self._unlink_pending_gate_file_if(leg)
-                return
-            newest = current if current is not None else self._last_delivered_gate_leg
             self._last_delivered_gate_leg = leg
-            if newest is None:
+            newest = self._read_pending_gate_file()
+            if newest is None or newest == leg:
                 self._pending_gate_leg = None
                 self._unlink_pending_gate_file_if(leg)
                 return
             self._pending_gate_leg = newest
-            force = True
 
     @staticmethod
     def _replace_if_changed(path: Path, document, keep: tuple) -> None:

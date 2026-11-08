@@ -612,12 +612,14 @@ class GateReportTests(unittest.TestCase):
                 str(uuid4()), self.goal, self.controller.status()["revision"]
             )
             self.assertTrue(worker.is_alive())
+            # Serialized by the report lock: exactly the first report is in
+            # flight, and the newer leg waits for it instead of racing it.
+            self.assertEqual(len(calls), 1)
             wanted = {
                 "state": "starting",
                 "message": self.controller.message,
                 "allowed": [{"draslId": DRASL, "name": "Builder1"}],
             }
-            self.assertEqual(calls[-1], wanted)
         finally:
             release.set()
             worker.join(10)
@@ -626,6 +628,143 @@ class GateReportTests(unittest.TestCase):
         self.assertEqual(calls[-1], wanted)
         self.assertFalse(self.controller.gate_report_pending())
         self.assertFalse((self.dir / "state" / "gate_pending.json").exists())
+
+    def test_write_failure_still_stages_and_blocks_ack(self):
+        """A failed file write must not skip staging: the leg stays pending
+        so sync holds the op below effective until it is delivered."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        with mock.patch.object(
+            Controller, "_replace_if_changed", side_effect=OSError("ENOSPC")
+        ):
+            self.controller.set_members(
+                [
+                    {
+                        "draslId": DRASL,
+                        "name": "Builder1",
+                        "role": "builder",
+                        "maps": ["hub"],
+                    }
+                ]
+            )
+        self.assertTrue(self.controller.gate_report_pending())
+        self.assertEqual(
+            self.controller._pending_gate_leg,
+            {"state": "closed", "message": self.controller.message, "allowed": []},
+        )
+
+    def test_delivered_leg_drops_stale_sidecar(self):
+        """leg == last-delivered must remove the sidecar unconditionally: a
+        stale file from a failed newer report must not be PATCHed back."""
+
+        class StubReporter:
+            def report(self, leg):
+                raise AssertionError("no report needed for a delivered leg")
+
+        self.controller.gate_reporter = StubReporter()
+        delivered = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+        self.controller._last_delivered_gate_leg = dict(delivered)
+        stale = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [
+                {"draslId": DRASL, "name": "Nether"},
+                {"draslId": "aa" * 16, "name": "Removed"},
+            ],
+        }
+        self.controller._gate_pending_file.write_bytes(
+            json.dumps(stale, sort_keys=True).encode()
+        )
+        self.controller._stage_gate_report(
+            {
+                "gate": "builders",
+                "message": "m",
+                "allowed": [{"draslId": DRASL, "name": "Nether", "role": "builder"}],
+            }
+        )
+        self.assertFalse(self.controller.gate_report_pending())
+        self.assertFalse(self.controller._gate_pending_file.exists())
+
+    def test_concurrent_flushes_deliver_newest_once(self):
+        """Two processes flushing at once: one report in flight (own lock),
+        and the winner sends the newest staged leg, not a stale one."""
+        newest = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+        stale = {"state": "closed", "message": "m", "allowed": []}
+        state_dir = self.dir / "state"
+        # Two processes open the same workshop directory (same state path,
+        # same sidecar, same report lock), with separate in-memory caches.
+        first = Controller(
+            state_dir,
+            FakeBackend(),
+            gate_file=self.dir / "gate.json",
+            public_file=self.dir / "public.json",
+            releases=catalog(),
+        )
+        second = Controller(
+            state_dir,
+            FakeBackend(),
+            gate_file=self.dir / "gate.json",
+            public_file=self.dir / "public.json",
+            releases=catalog(),
+        )
+        self.assertEqual(first._gate_pending_file, second._gate_pending_file)
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        in_flight = {"n": 0, "max": 0}
+        guard = threading.Lock()
+
+        class BarrierReporter:
+            def report(self, leg):
+                with guard:
+                    in_flight["n"] += 1
+                    in_flight["max"] = max(in_flight["max"], in_flight["n"])
+                    calls.append(dict(leg))
+                entered.set()
+                try:
+                    assert release.wait(15), "stalled report released too early"
+                finally:
+                    with guard:
+                        in_flight["n"] -= 1
+                return {"reported": True, "revision": 1}
+
+        first.gate_reporter = second.gate_reporter = BarrierReporter()
+        # Newest leg staged on disk; first process holds a stale in-memory leg.
+        first._gate_pending_file.write_bytes(
+            json.dumps(newest, sort_keys=True).encode()
+        )
+        first._pending_gate_leg = dict(stale)
+        worker = threading.Thread(target=first._flush_gate_report)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(15))
+            # The second flush must skip while the first report is in flight,
+            # never block and never send a second concurrent report.
+            rival = threading.Thread(target=second._flush_gate_report)
+            rival.start()
+            rival.join(5)
+            self.assertFalse(rival.is_alive(), "rival flush blocked on the report")
+            self.assertEqual(calls, [newest])
+            self.assertEqual(in_flight["max"], 1)
+        finally:
+            release.set()
+            worker.join(15)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(first._last_delivered_gate_leg, newest)
+        self.assertFalse(first.gate_report_pending())
+        self.assertFalse(first._gate_pending_file.exists())
 
     def test_unchanged_leg_skips_transport(self):
         from test_cp_client import GateStubTransport

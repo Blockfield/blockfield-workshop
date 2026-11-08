@@ -736,10 +736,34 @@ class CPClient:
                 "effective",
                 "rejected",
             ):
+                stored = receipts[operation_id]
+                pending_gate = getattr(controller, "gate_report_pending", None)
+                if (
+                    stored.get("state") == "effective"
+                    and callable(pending_gate)
+                    and pending_gate()
+                ):
+                    # Retry the delivery first (no controller lock is held
+                    # here): a pass that only replays must still converge
+                    # once CP is reachable again.
+                    flush = getattr(controller, "_flush_gate_report", None)
+                    if callable(flush):
+                        try:
+                            flush()
+                        except Exception:
+                            pass  # stays pending; the hold below retries later
+                    if pending_gate():
+                        # Leg still undelivered: re-send progress ACKs only
+                        # and hold the cursor, so effective follows delivery
+                        # instead of preceding it. The receipt is already
+                        # terminal: the op is never re-applied (cancel/wake
+                        # are not idempotent).
+                        self._replay_ack(frame, "applied", stored.get("result", "ok"))
+                        break
                 self._replay_ack(
                     frame,
-                    receipts[operation_id]["state"],
-                    receipts[operation_id].get("result", "ok"),
+                    stored["state"],
+                    stored.get("result", "ok"),
                 )
                 acked += 1
                 state["cursor"] = max(state["cursor"], sequence)
@@ -774,13 +798,24 @@ class CPClient:
                 # and retry the whole pass later (like lock contention above),
                 # so a narrowing change cannot read effective while CP still
                 # admits the old leg.
-                if result.get("kind") in ("members", "message", "wake", "cancel"):
-                    pending_gate = getattr(controller, "gate_report_pending", None)
-                    if callable(pending_gate) and pending_gate():
-                        break
                 # CP only advances the durable cursor across contiguous
                 # receipts in state order, so walk it explicitly.
                 terminal = "applied" if result.get("started") is True else "effective"
+                if result.get("kind") in ("members", "message", "wake", "cancel"):
+                    pending_gate = getattr(controller, "gate_report_pending", None)
+                    if callable(pending_gate) and pending_gate():
+                        # Persist the terminal receipt before holding: the
+                        # next pass replays ACKs from it instead of
+                        # re-applying the op (cancel/wake are not idempotent).
+                        self._store_receipt(
+                            operation_id,
+                            {
+                                "state": terminal,
+                                "sequence": sequence,
+                                "result": "ok",
+                            },
+                        )
+                        break
                 # Durable first: if an ACK post below fails, the replay path
                 # re-sends ACKs for this stored receipt instead of running the
                 # op again (cancel/wake are not idempotent).

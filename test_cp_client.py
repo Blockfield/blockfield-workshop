@@ -412,6 +412,54 @@ class CPClientTests(unittest.TestCase):
 
     # Bot-review findings below: each failed on the pre-fix code.
 
+    def test_held_cancel_not_reapplied_on_retry(self):
+        """A gate-held cancel stores its terminal receipt before holding the
+        cursor, so the next pass re-sends ACKs instead of re-applying the op
+        (a retried cancel would fence and park the workshop in ERROR)."""
+        envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+
+        class GateHeldController:
+            def __init__(self):
+                self.pending = True
+                self.applies = 0
+
+            def apply_cp_releases(self, pending):
+                return None
+
+            def members(self):
+                return [ADMIN]
+
+            def gate_report_pending(self):
+                return self.pending
+
+            def apply_cp_operation(self, operation_id, operation, acl):
+                self.applies += 1
+                return {"kind": "cancel"}
+
+        stub = GateHeldController()
+        first = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(first, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        # Same frame redelivered (cursor held): no re-apply, progress re-ACKed.
+        second = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(second, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied"],
+        )
+        # Once the leg is delivered, the replay converges on effective.
+        stub.pending = False
+        third = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(third, {"applied": 0, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks[-4:]],
+            ["received", "validated", "applied", "effective"],
+        )
+
     def test_cp_members_keeps_admin(self):
         only_builders = [
             {"draslId": DRASL, "name": "Nether", "role": "builder"},
@@ -1039,14 +1087,19 @@ class CPClientTests(unittest.TestCase):
             },
         )
         # Next pass with a working reporter delivers the leg, then ACKs
-        # the retried op effective.
+        # the op effective without re-applying it.
         gate = GateStubTransport(revision=0)
         self.controller.gate_reporter = GateReporter(
             "https://cp.invalid", "gate-token", transport=gate
         )
+        members_before = list(self.controller.members())
         result = self.client(transport).sync(self.controller)
-        self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
-        self.assertIn("effective", [ack["state"] for ack in transport.acks])
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
+        self.assertEqual(list(self.controller.members()), members_before)
         self.assertFalse(self.controller.gate_report_pending())
         self.assertFalse((self.dir / "state" / "gate_pending.json").exists())
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
