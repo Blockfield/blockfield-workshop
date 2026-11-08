@@ -41,9 +41,20 @@ def java_home():
     home = os.environ.get("JAVA_HOME", "")
     if home and (Path(home) / "bin").is_dir():
         return Path(home)
-    java = shutil.which("java")
-    if java is not None:
-        return Path(java).resolve().parents[1]
+    # Version-manager shims win a raw-PATH lookup and resolve into the
+    # manager dir: search the shim-filtered child env and accept only a
+    # candidate whose layout holds a real bin/java next to it.
+    from toolchain import child_env  # lazy: the core imports this module
+
+    for entry in child_env()["PATH"].split(os.pathsep):
+        if not entry:
+            continue
+        java = shutil.which("java", path=entry)
+        if java is None:
+            continue
+        home = Path(java).resolve().parents[1]
+        if (home / "bin" / "java").exists() or (home / "bin" / "java.exe").exists():
+            return home
     raise RuntimeError(
         "Missing native java; install the repository's documented SDK prerequisites"
     )

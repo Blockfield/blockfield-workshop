@@ -7,7 +7,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+from toolchain import java_home  # noqa: E402
 
 
 class ToolchainScript(unittest.TestCase):
@@ -59,3 +63,23 @@ class ToolchainScript(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(json.loads(output.read_text()), [42, ["space & $literal"]])
+
+
+class JavaHome(unittest.TestCase):
+    def test_shim_ahead_of_jdk_picks_jdk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = Path(tmp) / "shim"
+            shim.mkdir()
+            fake = shim / "java"
+            fake.write_text("#!/bin/sh\nexit 3\n")
+            fake.chmod(0o755)
+            home = Path(tmp) / "jdk"
+            (home / "bin").mkdir(parents=True)
+            real = home / "bin" / "java"
+            real.write_text("#!/bin/sh\nexit 0\n")
+            real.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(shim), str(home / "bin")))
+            env.pop("JAVA_HOME", None)
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(java_home(), real.resolve().parents[1])
