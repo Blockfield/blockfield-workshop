@@ -776,14 +776,18 @@ class CPClient:
                 result = controller.apply_cp_operation(
                     operation_id, operation, self._acl(state, controller)
                 )
-            except OSError:
-                # Local I/O failure (members/state commit, gate-leg staging):
-                # transient, never a rejection. Hold the cursor and retry the
-                # whole pass later (like lock contention above) instead of
-                # recording rejected or ACKing effective on an undelivered leg.
-                # (BlockingIOError is an OSError; contention stays on this path.)
+            except BlockingIOError:
+                # Transient controller lock contention: hold the cursor and
+                # retry the whole pass later instead of skipping this frame.
+                # Every mutating op takes the controller lock before any
+                # commit, so contention raises pre-commit and the retry
+                # re-applies a never-started op (cancel included).
                 break
             except Exception:
+                # Rejected, cursor advances: schema violations and permanent
+                # local I/O failures (anything but lock contention) alike. A
+                # terminal receipt is stored first, so a same-op retry replays
+                # instead of re-applying (an already-committed cancel included).
                 self._store_receipt(
                     operation_id,
                     {

@@ -953,6 +953,155 @@ class GateReportTests(unittest.TestCase):
         self.assertEqual(gets["n"], 1)
         self.assertFalse(self.controller.gate_report_pending())
 
+    def test_corrupt_pending_reads_as_pending_not_absent(self):
+        """Finding 4507647307: a truncated or schema-invalid pending record is
+        pending, not absent. The drain keeps it without sending, and the next
+        stage overwrites (heals) it."""
+        leg = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+
+        class BoomReporter:
+            def report(self, leg):
+                raise AssertionError("must not report an unreadable leg")
+
+        self.controller.gate_reporter = BoomReporter()
+        delivered_leg = {
+            "state": "closed",
+            "message": "",
+            "allowed": [],
+        }
+        for payload, delivered_seq, want_seq in (
+            (b"{truncated", None, 1),
+            (b'{"seq": "x", "leg": {}}', 4, 5),
+        ):
+            with self.subTest(payload=payload):
+                for record in (
+                    self.controller._gate_pending_file,
+                    self.controller._gate_delivered_file,
+                ):
+                    record.unlink(missing_ok=True)
+                if delivered_seq is not None:
+                    self.controller._gate_delivered_file.write_bytes(
+                        json.dumps(
+                            {"seq": delivered_seq, "leg": delivered_leg}
+                        ).encode()
+                    )
+                self.controller._gate_pending_file.write_bytes(payload)
+                self.assertTrue(self.controller.gate_report_pending())
+                self.controller._flush_gate_report()
+                self.assertTrue(self.controller._gate_pending_file.exists())
+                self.assertTrue(self.controller.gate_report_pending())
+                self.controller._stage_gate_leg(leg)
+                healed = json.loads(self.controller._gate_pending_file.read_text())
+                self.assertEqual(healed, {"seq": want_seq, "leg": leg})
+
+    def test_eio_pending_reads_as_pending(self):
+        """Finding 4507647307, read-error arm: EIO on the pending file holds
+        ACKs and keeps the marker instead of reading as absent."""
+        leg = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+
+        class BoomReporter:
+            def report(self, leg):
+                raise AssertionError("must not report an unreadable leg")
+
+        self.controller.gate_reporter = BoomReporter()
+        self.controller._gate_pending_file.write_bytes(
+            json.dumps({"seq": 2, "leg": leg}).encode()
+        )
+        real_read_bytes = Path.read_bytes
+
+        def eio_on_pending(path):
+            if path.name == "gate_pending.json":
+                raise OSError("EIO")
+            return real_read_bytes(path)
+
+        with mock.patch.object(Path, "read_bytes", eio_on_pending):
+            self.assertTrue(self.controller.gate_report_pending())
+            self.controller._flush_gate_report()
+            self.assertTrue(self.controller._gate_pending_file.exists())
+        self.assertTrue(self.controller.gate_report_pending())
+
+    def test_staging_failure_with_old_pending_raises(self):
+        """Finding 4507647314: the swallow tracks this op's staging, not any
+        older record. A pre-existing pending leg never masks a failed write
+        for the new leg."""
+        old_leg = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        self.controller._stage_gate_leg(old_leg)
+        staged = self.controller._gate_pending_file.read_bytes()
+        real_atomic_write = Controller._stage_gate_leg.__globals__["atomic_write"]
+
+        def fail_pending(path, *args, **kwargs):
+            if Path(path).name == "gate_pending.json":
+                raise OSError("ENOSPC")
+            return real_atomic_write(path, *args, **kwargs)
+
+        builder = {
+            "draslId": DRASL,
+            "name": "Builder1",
+            "role": "builder",
+            "maps": ["hub"],
+        }
+        with mock.patch("controller.atomic_write", side_effect=fail_pending):
+            with self.assertRaises(OSError):
+                self.controller.set_members([builder])
+        # The old record is untouched: nothing staged over it.
+        self.assertEqual(self.controller._gate_pending_file.read_bytes(), staged)
+
+    def test_reporter_less_drain_keeps_foreign_pending(self):
+        """Finding 4507647317: without a gate reporter the drain never unlinks
+        another process's pending record, pending reads as pending, and no
+        staging happens from here either."""
+        wanted = {
+            "gate": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether", "role": "builder"}],
+        }
+
+        class StubReporter:
+            def report(self, leg):
+                raise AssertionError("token-less test never delivers")
+
+        holder = Controller(
+            self.dir / "state",
+            FakeBackend(),
+            gate_file=self.dir / "gate.json",
+            public_file=self.dir / "public.json",
+            releases=catalog(),
+        )
+        holder.gate_reporter = StubReporter()
+        holder._stage_gate_report(wanted)
+        staged = self.controller._gate_pending_file.read_bytes()
+        self.assertNotEqual(
+            getattr(self.controller, "gate_reporter", None),
+            holder.gate_reporter,
+        )
+        # No reporter here: pending still reads as pending ...
+        self.assertTrue(self.controller.gate_report_pending())
+        # ... the drain keeps it ...
+        self.controller._flush_gate_report()
+        self.assertEqual(self.controller._gate_pending_file.read_bytes(), staged)
+        self.assertTrue(self.controller.gate_report_pending())
+        # ... and nothing stages from a process that cannot deliver.
+        self.controller._stage_gate_report(wanted)
+        self.assertEqual(self.controller._gate_pending_file.read_bytes(), staged)
+
 
 if __name__ == "__main__":
     unittest.main()

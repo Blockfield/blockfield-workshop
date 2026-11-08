@@ -274,6 +274,12 @@ def atomic_write(
         Path(temporary).unlink(missing_ok=True)
 
 
+#: Marker for a gate record file that exists but cannot be read or validated.
+#: Pending reads return it (fail closed: hold ACKs, let the next stage heal);
+#: only a missing file reads as absent.
+_UNREADABLE_GATE_RECORD = object()
+
+
 class Controller:
     def __init__(
         self,
@@ -701,13 +707,15 @@ class Controller:
                 # even if a derived export fails. Report applied (the next
                 # state change re-exports and heals this) instead of escaping,
                 # which would tell CP the change failed while it is live --
-                # but only when the desired leg was actually staged: the
+                # but only when this op's leg was actually staged: the
                 # pending marker then holds the ACK below effective. A
-                # staging failure leaves nothing pending and must raise, so
-                # the op is never ACKed effective on an undelivered leg.
+                # staging failure leaves this export unstaged (tracked per
+                # op, not inferred from any older pending record) and must
+                # raise, so the op is never ACKed effective on an undelivered
+                # leg.
                 if (
                     getattr(self, "gate_reporter", None) is not None
-                    and not self.gate_report_pending()
+                    and getattr(self, "_export_staged_gate_seq", None) is None
                 ):
                     raise
                 print(
@@ -1086,6 +1094,9 @@ class Controller:
         processes reuses one step's observation so a step probes the backend only once;
         omit it whenever the backend may have changed since the observation.
         """
+        # This export's staging outcome for set_members (None = not staged):
+        # reset here so a stale seq can never mask a failed write.
+        self._export_staged_gate_seq = None
         gate = (
             state["gate"]
             if state["gate"] in {"public", "draining", "builders", "testers"}
@@ -1257,27 +1268,38 @@ class Controller:
         Caller holds controller.lock (staging); gate_state.lock guards the
         read-modify-write of both files. The seq is one past the highest seq
         seen, so a concurrent delivery unlinks only the exact record it sent.
+        Records the covering seq in self._export_staged_gate_seq so set_members
+        can tell this op's staging from an older pending record.
         """
         with self._gate_state_locked():
             delivered = self._read_gate_record_locked(self._gate_delivered_file)
-            pending = self._read_gate_record_locked(self._gate_pending_file)
-            if pending is None and delivered is not None and delivered[1] == leg:
-                return
-            seq = (
-                max(
-                    [0]
-                    + [
-                        record[0]
-                        for record in (delivered, pending)
-                        if record is not None
-                    ]
-                )
-                + 1
+            pending = self._read_gate_record_locked(
+                self._gate_pending_file, fail_closed=True
             )
+            if pending is None and delivered is not None and delivered[1] == leg:
+                self._export_staged_gate_seq = delivered[0]
+                return
+            if pending is _UNREADABLE_GATE_RECORD:
+                # Unreadable seq: bump past delivered only. Delivery advances
+                # delivered solely on exact-seq sends, so this cannot collide.
+                seq = (delivered[0] if delivered is not None else 0) + 1
+            else:
+                seq = (
+                    max(
+                        [0]
+                        + [
+                            record[0]
+                            for record in (delivered, pending)
+                            if record is not None
+                        ]
+                    )
+                    + 1
+                )
             atomic_write(
                 self._gate_pending_file,
                 json.dumps({"seq": seq, "leg": leg}, ensure_ascii=False).encode(),
             )
+            self._export_staged_gate_seq = seq
 
     @contextmanager
     def _gate_state_locked(self):
@@ -1308,28 +1330,39 @@ class Controller:
             )
         )
 
-    def _read_gate_record_locked(self, path: Path) -> tuple[int, dict] | None:
-        """(seq, leg) from a gate record file; None when absent or invalid.
+    def _read_gate_record_locked(
+        self, path: Path, *, fail_closed: bool = False
+    ) -> tuple[int, dict] | object | None:
+        """(seq, leg) from a gate record file; None only when the file is absent.
 
-        The caller holds gate_state.lock; a corrupt file is unlinked so the
-        next stage heals it (an unreadable marker must never block delivery
-        or hold ACKs forever).
+        The caller holds gate_state.lock. With fail_closed=False (the delivered
+        file) an unreadable or invalid record is unlinked so the next stage
+        heals it, and None is returned. With fail_closed=True (the pending
+        file) an unreadable or invalid record returns _UNREADABLE_GATE_RECORD
+        instead of None and is never unlinked: a leg that cannot be read must
+        keep holding ACKs, and the next stage overwrites it.
         """
         try:
             document = json.loads(path.read_bytes()[:65536])
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return None
+        except (OSError, ValueError):
+            if not fail_closed:
+                return None
+            return _UNREADABLE_GATE_RECORD
         if (
             not isinstance(document, dict)
             or type(document.get("seq")) is not int
             or document["seq"] < 1
             or not self._valid_gate_leg(document.get("leg"))
         ):
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            return None
+            if not fail_closed:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                return None
+            return _UNREADABLE_GATE_RECORD
         leg = document["leg"]
         return (
             document["seq"],
@@ -1344,11 +1377,18 @@ class Controller:
         )
 
     def gate_report_pending(self) -> bool:
-        """True while a desired leg is staged but not yet delivered to CP."""
-        if getattr(self, "gate_reporter", None) is None:
-            return False
+        """True while a desired leg is staged but not yet delivered to CP.
+
+        Always reads the file, even without a reporter: a process that cannot
+        deliver must still hold while another process's leg is undelivered.
+        An unreadable record counts as pending (fail closed); only a missing
+        file reads as clear.
+        """
         with self._gate_state_locked():
-            return self._read_gate_record_locked(self._gate_pending_file) is not None
+            return (
+                self._read_gate_record_locked(self._gate_pending_file, fail_closed=True)
+                is not None
+            )
 
     def _flush_gate_report(self) -> None:
         """Deliver the staged leg. Callers must not hold the controller lock.
@@ -1387,19 +1427,21 @@ class Controller:
         """One drain pass; the caller holds gate_report.lock."""
         while True:
             with self._gate_state_locked():
-                record = self._read_gate_record_locked(self._gate_pending_file)
+                record = self._read_gate_record_locked(
+                    self._gate_pending_file, fail_closed=True
+                )
                 if record is None:
+                    return
+                if record is _UNREADABLE_GATE_RECORD:
+                    # Staged but unparseable: keep it (the next stage
+                    # overwrites it) and stop; never deliver what was not read.
                     return
                 seq, leg = record
             reporter = getattr(self, "gate_reporter", None)
             if reporter is None:
-                # Reporting disabled: nothing to deliver to; drop the marker
-                # so CP ops are not held forever.
-                with self._gate_state_locked():
-                    try:
-                        self._gate_pending_file.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                # Nothing can be delivered from here: keep the marker for a
+                # process holding the gate credential. Never unlink another
+                # owner's leg, never treat it as delivered.
                 return
             try:
                 reporter.report(leg)
@@ -1411,8 +1453,14 @@ class Controller:
                     self._gate_delivered_file,
                     json.dumps({"seq": seq, "leg": leg}, ensure_ascii=False).encode(),
                 )
-                current = self._read_gate_record_locked(self._gate_pending_file)
-                if current is not None and current[0] == seq:
+                current = self._read_gate_record_locked(
+                    self._gate_pending_file, fail_closed=True
+                )
+                if current is None or current is _UNREADABLE_GATE_RECORD:
+                    # Gone (impossible under the report lock) or unreadable
+                    # mid-flight: stay fail-closed, the next stage heals it.
+                    return
+                if current[0] == seq:
                     # Still the record just sent: delivered, drop it. A newer
                     # stage landing mid-report has a higher seq: loop and
                     # deliver it last so CP converges on it.
