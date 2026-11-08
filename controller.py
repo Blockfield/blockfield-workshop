@@ -280,6 +280,16 @@ def atomic_write(
 _UNREADABLE_GATE_RECORD = object()
 
 
+class CommitIncompleteError(OSError):
+    """A durable commit (state.json, members.json, message.json) is live but
+    a later derived write failed. An OSError subclass: callers that do not
+    know this class treat it as the local I/O failure it is. Callers that do
+    (sync, commit sites) must not report the op rejected — the commit stands
+    and the retry must be safe: commit sites ERROR-drive or are naturally
+    idempotent, so a retry lands on a vacuous path instead of re-applying a
+    non-idempotent op."""
+
+
 class Controller:
     def __init__(
         self,
@@ -445,6 +455,7 @@ class Controller:
                 "operation": None,
                 "desired": None,
                 "revision": 0,
+                "cancelOperation": None,
             }
         with os.fdopen(fd, "rb") as handle:
             info = os.fstat(handle.fileno())
@@ -523,6 +534,10 @@ class Controller:
         state.setdefault("since", 0)
         state.setdefault("errorMessage", None)
         state.setdefault("rollback", None)
+        # Op id of the cancel that journaled this state (None when the journal
+        # is not cancel-owned): a same-op retry is a no-op, never a re-apply.
+        # A new switch (_request_locked) builds a fresh dict without this key.
+        state.setdefault("cancelOperation", None)
         # Cold Workshop idle timer: epoch ms of continuous idleness, None while active.
         state.setdefault("idleSince", None)
         if type(state["since"]) is not int or not (
@@ -659,13 +674,26 @@ class Controller:
         if len(data) > STATE_MAX_BYTES:
             raise ValueError("controller state exceeds its bounded reader")
         atomic_write(self.file, data)
-        self._project_target(state)
-        self._project_desired(state)
-        # processes reuses the step's observation: every export of a step shares
-        # one observation, so a nested export can never be newer than the step's
-        # trailing export (stale data must not overwrite fresh gate decisions).
-        # Omit it whenever the backend may have changed since the observation.
-        self._export(state, processes=processes)
+        # Commit point: state.json above is durable. Every failure below is
+        # commit-then-fail: never a rejection (the commit stands), never a
+        # silent ghost. Local-write failures already forced the local gate
+        # closed best effort inside _export; ERROR-driving is the op sites'
+        # job (_rollback, set_members, set_message), which own their state.
+        try:
+            self._project_target(state)
+            self._project_desired(state)
+            # processes reuses the step's observation: every export of a step shares
+            # one observation, so a nested export can never be newer than the step's
+            # trailing export (stale data must not overwrite fresh gate decisions).
+            # Omit it whenever the backend may have changed since the observation.
+            self._export(state, processes=processes)
+        except CommitIncompleteError:
+            raise
+        except OSError as error:
+            raise CommitIncompleteError(
+                f"committed state r{state.get('revision')} but a derived write"
+                f" failed: {error}"
+            ) from error
 
     def members(self) -> list[dict]:
         """Missing or invalid ACL admits nobody."""
@@ -691,9 +719,15 @@ class Controller:
                 # state.json unreadable or invalid: the members commit above
                 # is live but the desired leg is unknown. Fail closed: stage
                 # a closed leg so the pending marker holds any effective ACK
-                # until it is delivered. A staging failure propagates: the op
-                # must not be ACKed effective on an undelivered leg.
-                self._stage_closed_gate_report()
+                # until it is delivered. A staging failure is commit-then-fail
+                # (hold and converge on retry, never rejected or effective).
+                try:
+                    self._stage_closed_gate_report()
+                except OSError as stage_error:
+                    raise CommitIncompleteError(
+                        "members commit is live but no leg could be staged: "
+                        f"{stage_error}"
+                    ) from stage_error
                 print(
                     f"controller: members export failed after commit ({read_error!r});"
                     " staged closed gate leg",
@@ -702,27 +736,30 @@ class Controller:
                 return members
             try:
                 self._export(state)
-            except Exception as error:
-                # The write above is the commit point: the new ACL is live
-                # even if a derived export fails. Report applied (the next
-                # state change re-exports and heals this) instead of escaping,
-                # which would tell CP the change failed while it is live --
-                # but only when this op's leg was actually staged: the
-                # pending marker then holds the ACK below effective. A
-                # staging failure leaves this export unstaged (tracked per
-                # op, not inferred from any older pending record) and must
-                # raise, so the op is never ACKed effective on an undelivered
-                # leg.
+            except CommitIncompleteError:
+                raise
+            except OSError as error:
+                # The members commit above is live even if a derived export
+                # fails. A staging failure leaves this op unstaged (tracked
+                # per op, not inferred from any older pending record): hold,
+                # never effective, and converge on retry (members re-apply is
+                # idempotent). A local-write failure never narrowed the gate:
+                # the closed best effort already ran, so park ERROR visibly.
                 if (
                     getattr(self, "gate_reporter", None) is not None
                     and getattr(self, "_export_staged_gate_seq", None) is None
                 ):
-                    raise
+                    if getattr(self, "_export_local_failed", False):
+                        self._drive_error_after_commit(state, error)
+                    raise CommitIncompleteError(
+                        f"members commit is live but its gate leg was not"
+                        f" staged: {error}"
+                    ) from error
                 print(
                     f"controller: members export failed after commit: {error!r}",
                     file=sys.stderr,
                 )
-        return members
+            return members
 
     @property
     def message(self) -> str:
@@ -744,7 +781,27 @@ class Controller:
                 )
             else:
                 self.message_file.unlink(missing_ok=True)
-            self._export(self._read())
+            # Commit point: the message file above is live. An export failure
+            # is commit-then-fail (message re-apply is idempotent, so the op
+            # holds and converges on retry, never rejected or effective); a
+            # local-write failure parks ERROR visibly.
+            state = self._read()
+            try:
+                self._export(state)
+            except CommitIncompleteError:
+                raise
+            except OSError as error:
+                if (
+                    getattr(self, "gate_reporter", None) is not None
+                    and getattr(self, "_export_staged_gate_seq", None) is None
+                ):
+                    if getattr(self, "_export_local_failed", False):
+                        self._drive_error_after_commit(state, error)
+                    raise CommitIncompleteError(
+                        "message commit is live but its gate leg was not"
+                        f" staged: {error}"
+                    ) from error
+                raise
         return self.message
 
     def status(self) -> dict:
@@ -1095,8 +1152,12 @@ class Controller:
         omit it whenever the backend may have changed since the observation.
         """
         # This export's staging outcome for set_members (None = not staged):
-        # reset here so a stale seq can never mask a failed write.
+        # reset here so a stale seq can never mask a failed write. The
+        # local-failure flag tells post-commit handlers whether the local
+        # gate narrowed (staging-only failure: hold and converge) or not
+        # (local write failure: ERROR-drive, never silently effective).
         self._export_staged_gate_seq = None
+        self._export_local_failed = False
         gate = (
             state["gate"]
             if state["gate"] in {"public", "draining", "builders", "testers"}
@@ -1145,9 +1206,9 @@ class Controller:
                 "message": self.message,
                 "allowed": self.members() if members_gate else [],
             }
-        # Stage before any file write below: a failed write must still leave
-        # the leg pending (and the op below effective) instead of skipping it.
-        self._stage_gate_report(workshop_gate)
+        # Local gate first: gate.json/public.json narrow (or close) before any
+        # pending staging or CP report. A staging failure below must never
+        # leave the wider local gate behind it.
         game_gate = {
             "gate": game_status["gate"],
             "message": "" if game_status["gate"] == "public" else self.default_message,
@@ -1180,7 +1241,6 @@ class Controller:
             "backend": "game",
             "backends": {"game": game_gate, "workshop": workshop_gate},
         }
-        self._replace_if_changed(self.gate_file, gate_doc, keep=())
         public = {
             "mode": mode,
             "message": "" if mode == "game" else self.default_message,
@@ -1194,40 +1254,105 @@ class Controller:
                 "message": self.message,
             },
         }
-        self._replace_if_changed(self.public_file, public, keep=("since",))
-        if self.admin_dir:
-            self._replace_if_changed(
-                self.admin_dir / "members.json", self.members(), keep=()
-            )
-            session = self.session()
-            if session is not None:
+        try:
+            self._replace_if_changed(self.gate_file, gate_doc, keep=())
+            self._replace_if_changed(self.public_file, public, keep=("since",))
+            if self.admin_dir:
                 self._replace_if_changed(
-                    self.admin_dir / "session.json", session, keep=()
+                    self.admin_dir / "members.json", self.members(), keep=()
                 )
-            status = {
-                "schema": 1,
-                "revision": state["revision"],
-                "operation": state.get("operation"),
-                "phase": state["phase"],
-                "gate": workshop_gate["gate"],
-                "error": state.get("error"),
-                "errorMessage": state.get("errorMessage"),
-                "since": state.get("since"),
-                "deadline": deadline,
-                "desired": state.get("desired"),
-                "selection": {
-                    key: state["selection"][key]
-                    for key in ("operation", "revision", "deferred")
+                session = self.session()
+                if session is not None:
+                    self._replace_if_changed(
+                        self.admin_dir / "session.json", session, keep=()
+                    )
+                status = {
+                    "schema": 1,
+                    "revision": state["revision"],
+                    "operation": state.get("operation"),
+                    "phase": state["phase"],
+                    "gate": workshop_gate["gate"],
+                    "error": state.get("error"),
+                    "errorMessage": state.get("errorMessage"),
+                    "since": state.get("since"),
+                    "deadline": deadline,
+                    "desired": state.get("desired"),
+                    "selection": {
+                        key: state["selection"][key]
+                        for key in ("operation", "revision", "deferred")
+                    }
+                    if state.get("selection")
+                    else None,
+                    "game": game_status,
+                    "message": self.message,
+                    "updatedAt": int(time.time() * 1000),
                 }
-                if state.get("selection")
-                else None,
-                "game": game_status,
-                "message": self.message,
-                "updatedAt": int(time.time() * 1000),
+                self._replace_if_changed(
+                    self.admin_dir / "status.json", status, keep=("updatedAt",)
+                )
+        except OSError:
+            # The local gate never narrows: force it closed best effort (the
+            # Game entry is preserved) so a narrowing change never waits on
+            # a dead disk, then let post-commit handlers ERROR-drive + raise.
+            self._export_local_failed = True
+            self._write_closed_gate_best_effort(gate_doc, public)
+            raise
+        # Stage last, after every local derivative narrowed: a staging
+        # failure raises with the local gate already narrowed, so the op is
+        # held (never effective) but never leaves the wider gate behind.
+        # Delivery itself happens only via the flush, after the lock.
+        self._stage_gate_report(workshop_gate)
+
+    def _write_closed_gate_best_effort(self, gate_doc: dict, public: dict) -> None:
+        """Narrow the local gate after a failed export write. Best effort:
+        never raises. Preserves the Game entry (only the workshop backend is
+        forced closed) so a transient export failure cannot close the Game
+        site; the proxy denies until the next export heals."""
+        try:
+            backends = gate_doc.get("backends", {})
+            closed_gate_doc = {
+                **gate_doc,
+                "backends": {
+                    **backends,
+                    "workshop": {
+                        **backends.get("workshop", {}),
+                        "gate": "closed",
+                        "allowed": [],
+                    },
+                },
             }
-            self._replace_if_changed(
-                self.admin_dir / "status.json", status, keep=("updatedAt",)
+            self._replace_if_changed(self.gate_file, closed_gate_doc, keep=())
+        except Exception:
+            pass
+        try:
+            closed_public = {
+                **public,
+                "workshop": {"mode": "maintenance", "message": self.message},
+            }
+            self._replace_if_changed(self.public_file, closed_public, keep=("since",))
+        except Exception:
+            pass
+
+    def _drive_error_after_commit(self, state: dict, error: Exception) -> None:
+        """Persist ERROR after a post-commit derivative failure. Best effort:
+        never raises. Writes state.json directly: routing through _write
+        would re-export (recursion) and the derivatives just failed."""
+        try:
+            state.update(
+                phase="ERROR",
+                gate="closed",
+                error=type(error).__name__,
+                errorMessage=str(error)[:500],
+                since=self._now_ms(),
             )
+            data = json.dumps(
+                state, ensure_ascii=False, sort_keys=True, allow_nan=False
+            ).encode()
+            if len(data) > STATE_MAX_BYTES:
+                return
+            atomic_write(self.file, data)
+        except Exception:
+            pass
 
     @staticmethod
     def _project_gate_leg(workshop_gate: dict) -> dict:
@@ -1263,11 +1388,16 @@ class Controller:
         )
 
     def _stage_gate_leg(self, leg: dict) -> None:
-        """Write pending {seq, leg}; skip only when CP already holds the leg.
+        """Write pending {seq, nonce, leg}; skip only when CP holds the leg.
 
         Caller holds controller.lock (staging); gate_state.lock guards the
-        read-modify-write of both files. The seq is one past the highest seq
-        seen, so a concurrent delivery unlinks only the exact record it sent.
+        read-modify-write of both files. The seq is one past the highest
+        readable seq; when the previous pending record is unreadable its seq
+        is unknown, so the bump may reuse a seq still in flight — the fresh
+        nonce keeps the record identity unique anyway, and the drain unlinks
+        only on an exact (seq, nonce) match, so the reused number can never
+        delete the newer record. A stage of the already-staged leg is a
+        no-op (lets duplicate requests re-export without churning seqs).
         Records the covering seq in self._export_staged_gate_seq so set_members
         can tell this op's staging from an older pending record.
         """
@@ -1276,12 +1406,20 @@ class Controller:
             pending = self._read_gate_record_locked(
                 self._gate_pending_file, fail_closed=True
             )
-            if pending is None and delivered is not None and delivered[1] == leg:
+            if pending is None and delivered is not None and delivered[2] == leg:
                 self._export_staged_gate_seq = delivered[0]
+                return
+            if (
+                pending is not None
+                and pending is not _UNREADABLE_GATE_RECORD
+                and pending[2] == leg
+            ):
+                self._export_staged_gate_seq = pending[0]
                 return
             if pending is _UNREADABLE_GATE_RECORD:
                 # Unreadable seq: bump past delivered only. Delivery advances
-                # delivered solely on exact-seq sends, so this cannot collide.
+                # delivered solely on exact-identity sends, so the reused
+                # number resolves via the fresh nonce below, never by unlink.
                 seq = (delivered[0] if delivered is not None else 0) + 1
             else:
                 seq = (
@@ -1295,9 +1433,12 @@ class Controller:
                     )
                     + 1
                 )
+            nonce = uuid4().hex
             atomic_write(
                 self._gate_pending_file,
-                json.dumps({"seq": seq, "leg": leg}, ensure_ascii=False).encode(),
+                json.dumps(
+                    {"seq": seq, "nonce": nonce, "leg": leg}, ensure_ascii=False
+                ).encode(),
             )
             self._export_staged_gate_seq = seq
 
@@ -1332,15 +1473,22 @@ class Controller:
 
     def _read_gate_record_locked(
         self, path: Path, *, fail_closed: bool = False
-    ) -> tuple[int, dict] | object | None:
-        """(seq, leg) from a gate record file; None only when the file is absent.
+    ) -> tuple[int, str, dict] | object | None:
+        """(seq, nonce, leg) from a gate record file; None only when absent.
 
-        The caller holds gate_state.lock. With fail_closed=False (the delivered
-        file) an unreadable or invalid record is unlinked so the next stage
-        heals it, and None is returned. With fail_closed=True (the pending
-        file) an unreadable or invalid record returns _UNREADABLE_GATE_RECORD
-        instead of None and is never unlinked: a leg that cannot be read must
-        keep holding ACKs, and the next stage overwrites it.
+        The (seq, nonce) pair is the record identity: every stage mints a
+        fresh nonce, and the drain unlinks only on an exact identity match,
+        so a seq reused after an unreadable read can never delete the newer
+        record. A nonce-less (pre-upgrade) record is invalid: pending reads
+        return _UNREADABLE_GATE_RECORD (fail closed, healed by next stage).
+
+        The caller holds gate_state.lock. With fail_closed=False (the
+        delivered file) an unreadable or invalid record is unlinked so the
+        next stage heals it, and None is returned. With fail_closed=True
+        invalid record returns _UNREADABLE_GATE_RECORD instead of None and
+        is never unlinked: a leg that cannot be read must keep holding ACKs,
+        and the next stage overwrites it. Delivered-identity reads also use
+        fail_closed=True: a pure read must never mutate the file.
         """
         try:
             document = json.loads(path.read_bytes()[:65536])
@@ -1354,6 +1502,8 @@ class Controller:
             not isinstance(document, dict)
             or type(document.get("seq")) is not int
             or document["seq"] < 1
+            or type(document.get("nonce")) is not str
+            or not document["nonce"]
             or not self._valid_gate_leg(document.get("leg"))
         ):
             if not fail_closed:
@@ -1366,6 +1516,7 @@ class Controller:
         leg = document["leg"]
         return (
             document["seq"],
+            document["nonce"],
             {
                 "state": leg["state"],
                 "message": leg["message"],
@@ -1389,6 +1540,28 @@ class Controller:
                 self._read_gate_record_locked(self._gate_pending_file, fail_closed=True)
                 is not None
             )
+
+    def gate_pending_identity(self) -> dict | None:
+        """{seq, nonce} of the staged-but-undelivered leg; None when absent
+        or unreadable. A pure read: never mutates the files."""
+        with self._gate_state_locked():
+            record = self._read_gate_record_locked(
+                self._gate_pending_file, fail_closed=True
+            )
+            if record is None or record is _UNREADABLE_GATE_RECORD:
+                return None
+            return {"seq": record[0], "nonce": record[1]}
+
+    def gate_delivered_identity(self) -> dict | None:
+        """{seq, nonce} of the last leg confirmed on CP; None when absent or
+        unreadable. A pure read: never mutates the files."""
+        with self._gate_state_locked():
+            record = self._read_gate_record_locked(
+                self._gate_delivered_file, fail_closed=True
+            )
+            if record is None or record is _UNREADABLE_GATE_RECORD:
+                return None
+            return {"seq": record[0], "nonce": record[1]}
 
     def _flush_gate_report(self) -> None:
         """Deliver the staged leg. Callers must not hold the controller lock.
@@ -1436,7 +1609,7 @@ class Controller:
                     # Staged but unparseable: keep it (the next stage
                     # overwrites it) and stop; never deliver what was not read.
                     return
-                seq, leg = record
+                seq, nonce, leg = record
             reporter = getattr(self, "gate_reporter", None)
             if reporter is None:
                 # Nothing can be delivered from here: keep the marker for a
@@ -1451,7 +1624,9 @@ class Controller:
             with self._gate_state_locked():
                 atomic_write(
                     self._gate_delivered_file,
-                    json.dumps({"seq": seq, "leg": leg}, ensure_ascii=False).encode(),
+                    json.dumps(
+                        {"seq": seq, "nonce": nonce, "leg": leg}, ensure_ascii=False
+                    ).encode(),
                 )
                 current = self._read_gate_record_locked(
                     self._gate_pending_file, fail_closed=True
@@ -1460,10 +1635,10 @@ class Controller:
                     # Gone (impossible under the report lock) or unreadable
                     # mid-flight: stay fail-closed, the next stage heals it.
                     return
-                if current[0] == seq:
-                    # Still the record just sent: delivered, drop it. A newer
-                    # stage landing mid-report has a higher seq: loop and
-                    # deliver it last so CP converges on it.
+                if current[0] == seq and current[1] == nonce:
+                    # Still the exact record just sent: delivered, drop it. A
+                    # newer stage landing mid-report has a different identity:
+                    # loop and deliver it last so CP converges on it.
                     try:
                         self._gate_pending_file.unlink()
                     except OSError:
@@ -1561,6 +1736,13 @@ class Controller:
                 raise ValueError(
                     "operation ID reused with different intent or release evidence"
                 )
+            if getattr(self, "gate_reporter", None) is not None:
+                # Same op retried (at-least-once delivery, or a retry after a
+                # commit-then-fail): the first attempt may have committed
+                # without staging. Re-export so the retry stages instead of
+                # ACKing an undelivered leg; the stage dedups an identical
+                # already-staged leg, so this never churns seqs.
+                self._export(state)
             return state
         if type(expected_revision) is not int or expected_revision != state["revision"]:
             raise ValueError("stale state revision")
@@ -1693,6 +1875,7 @@ class Controller:
             "rollbackSession": previous_session
             if previous_stable and previous_stable["profile"] in {"workshop", "test"}
             else None,
+            "cancelOperation": None,
             "idleSince": None,
         }
         if (
@@ -2050,11 +2233,15 @@ class Controller:
         )
         return state
 
-    def _rollback(self, state: dict, goal: Goal, reason: str) -> dict:
+    def _rollback(
+        self, state: dict, goal: Goal, reason: str, operation_id: str | None = None
+    ) -> dict:
         """Abandon the in-flight switch and reopen the gate of the previously stable profile.
 
         STARTING already stopped it, so bring it back up before declaring the profile stable again;
         if that itself fails there is no safe automatic move left, so it becomes an ERROR (root recovery).
+        operation_id keys the journal: a same-op retry of an already-committed
+        cancel is a no-op, never a second compensation run.
         """
         if state.get("rollback") is None:
             # An independently restarted backend has no switch to undo; keep waiting for readiness.
@@ -2086,6 +2273,9 @@ class Controller:
             errorMessage=reason,
             since=self._now_ms(),
             rollback=None,
+            # Key the journal on the owning cancel op (None for timeout
+            # rollbacks): a same-op retry must not compensate twice.
+            cancelOperation=operation_id,
         )
         if not pending:
             state["selection"] = {
@@ -2099,7 +2289,15 @@ class Controller:
                 "deferred": False,
             }
         # Journal the single compensation attempt before fencing/stopping/starting.
-        self._write(state)
+        # The journal is the commit point: a later derivative failure drives
+        # ERROR visibly (so a retry lands on the vacuous "nothing to cancel"
+        # path) and raises commit-then-fail (hold, never rejected) instead of
+        # letting a retry fence the restored backend a second time.
+        try:
+            self._write(state)
+        except CommitIncompleteError as error:
+            self._drive_error_after_commit(state, error)
+            raise
         if restarting:
             try:
                 self.backend.preflight(stable)
@@ -2120,16 +2318,25 @@ class Controller:
                 self._write(state)
         return state
 
-    def cancel(self) -> dict:
+    def cancel(self, operation_id: str | None = None) -> dict:
         """Unprivileged abort of a stuck switch (site -> inbox "cancel", no root): roll back now
         instead of waiting for the deadline. Only valid while a switch is actually in flight.
         With no previous stable profile (first-ever start, or a recover retry that never became
         ready) there is nothing to restore: fence anything half-started and park in ERROR so an
-        explicit request --recover can retry, instead of spinning with the gate closed."""
+        explicit request --recover can retry, instead of spinning with the gate closed.
+        operation_id keys the compensation: a same-op retry of an already
+        committed cancel returns the journaled state instead of fencing again."""
         with self._locked():
             state = self._read()
             if state.get("phase") not in {"STARTING"}:
                 raise ValueError("nothing to cancel: no switch is in progress")
+            if (
+                operation_id is not None
+                and state.get("cancelOperation") == operation_id
+            ):
+                # The compensation for this op already committed (the receipt
+                # was lost after the commit): the retry must be a no-op.
+                return state
             if not state.get("rollback"):
                 self.backend.fence_pending_starts()
                 state.update(
@@ -2142,11 +2349,19 @@ class Controller:
                     since=self._now_ms(),
                     rollback=None,
                     rollbackTarget=None,
+                    cancelOperation=operation_id,
                 )
-                self._write(state)
+                try:
+                    self._write(state)
+                except CommitIncompleteError as error:
+                    self._drive_error_after_commit(state, error)
+                    raise
                 return state
             return self._rollback(
-                state, Goal(**state["desired"]), "cancelled by admin request"
+                state,
+                Goal(**state["desired"]),
+                "cancelled by admin request",
+                operation_id=operation_id,
             )
 
     def wake(self, operation: str, actor: dict | None = None) -> dict:
@@ -2314,7 +2529,10 @@ class Controller:
                 {"draslId": principal["draslId"], "name": principal["name"]},
             )
         try:
-            return {"kind": "cancel", "revision": self.cancel()["revision"]}
+            return {
+                "kind": "cancel",
+                "revision": self.cancel(operation_id=operation_id)["revision"],
+            }
         except ValueError as error:
             if "nothing to cancel" not in str(error):
                 raise
@@ -2996,7 +3214,9 @@ class Controller:
             return None
         if kind == "cancel":
             # An admin cancels a stuck Workshop transition without root.
-            return self.cancel()["revision"]
+            # The inbox request id keys the compensation: a redelivered file
+            # after a committed cancel is a no-op, never a second fence.
+            return self.cancel(operation_id=request_id)["revision"]
         if kind in {
             "candidate",
             "publish",

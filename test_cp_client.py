@@ -1146,11 +1146,14 @@ class CPClientTests(unittest.TestCase):
         self.assertEqual(stub.applies, 1)
         self.assertEqual(second, {"applied": 0, "rejected": 0, "acked": 0})
 
-    def test_failed_cancel_staging_rejects_without_reapply(self):
-        """Finding 4507647322: a cancel whose staging write fails is rejected
-        (terminal receipt stored, cursor advances); the same-op retry replays
-        the rejection instead of running cancel again, which would take the
-        no-rollback branch, fence and park the workshop in ERROR."""
+    def test_committed_cancel_staging_holds_and_drives_error(self):
+        """Findings 4507740330/4507647322, I3: a cancel whose rollback journal
+        committed but whose staging write fails is never stored rejected (the
+        commit stands) and never re-applied (the retry would take the
+        no-rollback branch, fence and park in ERROR). Instead: the workshop
+        drives ERROR visibly, the cursor holds, and the healed retry replays
+        effective without running cancel again. Fail-before: the old code
+        stores rejected, advances, and stays STARTING."""
         from unittest import mock
 
         from controller import Goal
@@ -1187,20 +1190,146 @@ class CPClientTests(unittest.TestCase):
         transport = FakeTransport(snapshot_doc(), [envelope])
         with mock.patch("controller.atomic_write", side_effect=fail_pending):
             result = self.client(transport).sync(self.controller)
-        self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
-        # Committed once, never fenced, still STARTING: no ERROR parking.
-        self.assertEqual(self.controller.status()["phase"], "STARTING")
+        # Held, not rejected: nothing ACKed, cursor unmoved, ERROR visible,
+        # rollback never re-applied (no fence of the restored backend).
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        self.assertEqual(self.controller.status()["phase"], "ERROR")
         self.assertNotIn("fence", self.backend.events)
-        receipts = json.loads((self.dir / "state" / "cp_receipts.json").read_bytes())
-        self.assertEqual(receipts[envelope["operationId"]]["state"], "rejected")
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        # Healed retry: the same frame re-applies vacuously (phase ERROR
+        # answers "nothing to cancel") and converges effective without
+        # running cancel again.
+        transport.event_frames = [envelope]
+        second = self.client(transport).sync(self.controller)
+        self.assertEqual(second, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
+        self.assertNotIn("fence", self.backend.events)
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         self.assertEqual(state["cursor"], 1)
-        # Same frame again: consumed, cancel never re-applied.
-        with mock.patch("controller.atomic_write", side_effect=fail_pending):
-            second = self.client(transport).sync(self.controller)
-        self.assertEqual(second, {"applied": 0, "rejected": 0, "acked": 0})
-        self.assertEqual(self.controller.status()["phase"], "STARTING")
-        self.assertNotIn("fence", self.backend.events)
+
+    def test_receipt_write_failure_after_commit_holds(self):
+        """Thread 4507741042 / I3: the terminal receipt store itself can fail
+        after a cancel fully committed (journal + backend restart + export +
+        delivery). sync must not let that local write escape, advance, or
+        reject: it holds, and the healed retry converges without re-running
+        the cancel (same-op idempotency key) or fencing. Fail-before: the old
+        code lets _store_receipt raise out of sync."""
+        from unittest import mock
+
+        from controller import Goal
+        from cp_client import CPClient
+
+        session = str(uuid4())
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v1.0.0", session),
+            self.controller.status()["revision"],
+        )
+        self.controller.step()
+        self.backend.ready(Goal("workshop", "v1.0.0", session))
+        self.controller.step()
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v2.0.0", session),
+            self.controller.status()["revision"],
+        )
+        state = self.controller.step()
+        self.assertEqual(state["phase"], "STARTING")
+        gate = GateStubTransport(revision=0)
+        self.controller.gate_reporter = GateReporter(
+            "https://cp.invalid", "gate-token", transport=gate
+        )
+        envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        real_store = CPClient._store_receipt
+
+        def fail_terminal(client, operation_id, record):
+            if record.get("state") != "received":
+                raise OSError("EIO")
+            return real_store(client, operation_id, record)
+
+        with mock.patch.object(CPClient, "_store_receipt", autospec=True) as store:
+            store.side_effect = fail_terminal
+            result = self.client(transport).sync(self.controller)
+        # No raise, no ACKs, cursor held: the cancel committed exactly once.
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        fences = self.backend.events.count("fence")
+        self.assertEqual(fences, 1)
+        # Healed retry: the same frame is a no-op for the same cancel op id
+        # (no second fence), then ACKs effective and advances.
+        transport.event_frames = [envelope]
+        second = self.client(transport).sync(self.controller)
+        self.assertEqual(second, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
+        self.assertEqual(self.backend.events.count("fence"), fences)
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 1)
+
+    def test_effective_replay_requires_delivered_leg(self):
+        """I5: a held op replays effective only after its exact staged leg is
+        delivered ((seq, nonce) covering, or a newer delivered seq). A held
+        receipt whose leg is neither pending nor delivered holds instead of
+        going effective. Fail-before: the old code replays effective as soon
+        as no pending file exists."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        op = members_op(
+            {"draslId": DRASL, "name": "Nether"},
+            [dict(ADMIN), {"draslId": STRANGER, "name": "Stranger", "role": "builder"}],
+        )
+        envelope = frame(op, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        receipts = json.loads((self.dir / "state" / "cp_receipts.json").read_bytes())
+        marker = receipts[envelope["operationId"]].get("gate")
+        self.assertIs(type(marker), dict)
+        self.assertIs(type(marker["seq"]), int)
+        self.assertIs(type(marker["nonce"]), str)
+        # Tamper simulation: the pending marker is gone but the delivered
+        # record predates the held leg (it was never delivered). The retry
+        # must hold (applied-only replay), not ACK effective.
+        (self.dir / "state" / "gate_pending.json").unlink()
+        (self.dir / "state" / "gate_delivered.json").write_bytes(
+            json.dumps(
+                {
+                    "seq": marker["seq"] - 1,
+                    "nonce": "older",
+                    "leg": {
+                        "state": "closed",
+                        "message": "",
+                        "allowed": [],
+                    },
+                }
+            ).encode()
+        )
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        state["cursor"] = 0
+        (self.dir / "state" / "cp_state.json").write_bytes(json.dumps(state).encode())
+        transport.event_frames = [envelope]
+        held = self.client(transport).sync(self.controller)
+        self.assertEqual(held, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied"],
+        )
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
 
     def test_stranger_message_rejected_without_acl(self):
         stranger = {

@@ -629,39 +629,104 @@ class GateReportTests(unittest.TestCase):
         self.assertFalse(self.controller.gate_report_pending())
         self.assertFalse((self.dir / "state" / "gate_pending.json").exists())
 
-    def test_write_failure_still_stages_and_blocks_ack(self):
-        """A failed file write must not skip staging: the leg stays pending
-        so sync holds the op below effective until it is delivered."""
+    def test_local_write_failure_drives_error_and_raises(self):
+        """Finding 4507740327 / I1: the local gate is written BEFORE any
+        pending staging. When gate.json itself is unwritable during a removal,
+        the op is not swallowed: a closed best-effort gate, ERROR state, and
+        CommitIncompleteError (never effective). Fail-before: the old code
+        stages first and swallows (no raise, no ERROR)."""
+        from controller import CommitIncompleteError
 
         class BoomReporter:
             def report(self, leg):
                 raise RuntimeError("cp down")
 
         self.controller.gate_reporter = BoomReporter()
+        admin = {
+            "draslId": DRASL,
+            "name": "Nether",
+            "role": "admin",
+            "maps": ["hub"],
+        }
+        builder = {
+            "draslId": "bb" * 16,
+            "name": "Builder1",
+            "role": "builder",
+            "maps": ["hub"],
+        }
+        self.controller.set_members([admin, builder])
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.controller.step()
+        self.backend.ready(self.goal)
+        self.controller.step()
+        staged = self.controller._gate_pending_file.read_bytes()
         with mock.patch.object(
             Controller, "_replace_if_changed", side_effect=OSError("ENOSPC")
         ):
-            self.controller.set_members(
-                [
-                    {
-                        "draslId": DRASL,
-                        "name": "Builder1",
-                        "role": "builder",
-                        "maps": ["hub"],
-                    }
-                ]
-            )
+            with self.assertRaises(CommitIncompleteError):
+                self.controller.set_members([admin])
+        # The best-effort closed rewrite used the same failing writer, so no
+        # local gate file advanced; the old pending leg is untouched and the
+        # workshop parks in ERROR instead of staying open and silent.
+        self.assertEqual(self.controller._gate_pending_file.read_bytes(), staged)
         self.assertTrue(self.controller.gate_report_pending())
-        record = json.loads((self.dir / "state" / "gate_pending.json").read_text())
-        self.assertEqual(
-            record["leg"],
-            {"state": "closed", "message": self.controller.message, "allowed": []},
+        self.assertEqual(self.controller.status()["phase"], "ERROR")
+
+    def test_staging_failure_narrows_local_gate_before_raise(self):
+        """Finding 4507740327 / I1: removal + pending-write ENOSPC. The local
+        gate (gate.json, public.json) is already narrowed before the raise, so
+        a staging failure never leaves the wider gate. Fail-before: the old
+        stage-first order raises before any local write (gate.json still
+        admits the removed builder, and the error is a bare OSError)."""
+        from controller import CommitIncompleteError
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        admin = {
+            "draslId": DRASL,
+            "name": "Nether",
+            "role": "admin",
+            "maps": ["hub"],
+        }
+        builder = {
+            "draslId": "bb" * 16,
+            "name": "Builder1",
+            "role": "builder",
+            "maps": ["hub"],
+        }
+        self.controller.set_members([admin, builder])
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
         )
-        self.assertIs(type(record["seq"]), int)
+        self.controller.step()
+        self.backend.ready(self.goal)
+        self.controller.step()
+        real_atomic_write = Controller._stage_gate_leg.__globals__["atomic_write"]
+
+        def fail_pending(path, *args, **kwargs):
+            if Path(path).name == "gate_pending.json":
+                raise OSError("ENOSPC")
+            return real_atomic_write(path, *args, **kwargs)
+
+        with mock.patch("controller.atomic_write", side_effect=fail_pending):
+            with self.assertRaises(CommitIncompleteError):
+                self.controller.set_members([admin])
+        gate = json.loads((self.dir / "gate.json").read_text())
+        allowed = gate["backends"]["workshop"]["allowed"]
+        self.assertNotIn("bb" * 16, {entry["draslId"] for entry in allowed})
+        public = json.loads((self.dir / "public.json").read_text())
+        self.assertEqual(public["workshop"]["mode"], "workshop")
 
     def test_pending_write_failure_raises_instead_of_ghosting(self):
-        """A staging write failure raises: no in-memory fallback, so the op
-        is never ACKed effective on an undelivered leg (finding 4507194521)."""
+        """A staging write failure raises CommitIncompleteError (never a bare
+        ghost-ACK): the op is held below effective until the leg is staged
+        and delivered (finding 4507194521, I1/I3)."""
+        from controller import CommitIncompleteError
 
         class BoomReporter:
             def report(self, leg):
@@ -676,7 +741,7 @@ class GateReportTests(unittest.TestCase):
             return real_atomic_write(path, *args, **kwargs)
 
         with mock.patch("controller.atomic_write", side_effect=fail_pending):
-            with self.assertRaises(OSError):
+            with self.assertRaises(CommitIncompleteError):
                 self.controller.set_members(
                     [
                         {
@@ -738,7 +803,7 @@ class GateReportTests(unittest.TestCase):
             "allowed": [{"draslId": DRASL, "name": "Nether"}],
         }
         self.controller._gate_delivered_file.write_bytes(
-            json.dumps({"seq": 7, "leg": delivered_leg}, sort_keys=True).encode()
+            json.dumps({"seq": 7, "nonce": "n7", "leg": delivered_leg}).encode()
         )
         stale = {
             "state": "builders",
@@ -749,7 +814,7 @@ class GateReportTests(unittest.TestCase):
             ],
         }
         self.controller._gate_pending_file.write_bytes(
-            json.dumps({"seq": 8, "leg": stale}, sort_keys=True).encode()
+            json.dumps({"seq": 8, "nonce": "n8", "leg": stale}).encode()
         )
         self.controller._stage_gate_report(
             {
@@ -766,7 +831,10 @@ class GateReportTests(unittest.TestCase):
         self.controller._flush_gate_report()
         self.assertEqual(reported, [delivered_leg])
         delivered = json.loads(self.controller._gate_delivered_file.read_text())
-        self.assertEqual(delivered, {"seq": record["seq"], "leg": delivered_leg})
+        self.assertEqual(
+            delivered,
+            {"seq": record["seq"], "nonce": record["nonce"], "leg": delivered_leg},
+        )
         self.assertFalse(self.controller.gate_report_pending())
         self.assertFalse(self.controller._gate_pending_file.exists())
 
@@ -795,7 +863,7 @@ class GateReportTests(unittest.TestCase):
         }
         # CP holds new_leg (delivered file), desired flips back to old_leg.
         self.controller._gate_delivered_file.write_bytes(
-            json.dumps({"seq": 4, "leg": new_leg}, sort_keys=True).encode()
+            json.dumps({"seq": 4, "nonce": "n4", "leg": new_leg}).encode()
         )
         self.controller._stage_gate_report(
             {
@@ -906,6 +974,7 @@ class GateReportTests(unittest.TestCase):
             # skip (never block, never a second concurrent report).
             second._stage_gate_leg(leg_b)
             seq_b = json.loads(second._gate_pending_file.read_text())["seq"]
+            nonce_b = json.loads(second._gate_pending_file.read_text())["nonce"]
             self.assertGreater(seq_b, seq_a)
             rival = threading.Thread(target=second._flush_gate_report)
             rival.start()
@@ -920,7 +989,7 @@ class GateReportTests(unittest.TestCase):
         # The drain loop delivered the newer stage last: newest seq wins.
         self.assertEqual(calls, [leg_a, leg_b])
         delivered = json.loads(first._gate_delivered_file.read_text())
-        self.assertEqual(delivered, {"seq": seq_b, "leg": leg_b})
+        self.assertEqual(delivered, {"seq": seq_b, "nonce": nonce_b, "leg": leg_b})
         self.assertFalse(first.gate_report_pending())
         self.assertFalse(first._gate_pending_file.exists())
 
@@ -975,7 +1044,7 @@ class GateReportTests(unittest.TestCase):
         }
         for payload, delivered_seq, want_seq in (
             (b"{truncated", None, 1),
-            (b'{"seq": "x", "leg": {}}', 4, 5),
+            (b'{"seq": "x", "nonce": "n", "leg": {}}', 4, 5),
         ):
             with self.subTest(payload=payload):
                 for record in (
@@ -986,7 +1055,7 @@ class GateReportTests(unittest.TestCase):
                 if delivered_seq is not None:
                     self.controller._gate_delivered_file.write_bytes(
                         json.dumps(
-                            {"seq": delivered_seq, "leg": delivered_leg}
+                            {"seq": delivered_seq, "nonce": "nd", "leg": delivered_leg}
                         ).encode()
                     )
                 self.controller._gate_pending_file.write_bytes(payload)
@@ -996,7 +1065,10 @@ class GateReportTests(unittest.TestCase):
                 self.assertTrue(self.controller.gate_report_pending())
                 self.controller._stage_gate_leg(leg)
                 healed = json.loads(self.controller._gate_pending_file.read_text())
-                self.assertEqual(healed, {"seq": want_seq, "leg": leg})
+                self.assertEqual(healed["seq"], want_seq)
+                self.assertEqual(healed["leg"], leg)
+                self.assertIs(type(healed["nonce"]), str)
+                self.assertTrue(healed["nonce"])
 
     def test_eio_pending_reads_as_pending(self):
         """Finding 4507647307, read-error arm: EIO on the pending file holds
@@ -1013,7 +1085,7 @@ class GateReportTests(unittest.TestCase):
 
         self.controller.gate_reporter = BoomReporter()
         self.controller._gate_pending_file.write_bytes(
-            json.dumps({"seq": 2, "leg": leg}).encode()
+            json.dumps({"seq": 2, "nonce": "n2", "leg": leg}).encode()
         )
         real_read_bytes = Path.read_bytes
 
@@ -1029,9 +1101,12 @@ class GateReportTests(unittest.TestCase):
         self.assertTrue(self.controller.gate_report_pending())
 
     def test_staging_failure_with_old_pending_raises(self):
-        """Finding 4507647314: the swallow tracks this op's staging, not any
-        older record. A pre-existing pending leg never masks a failed write
-        for the new leg."""
+        """Finding 4507647314 (I3 round 6: the raise is now
+        CommitIncompleteError, a hold — never rejected, never effective):
+        the swallow tracks this op's staging, not any older record. A
+        pre-existing pending leg never masks a failed write for the new leg."""
+        from controller import CommitIncompleteError
+
         old_leg = {
             "state": "builders",
             "message": "m",
@@ -1059,7 +1134,7 @@ class GateReportTests(unittest.TestCase):
             "maps": ["hub"],
         }
         with mock.patch("controller.atomic_write", side_effect=fail_pending):
-            with self.assertRaises(OSError):
+            with self.assertRaises(CommitIncompleteError):
                 self.controller.set_members([builder])
         # The old record is untouched: nothing staged over it.
         self.assertEqual(self.controller._gate_pending_file.read_bytes(), staged)
@@ -1101,6 +1176,175 @@ class GateReportTests(unittest.TestCase):
         # ... and nothing stages from a process that cannot deliver.
         self.controller._stage_gate_report(wanted)
         self.assertEqual(self.controller._gate_pending_file.read_bytes(), staged)
+
+    def test_report_lock_holds_single_flight(self):
+        """I4 (confirm still true): a rival flush while gate_report.lock is
+        held skips instead of sending a second concurrent report; the marker
+        survives for the retry."""
+        import fcntl
+
+        leg = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+        calls = []
+
+        class CountingReporter:
+            def report(self, leg):
+                calls.append(dict(leg))
+                return {"reported": True, "revision": 1}
+
+        self.controller.gate_reporter = CountingReporter()
+        self.controller._stage_gate_leg(leg)
+        fd = os.open(
+            self.controller._gate_report_lock_file, os.O_CREAT | os.O_RDWR, 0o600
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.controller._flush_gate_report()
+            self.assertEqual(calls, [])
+            self.assertTrue(self.controller.gate_report_pending())
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        self.controller._flush_gate_report()
+        self.assertEqual(calls, [leg])
+        self.assertFalse(self.controller.gate_report_pending())
+
+    def test_in_flight_seq_reuse_never_unlinks_newer_record(self):
+        """Finding 4507740321 / I2: P1 reports (N, B) while P2 stages (N, C)
+        with a fresh nonce because the pending read failed. P1 must not unlink
+        C on the reused seq; the drain delivers C last. Fail-before: the
+        seq-only unlink drops C unsent."""
+        leg_a = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+        leg_b = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [
+                {"draslId": DRASL, "name": "Nether"},
+                {"draslId": "bb" * 16, "name": "Fresh"},
+            ],
+        }
+        state_dir = self.dir / "state"
+        first = Controller(
+            state_dir,
+            FakeBackend(),
+            gate_file=self.dir / "gate.json",
+            public_file=self.dir / "public.json",
+            releases=catalog(),
+        )
+        second = Controller(
+            state_dir,
+            FakeBackend(),
+            gate_file=self.dir / "gate.json",
+            public_file=self.dir / "public.json",
+            releases=catalog(),
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        class BarrierReporter:
+            def report(self, leg):
+                calls.append(dict(leg))
+                entered.set()
+                assert release.wait(15), "stalled report released too early"
+                return {"reported": True, "revision": 1}
+
+        first.gate_reporter = second.gate_reporter = BarrierReporter()
+        first._stage_gate_leg(leg_a)
+        worker = threading.Thread(target=first._flush_gate_report)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(15))
+            # The second stage cannot read the pending record (EIO): it must
+            # still stage under a fresh identity, never reusing the record.
+            real_read_bytes = Path.read_bytes
+
+            def eio_on_pending(path):
+                if path.name == "gate_pending.json":
+                    raise OSError("EIO")
+                return real_read_bytes(path)
+
+            with mock.patch.object(Path, "read_bytes", eio_on_pending):
+                second._stage_gate_leg(leg_b)
+            staged = json.loads(second._gate_pending_file.read_text())
+            self.assertEqual(staged["leg"], leg_b)
+            self.assertIs(type(staged["nonce"]), str)
+            self.assertTrue(staged["nonce"])
+        finally:
+            release.set()
+            worker.join(15)
+        self.assertFalse(worker.is_alive())
+        # Both legs reached CP in order; the newer record survived P1's
+        # unlink check and was delivered last.
+        self.assertEqual(calls, [leg_a, leg_b])
+        delivered = json.loads(first._gate_delivered_file.read_text())
+        self.assertEqual(delivered, staged)
+        self.assertFalse(first._gate_pending_file.exists())
+        self.assertFalse(first.gate_report_pending())
+
+    def test_stage_issues_unique_nonce_identities(self):
+        """I2: every stage mints a fresh (seq, nonce) identity; an identical
+        leg re-staged is a no-op (no churn); a nonce-less legacy record heals
+        to a nonce record on the next stage."""
+        leg_a = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+        leg_b = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [
+                {"draslId": DRASL, "name": "Nether"},
+                {"draslId": "bb" * 16, "name": "Fresh"},
+            ],
+        }
+        self.controller.gate_reporter = mock.sentinel.reporter
+        self.controller._stage_gate_leg(leg_a)
+        first = json.loads(self.controller._gate_pending_file.read_text())
+        self.assertIs(type(first["nonce"]), str)
+        self.assertTrue(first["nonce"])
+        # Identical leg: no churn, same identity.
+        self.controller._stage_gate_leg(leg_a)
+        self.assertEqual(
+            json.loads(self.controller._gate_pending_file.read_text()), first
+        )
+        # New leg: new seq, fresh nonce.
+        self.controller._stage_gate_leg(leg_b)
+        second = json.loads(self.controller._gate_pending_file.read_text())
+        self.assertGreater(second["seq"], first["seq"])
+        self.assertNotEqual(second["nonce"], first["nonce"])
+        # Legacy nonce-less record heals to a nonce record on next stage.
+        self.controller._gate_pending_file.write_bytes(
+            json.dumps({"seq": 3, "leg": leg_a}).encode()
+        )
+        self.controller._gate_delivered_file.unlink(missing_ok=True)
+        self.controller._stage_gate_leg(leg_b)
+        healed = json.loads(self.controller._gate_pending_file.read_text())
+        self.assertEqual(healed["leg"], leg_b)
+        self.assertIs(type(healed["nonce"]), str)
+        self.assertTrue(healed["nonce"])
+
+    def test_unreadable_legacy_record_holds_ack(self):
+        """I2 migration: a nonce-less pending record reads as pending (fail
+        closed), never as absent, until the next stage heals it."""
+        leg = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+        self.controller.gate_reporter = mock.sentinel.reporter
+        self.controller._gate_pending_file.write_bytes(
+            json.dumps({"seq": 3, "leg": leg}).encode()
+        )
+        self.assertTrue(self.controller.gate_report_pending())
 
 
 if __name__ == "__main__":
