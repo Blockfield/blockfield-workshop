@@ -518,6 +518,12 @@ def main(argv=None, backend_factory=None) -> int:
                 controller.export_maps()
             except Exception as error:  # the site inbox must never block reconciliation
                 print(f"workshopctl: inbox pass failed: {error!r}", file=sys.stderr)
+            try:
+                cp = getattr(controller, "cp_client", None)
+                if cp is not None:
+                    cp.sync(controller)
+            except Exception as error:  # cp must never block reconciliation
+                print(f"workshopctl: cp pass failed: {error!r}", file=sys.stderr)
             result = controller.step()
             # A switch in flight is followed every few seconds inside this run instead of once per 15 s timer tick:
             # the next phase (stopped, ready) is acted on almost at once. Bounded, so the timer stays the clock.
