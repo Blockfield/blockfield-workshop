@@ -12,11 +12,21 @@ from pathlib import Path
 
 class ToolchainScript(unittest.TestCase):
     def test_isolated_script_imports_adjacent_modules_and_preserves_arguments(self):
+        # Dispatch is `quality.py run python` (the shared toolchain core has
+        # no script wrapper; `toolchain.py <script>` no longer puts the
+        # script's directory on sys.path).
         repository = Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "installation without git"
             (root / "scripts").mkdir(parents=True)
-            for name in ("toolchain.py", "quality.py"):
+            for name in (
+                "toolchain.py",
+                "toolchain_local.py",
+                "tools.lock.json",
+                "terminal.py",
+                "dev_cache.py",
+                "quality.py",
+            ):
                 shutil.copyfile(repository / "scripts" / name, root / "scripts" / name)
             directory = Path(temporary) / "script with spaces"
             directory.mkdir()
@@ -32,25 +42,20 @@ class ToolchainScript(unittest.TestCase):
             output = directory / "result.json"
             env = os.environ.copy()
             env["PYTHONPATH"] = str(directory / "untrusted")
-            for entry in (
-                [str(root / "scripts/toolchain.py")],
-                [str(root / "scripts/quality.py"), "run", "python"],
-            ):
-                with self.subTest(entry=entry):
-                    subprocess.run(
-                        [
-                            sys.executable,
-                            *entry,
-                            str(script),
-                            str(output),
-                            "space & $literal",
-                        ],
-                        cwd=temporary,
-                        env=env,
-                        check=True,
-                        timeout=30,
-                        capture_output=True,
-                    )
-                    self.assertEqual(
-                        json.loads(output.read_text()), [42, ["space & $literal"]]
-                    )
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(root / "scripts/quality.py"),
+                    "run",
+                    "python",
+                    str(script),
+                    str(output),
+                    "space & $literal",
+                ],
+                cwd=temporary,
+                env=env,
+                check=True,
+                timeout=30,
+                capture_output=True,
+            )
+            self.assertEqual(json.loads(output.read_text()), [42, ["space & $literal"]])

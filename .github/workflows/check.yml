@@ -130,7 +130,7 @@ jobs:
           path: |
             .cache/quality
             .dev/jdk
-          key: quality-tools-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('scripts/toolchain.py', 'scripts/quality.py', 'dev/quality.py') }}
+          key: quality-tools-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/tools.lock.json', 'scripts/toolchain.py', 'scripts/toolchain_local.py', 'scripts/quality.py') }}
       - run: python -I -X utf8 scripts/toolchain.py --ci
       - run: just setup
       - run: just check

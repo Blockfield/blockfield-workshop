@@ -1,0 +1,341 @@
+{
+  "tools": {
+    "actionlint": {
+      "platforms": {
+        "linux-amd64": {
+          "kind": "tar.gz",
+          "sha256": "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+          "urls": [
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          ]
+        },
+        "linux-arm64": {
+          "kind": "tar.gz",
+          "sha256": "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6",
+          "urls": [
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_arm64.tar.gz"
+          ]
+        },
+        "windows-amd64": {
+          "kind": "zip",
+          "sha256": "6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9",
+          "urls": [
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_windows_amd64.zip"
+          ]
+        },
+        "windows-arm64": {
+          "kind": "zip",
+          "sha256": "cadcf7ea4efe3a68728893813643cebe1185e5b1d4be5b96245f65c9a4d5ea41",
+          "urls": [
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_windows_arm64.zip"
+          ]
+        }
+      },
+      "version": "1.7.12"
+    },
+    "asm": {
+      "platforms": {
+        "any": {
+          "kind": "jar",
+          "sha256": "876eab6a83daecad5ca67eb9fcabb063c97b5aeb8cf1fca7a989ecde17522051",
+          "urls": [
+            "https://repo.maven.apache.org/maven2/org/ow2/asm/asm/9.8/asm-9.8.jar",
+            "https://repo1.maven.org/maven2/org/ow2/asm/asm/9.8/asm-9.8.jar",
+            "https://maven-central.storage-download.googleapis.com/maven2/org/ow2/asm/asm/9.8/asm-9.8.jar"
+          ]
+        }
+      },
+      "version": "9.8"
+    },
+    "asm-tree": {
+      "platforms": {
+        "any": {
+          "kind": "jar",
+          "sha256": "14b7880cb7c85eed101e2710432fc3ffb83275532a6a894dc4c4095d49ad59f1",
+          "urls": [
+            "https://repo.maven.apache.org/maven2/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar",
+            "https://repo1.maven.org/maven2/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar",
+            "https://maven-central.storage-download.googleapis.com/maven2/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar"
+          ]
+        }
+      },
+      "version": "9.8"
+    },
+    "gjf": {
+      "platforms": {
+        "any": {
+          "kind": "jar",
+          "sha256": "25b400f003089d23cc5320cdaf1a16cabee19b8aa3434d0ff021b3d9f42154b4",
+          "urls": [
+            "https://repo.maven.apache.org/maven2/com/google/googlejavaformat/google-java-format/1.36.1/google-java-format-1.36.1-all-deps.jar",
+            "https://repo1.maven.org/maven2/com/google/googlejavaformat/google-java-format/1.36.1/google-java-format-1.36.1-all-deps.jar",
+            "https://maven-central.storage-download.googleapis.com/maven2/com/google/googlejavaformat/google-java-format/1.36.1/google-java-format-1.36.1-all-deps.jar"
+          ]
+        }
+      },
+      "version": "1.36.1"
+    },
+    "just": {
+      "platforms": {
+        "linux-amd64": {
+          "kind": "tar.gz",
+          "sha256": "45b548094283cb9739af8f13273b8cddeee869f5b4ef2bb631b1f311cb566155",
+          "urls": [
+            "https://github.com/casey/just/releases/download/1.57.0/just-1.57.0-x86_64-unknown-linux-musl.tar.gz"
+          ]
+        },
+        "linux-arm64": {
+          "kind": "tar.gz",
+          "sha256": "f225044a81adea6e0b3a8b9370aaf374e6af76c8735ae263ac993df55fd137ec",
+          "urls": [
+            "https://github.com/casey/just/releases/download/1.57.0/just-1.57.0-aarch64-unknown-linux-musl.tar.gz"
+          ]
+        },
+        "windows-amd64": {
+          "kind": "zip",
+          "sha256": "4c7391d17cb1d17b758b52004ee6411372b8a13ff37c3c9b9031625cb6026e09",
+          "urls": [
+            "https://github.com/casey/just/releases/download/1.57.0/just-1.57.0-x86_64-pc-windows-msvc.zip"
+          ]
+        },
+        "windows-arm64": {
+          "kind": "zip",
+          "sha256": "14ff33bbac8d2f07deda30cd3bafe7be083213cdb1c4dae7a55567d375cc17f1",
+          "urls": [
+            "https://github.com/casey/just/releases/download/1.57.0/just-1.57.0-aarch64-pc-windows-msvc.zip"
+          ]
+        }
+      },
+      "version": "1.57.0"
+    },
+    "ktlint": {
+    "platforms": {
+        "any": {
+          "kind": "raw",
+          "sha256": "a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75",
+          "urls": [
+            "https://github.com/ktlint/ktlint/releases/download/1.8.0/ktlint"
+          ]
+        }
+      },
+      "version": "1.8.0"
+    },
+    "pnpm": {
+      "platforms": {
+        "any": {
+          "integrity": "sha512-M9g8d9qC9J+6g2klxvG4QRgewxMrZwY5vQEvcHX1x89jTF+HAUfBmq50ePrAHfCdiJLogEVIlu3SPumzN1dWPA==",
+          "kind": "tgz",
+          "urls": [
+            "https://registry.npmjs.org/pnpm/-/pnpm-11.18.0.tgz",
+            "https://registry.npmmirror.com/pnpm/-/pnpm-11.18.0.tgz"
+          ]
+        }
+      },
+      "version": "11.18.0"
+    },
+    "prettier": {
+      "platforms": {
+        "any": {
+          "integrity": "sha512-7igPTM53cGHMW8xWuVTydi2KO233VFiTNyF5hLJqpilHfmn8C8gPf+PS7dUT64YcXFbiMGZxS9pCSxL/Dxm/Jw==",
+          "kind": "tgz",
+          "urls": [
+            "https://registry.npmjs.org/prettier/-/prettier-3.8.3.tgz",
+            "https://registry.npmmirror.com/prettier/-/prettier-3.8.3.tgz"
+          ]
+        }
+      },
+      "version": "3.8.3"
+    },
+    "python": {
+      "platforms": {
+        "linux-amd64": {
+          "kind": "tar.gz",
+          "sha256": "5eae8cf79dd47fc2496a4fccc892936be831ce7a84d984b2299dfb1cdb592682",
+          "urls": [
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.12.14%2B20260924-x86_64-unknown-linux-gnu-install_only.tar.gz"
+          ]
+        },
+        "linux-arm64": {
+          "kind": "tar.gz",
+          "sha256": "c0574c9c9fec561eb192ad510e4e79aaad039929b3531b3bb873e2f630fb14a9",
+          "urls": [
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.12.14%2B20260924-aarch64-unknown-linux-gnu-install_only.tar.gz"
+          ]
+        },
+        "windows-amd64": {
+          "kind": "tar.gz",
+          "sha256": "c5303174bc29f5205decf6721ac549d4eb41c448f9b8c46cbc562d00348865bb",
+          "urls": [
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.12.14%2B20260924-x86_64-pc-windows-msvc-install_only.tar.gz"
+          ]
+        },
+        "windows-arm64": {
+          "kind": "tar.gz",
+          "sha256": "394b3bf95c45e5b02e02fe9b201e51df11dbff612db5b26406c6db484581317d",
+          "urls": [
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.12.14%2B20260924-aarch64-pc-windows-msvc-install_only.tar.gz"
+          ]
+        }
+      },
+      "version": "3.12.14+20260924"
+    },
+    "rclone": {
+      "platforms": {
+        "linux-amd64": {
+          "kind": "zip",
+          "sha256": "dbee7ccd7a5d617e4ed4cd4555c16669b511abfe8d31164f61be35ac9e999bd2",
+          "urls": [
+            "https://github.com/rclone/rclone/releases/download/v1.74.3/rclone-v1.74.3-linux-amd64.zip"
+          ]
+        },
+        "linux-arm64": {
+          "kind": "zip",
+          "sha256": "8f8d47446e061f80c3256659fe8e21f56d72d96aaefe1275d088ea5eb6b42aa7",
+          "urls": [
+            "https://github.com/rclone/rclone/releases/download/v1.74.3/rclone-v1.74.3-linux-arm64.zip"
+          ]
+        },
+        "windows-amd64": {
+          "kind": "zip",
+          "sha256": "ecb0ed9006e0d1a693757007716a11dab6c2cde6dac3f2fd87da962eaa73d11d",
+          "urls": [
+            "https://github.com/rclone/rclone/releases/download/v1.74.3/rclone-v1.74.3-windows-amd64.zip"
+          ]
+        },
+        "windows-arm64": {
+          "kind": "zip",
+          "sha256": "5b6dcef9272f81caa44da9f9c216c385309b78cf53ebe1bd83a45bced50fc991",
+          "urls": [
+            "https://github.com/rclone/rclone/releases/download/v1.74.3/rclone-v1.74.3-windows-arm64.zip"
+          ]
+        }
+      },
+      "version": "1.74.3"
+    },
+    "ruff": {
+      "platforms": {
+        "linux-amd64": {
+          "kind": "wheel",
+          "sha256": "dce0896488562f09a27b9c91b1f58a097457143931f3c4d519690dea54e624c5",
+          "urls": [
+            "https://files.pythonhosted.org/packages/b0/99/66f0343176d5eab02c3f7fcd2de7a8e0dd7a41f0d982bee56cd1c24db62b/ruff-0.15.7-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+          ]
+        },
+        "linux-arm64": {
+          "kind": "wheel",
+          "sha256": "6b39329b60eba44156d138275323cc726bbfbddcec3063da57caa8a8b1d50adf",
+          "urls": [
+            "https://files.pythonhosted.org/packages/eb/5d/32b5c44ccf149a26623671df49cbfbd0a0ae511ff3df9d9d2426966a8d57/ruff-0.15.7-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+          ]
+        },
+        "windows-amd64": {
+          "kind": "wheel",
+          "sha256": "4d53d712ddebcd7dace1bc395367aec12c057aacfe9adbb6d832302575f4d3a1",
+          "urls": [
+            "https://files.pythonhosted.org/packages/2b/e9/346d4d3fffc6871125e877dae8d9a1966b254fbd92a50f8561078b88b099/ruff-0.15.7-py3-none-win_amd64.whl"
+          ]
+        },
+        "windows-arm64": {
+          "kind": "wheel",
+          "sha256": "18e8d73f1c3fdf27931497972250340f92e8c861722161a9caeb89a58ead6ed2",
+          "urls": [
+            "https://files.pythonhosted.org/packages/8f/e8/726643a3ea68c727da31570bde48c7a10f1aa60eddd628d94078fec586ff/ruff-0.15.7-py3-none-win_arm64.whl"
+          ]
+        }
+      },
+      "version": "0.15.7"
+    },
+    "shellcheck": {
+      "aliases": {
+        "windows-arm64": "windows-amd64"
+      },
+      "platforms": {
+        "linux-amd64": {
+          "kind": "tar.gz",
+          "sha256": "b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6",
+          "urls": [
+            "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz"
+          ]
+        },
+        "linux-arm64": {
+          "kind": "tar.gz",
+          "sha256": "68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc",
+          "urls": [
+            "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.aarch64.tar.gz"
+          ]
+        },
+        "windows-amd64": {
+          "kind": "zip",
+          "sha256": "8a4e35ab0b331c85d73567b12f2a444df187f483e5079ceffa6bda1faa2e740e",
+          "urls": [
+            "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.zip"
+          ]
+        }
+      },
+      "version": "0.11.0"
+    },
+    "shfmt": {
+      "aliases": {
+        "windows-arm64": "windows-amd64"
+      },
+      "platforms": {
+        "linux-amd64": {
+          "kind": "raw",
+          "sha256": "76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf",
+          "urls": [
+            "https://github.com/mvdan/sh/releases/download/v3.14.1/shfmt_v3.14.1_linux_amd64"
+          ]
+        },
+        "linux-arm64": {
+          "kind": "raw",
+          "sha256": "5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489",
+          "urls": [
+            "https://github.com/mvdan/sh/releases/download/v3.14.1/shfmt_v3.14.1_linux_arm64"
+          ]
+        },
+        "windows-amd64": {
+          "kind": "exe",
+          "sha256": "13629ce28442ca80b6b5a819f7574ab39e1c28c6e26734ca816c9714e04851df",
+          "urls": [
+            "https://github.com/mvdan/sh/releases/download/v3.14.1/shfmt_v3.14.1_windows_amd64.exe"
+          ]
+        }
+      },
+      "version": "3.14.1"
+    },
+    "temurin": {
+      "platforms": {
+        "linux-amd64": {
+          "kind": "tar.gz",
+          "sha256": "e4446ff06a276155697597cc0f1b15da004ff083f4964a35271ecee567177370",
+          "urls": [
+            "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12%2B8/OpenJDK21U-jdk_x64_linux_hotspot_21.0.12_8.tar.gz"
+          ]
+        },
+        "linux-arm64": {
+          "kind": "tar.gz",
+          "sha256": "eba38e871b02d407897bfe017ea35352dfc1420ef6d2112425b0c67325ca509d",
+          "urls": [
+            "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12%2B8/OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.12_8.tar.gz"
+          ]
+        },
+        "windows-amd64": {
+          "kind": "zip",
+          "sha256": "9ba963ee2371874a74185d18bc7bb2ab9407df7683300855ed7606e0662321d0",
+          "urls": [
+            "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12%2B8/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12_8.zip"
+          ]
+        },
+        "windows-arm64": {
+          "kind": "zip",
+          "sha256": "e7ddf1cf45885cae2cfb8a018db60b0041ef69e96843b93a92b447d9a4cba676",
+          "urls": [
+            "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12%2B8/OpenJDK21U-jdk_aarch64_windows_hotspot_21.0.12_8.zip"
+          ]
+        }
+      },
+      "version": "21.0.12+8"
+    }
+  },
+  "version": 1
+}
