@@ -14,28 +14,20 @@ if [ -n "$branch" ]; then
     filter="&branch=${branch}"
 fi
 tested=false
-for sha in $(gh api "repos/${repo}/actions/workflows/${workflow}/runs?status=success&per_page=30${filter}" --jq '.workflow_runs[].head_sha'); do
-    t=$(gh api "repos/${repo}/git/commits/${sha}" --jq '.tree.sha')
-    if [ "$t" = "$tree" ]; then
-        tested=true
+# Only the tested-tree-<tree> artifact counts: the build job uploads it after its
+# gates pass, while a run whose build job was skipped still concludes success.
+# PR runs test the merge ref, so the artifact (not head_sha) carries the tree.
+# Fork runs execute their own workflow copy, so only same-repo heads count.
+for event in pull_request pull_request_review; do
+    if [ "$tested" = true ]; then
         break
     fi
-done
-# PR runs test the merge ref, whose tree differs from head_sha when the PR was
-# behind its base; those runs record tested-tree-<tree> artifacts. Review runs
-# (pull_request_review) carry the gate verdict, so both event kinds count.
-if [ "$tested" != true ]; then
-    for event in pull_request pull_request_review; do
-        if [ "$tested" = true ]; then
+    for id in $(gh api "repos/${repo}/actions/workflows/${workflow}/runs?event=${event}&status=success&per_page=20${filter}" --jq ".workflow_runs[] | select(.head_repository.full_name == \"${repo}\") | .id" || true); do
+        if gh api "repos/${repo}/actions/runs/${id}/artifacts?per_page=100" --jq '.artifacts[].name' 2>/dev/null | grep -qx "tested-tree-${tree}"; then
+            tested=true
             break
         fi
-        for id in $(gh api "repos/${repo}/actions/workflows/${workflow}/runs?event=${event}&status=success&per_page=20${filter}" --jq '.workflow_runs[].id' || true); do
-            if gh api "repos/${repo}/actions/runs/${id}/artifacts?per_page=100" --jq '.artifacts[].name' 2>/dev/null | grep -qx "tested-tree-${tree}"; then
-                tested=true
-                break
-            fi
-        done
     done
-fi
+done
 echo "Same tree ${tree} already tested: ${tested}." >&2
 echo "$tested"

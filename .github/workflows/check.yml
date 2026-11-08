@@ -33,7 +33,6 @@ on:
   workflow_call:
 permissions:
   contents: read
-  actions: read # decide looks up the green check run for this tree
   pull-requests: read # bot-gate reads blockfield-review-bot verdicts on the head SHA
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
@@ -111,6 +110,10 @@ jobs:
     if: github.event_name != 'pull_request_review' || (github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Only decide reads Actions data; check runs PR code and keeps the narrow token.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       tested: ${{ steps.same.outputs.tested }}
     steps:
