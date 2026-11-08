@@ -13,6 +13,7 @@ module next to it.
 """
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -46,8 +47,11 @@ __all__ = [
     "lock_platform",
     "lock_tool",
     "native",
+    "pinned_bins",
     "read_url",
+    "replace",
     "retried",
+    "ruff_version",
     "tool",
     # Re-exported from scripts/toolchain_local.py (workspace-only pins).
     "JAVA_ASSETS",
@@ -150,7 +154,7 @@ def child_env():
     env["PATH"] = os.pathsep.join(
         [
             *([str(sdk)] if env.get("JAVA_HOME") and sdk.is_dir() else []),
-            str(cache_dir() / "bin"),
+            *pinned_bins(),
             *(
                 entry
                 for entry in env.get("PATH", "").split(os.pathsep)
@@ -259,6 +263,33 @@ def read_url(url):
         return response.read()
 
 
+def replace(target, data, mode=None):
+    """Publish bytes so concurrent checkouts never see a partial file (and a
+    running binary is never rewritten in place): sibling temp file, then rename
+    into place. Mode is applied when given (tool binaries need 0o755)."""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=target.parent, prefix=".dl-", delete=False
+    ) as file:
+        temporary = Path(file.name)
+        try:
+            file.write(data)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        if mode is not None:
+            os.chmod(temporary, mode)
+        temporary.replace(target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+CANONICAL_PYTHON_PROBE = "(3, 12, 14) 1.3.2 1.3.2"
+
+
 def download(name, url, checksum, *, cache=None):
     """Single pinned file: cached copy verified, else downloaded with retries
     and published atomically. Kept for explicit callers; lock-driven code
@@ -276,21 +307,7 @@ def download(name, url, checksum, *, cache=None):
         data = retried(lambda: read_url(url))
     if hashlib.sha256(data).hexdigest() != checksum:
         raise RuntimeError(f"Tool checksum mismatch: {name}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=target.parent, prefix=".dl-", delete=False
-    ) as file:
-        temporary = Path(file.name)
-        try:
-            file.write(data)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
-        temporary.replace(target)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    replace(target, data)
     return target
 
 
@@ -322,38 +339,105 @@ def fetch(tool_name, filename=None, *, cache=None, platform=None):
         except RuntimeError as error:
             failures.append(f"{url}: {error}")
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            dir=target.parent, prefix=".dl-", delete=False
-        ) as file:
-            temporary = Path(file.name)
-            try:
-                file.write(data)
-            except BaseException:
-                temporary.unlink(missing_ok=True)
-                raise
-        try:
-            temporary.replace(target)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
+        replace(target, data)
         return target
     raise RuntimeError(f"Tool {tool_name!r} download failed: " + "; ".join(failures))
 
 
-def tool_ruff():
-    expected = "ruff " + lock_tool("ruff")["version"]
-    directory = cache_dir() / "venv"
-    python = directory / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if not python.is_file():
-        call(canonical_python(), "-I", "-m", "venv", "--clear", directory)
-    probe = subprocess.run(
-        [str(python), "-I", "-m", "ruff", "--version"],
-        env=child_env(),
-        capture_output=True,
-        text=True,
-    )
-    if probe.returncode or probe.stdout.strip() != expected:
+def _pin_key(spec):
+    """Cache subdirectory for one locked asset: the first 16 hex digits of
+    its pin, so a lock bump never reuses (or flips) another pin's binaries."""
+    if "sha256" in spec:
+        return spec["sha256"][:16]
+    return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def pinned_bins():
+    """Every `bin/<pin>` directory of this checkout's lock for the current
+    host. Child processes and CI resolve bare tool names from these, so no
+    shared `bin/<name>` link can flip between pins under a shared cache."""
+    try:
+        lock = load_lock()
+    except RuntimeError:
+        return []
+    directories = []
+    for name in lock.get("tools", {}):
+        try:
+            _, _, spec = lock_platform(name, lock=lock)
+        except RuntimeError:
+            continue  # no asset pinned for this host
+        directories.append(str(cache_dir() / "bin" / _pin_key(spec)))
+    return directories
+
+
+@contextlib.contextmanager
+def _held(lock_path, timeout=600):
+    """Exclusive OS file lock beside an install dir (flock on POSIX,
+    msvcrt.locking on Windows). The OS releases it if the holder dies, so a
+    crashed builder can never wedge later runs; only the holder may
+    delete or rebuild the guarded dir."""
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    with open(lock_path, "a+b") as handle:
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Tool install is locked by another process ({lock_path}); "
+                        f"gave up after {timeout}s"
+                    )
+                time.sleep(1)
+        try:
+            yield handle
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+def _mark_complete(directory):
+    """Completion marker written last: an install dir counts as usable only
+    when its builder finished and left this file."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / ".complete").write_text("complete\n", encoding="utf-8")
+
+
+def ruff_version(python):
+    try:
+        probe = subprocess.run(
+            [str(python), "-I", "-m", "ruff", "--version"],
+            env=child_env(),
+            capture_output=True,
+            text=True,
+        )
+    except OSError:  # interpreter missing or a dangling symlink
+        return ""
+    return "" if probe.returncode else probe.stdout.strip()
+
+
+def _install_ruff_venv(directory, python, expected):
+    try:
+        call(canonical_python(), "-I", "-m", "venv", directory)
         # The wheel is hash-verified by fetch(); pip installs the local file.
         wheel = fetch("ruff")
         # pip does not retry a read timeout in the middle of a download.
@@ -369,7 +453,35 @@ def tool_ruff():
                 str(wheel),
             )
         )
-    return directory / ("Scripts/ruff.exe" if os.name == "nt" else "bin/ruff")
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    if ruff_version(python) != expected:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise RuntimeError(f"ruff install did not produce {expected}")
+    _mark_complete(directory)
+
+
+def tool_ruff():
+    # Keyed by the locked version, like tool_npm: a lock bump must not reuse
+    # (or reinstall under) another pin's venv.
+    version = lock_tool("ruff")["version"]
+    expected = "ruff " + version
+    directory = cache_dir() / ("venv-ruff-" + version)
+    python = directory / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    ruff = directory / ("Scripts/ruff.exe" if os.name == "nt" else "bin/ruff")
+    marker = directory / ".complete"
+    if marker.is_file() and ruff_version(python) == expected:
+        return ruff
+    with _held(cache_dir() / (directory.name + ".lock")):
+        if marker.is_file() and ruff_version(python) == expected:
+            return ruff  # a lock holder finished while we waited
+        if directory.exists():
+            # Only the lock holder reaches here, so no live builder or runner
+            # can be using this unmarked dir.
+            shutil.rmtree(directory, ignore_errors=True)
+        _install_ruff_venv(directory, python, expected)
+    return ruff
 
 
 def tool_npm(name):
@@ -381,7 +493,16 @@ def tool_npm(name):
         / ".bin"
         / (name + ".cmd" if os.name == "nt" else name)
     )
-    if not binary.is_file():
+    marker = directory / ".complete"
+    if marker.is_file() and binary.is_file():
+        return binary
+    with _held(cache_dir() / (directory.name + ".lock")):
+        if marker.is_file() and binary.is_file():
+            return binary  # a lock holder finished while we waited
+        if directory.exists():
+            # Only the lock holder reaches here, so no live npm run can be
+            # using this unmarked dir.
+            shutil.rmtree(directory, ignore_errors=True)
         # The tarball carries the registry integrity hash; npm installs the
         # verified local file, so no registry round-trip can swap the bytes.
         tarball = fetch(name)
@@ -397,6 +518,7 @@ def tool_npm(name):
             "--save-exact",
             str(tarball),
         )
+        _mark_complete(directory)
     return binary
 
 
@@ -426,10 +548,12 @@ def tool(name):
             data = source.extractfile(member).read()
     else:
         data = archive.read_bytes()
-    binary = cache_dir() / "bin" / filename
-    binary.parent.mkdir(parents=True, exist_ok=True)
+    # Keyed by the pin, so checkouts on other pins never swap the binary under
+    # a running check (same pattern as the mod's old toolchain).
+    key = _pin_key(spec)
+    binary = cache_dir() / "bin" / key / filename
     if not binary.is_file() or binary.read_bytes() != data:
-        binary.write_bytes(data)
+        replace(binary, data, mode=0o755)
     binary.chmod(0o755)
     return binary
 
@@ -458,11 +582,20 @@ def canonical_python():
             with tarfile.open(archive) as source:
                 source.extractall(staging, filter="data")
             probed = python_version(staging / relative)
-            if probed != "(3, 12, 14) 1.3.2 1.3.2":
+            if probed != CANONICAL_PYTHON_PROBE:
                 raise RuntimeError(f"Canonical Python compressor mismatch: {probed}")
-            staging.rename(directory)
+            try:
+                staging.rename(directory)
+            except OSError:
+                # Another process installed it first: use the winner when it
+                # is a valid install (same checks as the cache hit), else raise.
+                if (
+                    not python.is_file()
+                    or python_version(python) != CANONICAL_PYTHON_PROBE
+                ):
+                    raise
     probed = python_version(python)
-    if probed != "(3, 12, 14) 1.3.2 1.3.2":
+    if probed != CANONICAL_PYTHON_PROBE:
         raise RuntimeError(f"Canonical Python compressor mismatch: {probed}")
     return python
 
@@ -487,14 +620,29 @@ def prefetch(names):
 
 
 def main(argv):
-    wanted = None
-    for index, arg in enumerate(argv):
-        if arg == "--tools" and index + 1 < len(argv):
-            wanted = argv[index + 1]
-        elif arg.startswith("--tools="):
-            wanted = arg.partition("=")[2]
-    if "--ci" in argv or wanted is not None:
-        names = [name for name in (wanted or "").split(",") if name]
+    # Only a leading flag selects prefetch; `toolchain.py script.py --ci`
+    # must run the script. Prefetch takes nothing but the known flags: any
+    # other argument is a caller mistake that must fail loudly (exit 2)
+    # instead of exiting 0 without running anything.
+    if argv and (argv[0] in ("--ci", "--tools") or argv[0].startswith("--tools=")):
+        names = []
+        index = 0
+        while index < len(argv):
+            arg = argv[index]
+            if arg == "--ci":
+                index += 1
+            elif arg == "--tools" and index + 1 < len(argv):
+                names.extend(name for name in argv[index + 1].split(",") if name)
+                index += 2
+            elif arg.startswith("--tools="):
+                names.extend(name for name in arg.partition("=")[2].split(",") if name)
+                index += 1
+            else:
+                print(
+                    "usage: toolchain.py [--ci] [--tools name[,name]]",
+                    file=sys.stderr,
+                )
+                return 2
         if "--ci" in argv and not names:
             names = ["just", "shellcheck"]
         prefetch(names)
@@ -504,15 +652,13 @@ def main(argv):
                 with Path(os.environ["GITHUB_PATH"]).open(
                     "a", encoding="utf-8", newline="\n"
                 ) as output:
-                    output.write(
-                        str(cache_dir() / "bin") + "\n" + str(python.parent) + "\n"
-                    )
+                    output.write("\n".join([*pinned_bins(), str(python.parent)]) + "\n")
     else:
         call(canonical_python(), "-I", "-X", "utf8", *argv)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]))
 
 
 try:

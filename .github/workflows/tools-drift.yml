@@ -19,4 +19,4 @@ jobs:
       - name: Check vendored core matches workspace origin/main
         env:
           BF_DRIFT_CHECK: "1"
-        run: python3 -I -X utf8 -m unittest test_vendored.VendoredCore.test_vendored_files_equal_workspace_origin_main -v
+        run: python3 -X utf8 -m unittest test_vendored.VendoredCore.test_vendored_files_equal_workspace_origin_main -v

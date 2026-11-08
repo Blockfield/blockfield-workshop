@@ -43,7 +43,8 @@ def java_home():
         return Path(home)
     # Version-manager shims win a raw-PATH lookup and resolve into the
     # manager dir: search the shim-filtered child env and accept only a
-    # candidate whose layout holds a real bin/java next to it.
+    # candidate whose home holds the JDK 9+ `release` marker (a launcher in
+    # any other bin/ dir has a bin/java beside it, but no `release`).
     from toolchain import child_env  # lazy: the core imports this module
 
     for entry in child_env()["PATH"].split(os.pathsep):
@@ -53,7 +54,7 @@ def java_home():
         if java is None:
             continue
         home = Path(java).resolve().parents[1]
-        if (home / "bin" / "java").exists() or (home / "bin" / "java.exe").exists():
+        if (home / "release").is_file():
             return home
     raise RuntimeError(
         "Missing native java; install the repository's documented SDK prerequisites"

@@ -78,8 +78,29 @@ class JavaHome(unittest.TestCase):
             real = home / "bin" / "java"
             real.write_text("#!/bin/sh\nexit 0\n")
             real.chmod(0o755)
+            (home / "release").write_text('JAVA_VERSION="21"\n')
             env = os.environ.copy()
             env["PATH"] = os.pathsep.join((str(shim), str(home / "bin")))
+            env.pop("JAVA_HOME", None)
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(java_home(), real.resolve().parents[1])
+
+    def test_launcher_in_bin_ahead_of_jdk_picks_jdk(self):
+        # A non-symlink launcher in some other bin/ (chocolatey bin\java.exe,
+        # ~/.local/bin/java) has a bin/java beside it but no JDK `release`.
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = Path(tmp) / "local" / "bin"
+            launcher.mkdir(parents=True)
+            (launcher / "java").write_text("#!/bin/sh\nexit 3\n")
+            (launcher / "java").chmod(0o755)
+            home = Path(tmp) / "jdk"
+            (home / "bin").mkdir(parents=True)
+            real = home / "bin" / "java"
+            real.write_text("#!/bin/sh\nexit 0\n")
+            real.chmod(0o755)
+            (home / "release").write_text('JAVA_VERSION="21"\n')
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(launcher), str(home / "bin")))
             env.pop("JAVA_HOME", None)
             with unittest.mock.patch.dict(os.environ, env, clear=True):
                 self.assertEqual(java_home(), real.resolve().parents[1])
