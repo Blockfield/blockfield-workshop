@@ -870,19 +870,147 @@ class GateReportTests(unittest.TestCase):
             with self.assertRaises(CommitIncompleteError):
                 self.controller.request(operation, self.goal, revision)
 
-    def test_set_message_read_failure_holds_after_commit(self):
-        """Edge (c) / I3: message.json committed but state.json unreadable.
-        The op holds (CommitIncompleteError; message re-apply is idempotent)
-        instead of escaping as a read ValueError/OSError that sync would
-        store as terminal rejected. Fail-before: the old code raises the
-        raw read error."""
-        from controller import CommitIncompleteError
-
-        self.controller.set_message("hello")
+    def test_set_message_read_failure_returns_without_holding_queue(self):
+        """Round 8 / I6: message.json committed but state.json unreadable.
+        A message carries no admission, so there is nothing to narrow and
+        no leg to deliver: warn and return normally instead of holding the
+        queue and blocking a members removal queued behind it.
+        Fail-before: the old code raises CommitIncompleteError."""
+        admin = {
+            "draslId": DRASL,
+            "name": "Nether",
+            "role": "admin",
+            "maps": ["hub"],
+        }
+        builder = {
+            "draslId": "bb" * 16,
+            "name": "Builder1",
+            "role": "builder",
+            "maps": ["hub"],
+        }
+        self.controller.set_members([admin, builder])
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.controller.step()
+        self.backend.ready(self.goal)
+        self.controller.step()
         (self.dir / "state" / "state.json").write_bytes(b"{corrupt")
-        with self.assertRaises(CommitIncompleteError):
-            self.controller.set_message("again")
-        self.assertEqual(self.controller.message, "again")
+        self.assertEqual(self.controller.set_message("again"), "again")
+        # The removal queued behind the message still applies: the local
+        # gate narrows (ruling 1) and a closed leg is staged.
+        self.assertEqual(
+            [m["draslId"] for m in self.controller.set_members([admin])],
+            [DRASL],
+        )
+        gate = json.loads((self.dir / "gate.json").read_text())
+        self.assertNotIn(
+            "bb" * 16,
+            {entry["draslId"] for entry in gate["backends"]["workshop"]["allowed"]},
+        )
+
+    def test_narrow_unreadable_gate_handles_public_missing(self):
+        """Round 8 / ruling 1: gate.json parses but public.json is missing.
+        The files narrow independently: gate.json must still drop the
+        removed builder. Fail-before: the old code returns early and the
+        builder stays admitted locally."""
+        admin = {
+            "draslId": DRASL,
+            "name": "Nether",
+            "role": "admin",
+            "maps": ["hub"],
+        }
+        builder = {
+            "draslId": "bb" * 16,
+            "name": "Builder1",
+            "role": "builder",
+            "maps": ["hub"],
+        }
+        self.controller.set_members([admin, builder])
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.controller.step()
+        self.backend.ready(self.goal)
+        self.controller.step()
+        (self.dir / "public.json").unlink()
+        (self.dir / "state" / "state.json").write_bytes(b"{corrupt")
+        self.controller.set_members([admin])
+        gate = json.loads((self.dir / "gate.json").read_text())
+        self.assertNotIn(
+            "bb" * 16,
+            {entry["draslId"] for entry in gate["backends"]["workshop"]["allowed"]},
+        )
+
+    def test_narrow_unreadable_gate_handles_gate_missing(self):
+        """Round 8 / ruling 1, other direction: public.json parses but
+        gate.json is missing. public.json must still close.
+        Fail-before: the old code returns early and public stays open."""
+        admin = {
+            "draslId": DRASL,
+            "name": "Nether",
+            "role": "admin",
+            "maps": ["hub"],
+        }
+        builder = {
+            "draslId": "bb" * 16,
+            "name": "Builder1",
+            "role": "builder",
+            "maps": ["hub"],
+        }
+        self.controller.set_members([admin, builder])
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.controller.step()
+        self.backend.ready(self.goal)
+        self.controller.step()
+        (self.dir / "gate.json").unlink()
+        (self.dir / "state" / "state.json").write_bytes(b"{corrupt")
+        self.controller.set_members([admin])
+        public = json.loads((self.dir / "public.json").read_text())
+        self.assertEqual(public["workshop"]["mode"], "maintenance")
+
+    def test_cancel_retry_reexports_staged_leg(self):
+        """Round 8 / ruling 3: a cancel whose first attempt committed but
+        failed staging (ERROR-driven hold) must stage on same-op retry,
+        not return the journaled state with the leg unstaged (which sync
+        would ACK effective). Fail-before: the retry raises ValueError
+        ("nothing to cancel") and stages nothing."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.controller.step()
+        self.assertEqual(self.controller.status()["phase"], "STARTING")
+        operation = str(uuid4())
+        real_atomic_write = Controller._stage_gate_leg.__globals__["atomic_write"]
+
+        def fail_pending(path, *args, **kwargs):
+            if Path(path).name == "gate_pending.json":
+                raise OSError("ENOSPC")
+            return real_atomic_write(path, *args, **kwargs)
+
+        with mock.patch("controller.atomic_write", side_effect=fail_pending):
+            from controller import CommitIncompleteError
+
+            with self.assertRaises(CommitIncompleteError):
+                self.controller.cancel(operation_id=operation)
+        state = self.controller.cancel(operation_id=operation)
+        self.assertEqual(state["cancelOperation"], operation)
+        # The retry staged the cancel leg itself, not a leftover: the
+        # request's starting leg must be replaced by the closed leg.
+        self.assertTrue(self.controller.gate_report_pending())
+        record = json.loads((self.dir / "state" / "gate_pending.json").read_text())
+        self.assertEqual(
+            record["leg"],
+            {"state": "closed", "message": self.controller.message, "allowed": []},
+        )
 
     def test_delivered_leg_replaces_stale_sidecar(self):
         """leg == delivered.leg with a stale pending record: staging replaces

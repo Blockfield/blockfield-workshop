@@ -1198,9 +1198,9 @@ class CPClientTests(unittest.TestCase):
         self.assertNotIn("fence", self.backend.events)
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         self.assertEqual(state["cursor"], 0)
-        # Healed retry: the same frame re-applies vacuously (phase ERROR
-        # answers "nothing to cancel") and converges effective without
-        # running cancel again.
+        # Healed retry: the same frame re-applies vacuously (same-op branch:
+        # no second fence), stages the committed closed leg, and converges
+        # effective without running cancel again.
         transport.event_frames = [envelope]
         second = self.client(transport).sync(self.controller)
         self.assertEqual(second, {"applied": 1, "rejected": 0, "acked": 1})

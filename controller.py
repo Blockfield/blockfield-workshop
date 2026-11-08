@@ -793,10 +793,17 @@ class Controller:
                 state = self._read()
             except Exception as read_error:
                 # The message commit above is live but the desired leg is
-                # unknown: hold and converge on retry, never rejected.
-                raise CommitIncompleteError(
-                    f"message commit is live but state could not be read: {read_error}"
-                ) from read_error
+                # unknown. A message carries no admission, so there is
+                # nothing to narrow and no leg to deliver (I6): warn and
+                # return normally so the queue — including a members
+                # removal queued behind this op — proceeds. The next op
+                # re-reads; unreadable state still fails closed there.
+                print(
+                    "controller: message commit is live but state could not"
+                    f" be read ({read_error!r}); continuing without a gate leg",
+                    file=sys.stderr,
+                )
+                return self.message
             try:
                 self._export(state)
             except CommitIncompleteError:
@@ -1347,7 +1354,11 @@ class Controller:
     def _narrow_unreadable_gate_best_effort(self) -> None:
         """Narrow the on-disk gate for the unreadable-state path. Best
         effort: never raises. Forces the workshop entry closed (Game entry
-        preserved) so a just-removed member stops being admitted locally."""
+        preserved) so a just-removed member stops being admitted locally.
+        Each file narrows independently: a missing or corrupt public.json
+        must not keep gate.json admitting a removed member, and vice versa
+        (the per-file writes below already tolerate the other side being
+        absent or invalid)."""
         try:
             gate_doc = json.loads(self.gate_file.read_bytes()[:65536])
         except Exception:
@@ -1356,7 +1367,7 @@ class Controller:
             public = json.loads(self.public_file.read_bytes()[:65536])
         except Exception:
             public = None
-        if not isinstance(gate_doc, dict) or not isinstance(public, dict):
+        if not isinstance(gate_doc, dict) and not isinstance(public, dict):
             return
         self._write_closed_gate_best_effort(gate_doc, public)
 
@@ -2366,15 +2377,28 @@ class Controller:
         committed cancel returns the journaled state instead of fencing again."""
         with self._locked():
             state = self._read()
-            if state.get("phase") not in {"STARTING"}:
-                raise ValueError("nothing to cancel: no switch is in progress")
             if (
                 operation_id is not None
                 and state.get("cancelOperation") == operation_id
             ):
                 # The compensation for this op already committed (the receipt
-                # was lost after the commit): the retry must be a no-op.
+                # was lost after the commit): the retry must be a no-op, never
+                # a second fence — but it still must re-export so the retry
+                # stages the committed leg instead of ACKing it effective
+                # unstaged (I5). A staging failure holds, never a bare OSError.
+                if getattr(self, "gate_reporter", None) is not None:
+                    try:
+                        self._export(state)
+                    except CommitIncompleteError:
+                        raise
+                    except OSError as error:
+                        raise CommitIncompleteError(
+                            f"committed {operation_id!r} cancel already stored"
+                            f" but its gate leg was not staged: {error}"
+                        ) from error
                 return state
+            if state.get("phase") not in {"STARTING"}:
+                raise ValueError("nothing to cancel: no switch is in progress")
             if not state.get("rollback"):
                 self.backend.fence_pending_starts()
                 state.update(
@@ -2420,6 +2444,24 @@ class Controller:
                 self._member_actor(actor)
             state = self._read()
             if state.get("phase") != "sleeping":
+                if getattr(self, "gate_reporter", None) is not None and (
+                    state.get("operation") == operation
+                    or (state.get("selection") or {}).get("operation") == operation
+                ):
+                    # Same-op retry after a commit-then-fail: the first
+                    # attempt committed without staging, so re-export before
+                    # reporting started:False — otherwise sync ACKs the op
+                    # effective with its gate leg unstaged (I5). A staging
+                    # failure holds, never a bare OSError.
+                    try:
+                        self._export(state)
+                    except CommitIncompleteError:
+                        raise
+                    except OSError as error:
+                        raise CommitIncompleteError(
+                            f"committed {operation!r} wake already stored"
+                            f" but its gate leg was not staged: {error}"
+                        ) from error
                 return {
                     "kind": "wake",
                     "phase": state.get("phase"),
