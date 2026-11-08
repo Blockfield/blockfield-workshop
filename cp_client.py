@@ -253,6 +253,19 @@ class _UrllibTransport:
         )
         return _request_body(self.opener, request, timeout, "acks", MAX_FRAME_BYTES)
 
+    def patch_json(self, url: str, body: dict, timeout: float) -> bytes:
+        data = canonical(body)
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                **self._headers("application/json"),
+                "Content-Type": "application/json",
+            },
+            method="PATCH",
+        )
+        return _request_body(self.opener, request, timeout, "gate", MAX_FRAME_BYTES)
+
     def get_events(self, url: str, timeout: float) -> tuple[int, list[dict]]:
         request = urllib.request.Request(
             url, headers=self._headers("text/event-stream")
@@ -322,6 +335,112 @@ def _read_sse(response, timeout: float) -> list[dict]:
                 raise ValueError(f"cp frame exceeds {MAX_FRAME_BYTES} bytes")
         # "id:" (epoch:sequence) and retry/comments carry no payload here.
     return frames
+
+
+class GateReporter:
+    """Reports the controller gate leg to CP (unit CPP3).
+
+    Reads the current (gate, workshop) settings, PATCHes only when the leg
+    differs (idempotent, no write when unchanged). A 409 (someone else
+    reported meanwhile) refetches once and retries against the fresh
+    revision. Transport failures raise; callers must not let a failed
+    report block reconciliation. Disabled unless BLOCKFIELD_CP_GATE_TOKEN
+    (a service credential holding the workshop.gate scope) is set.
+    """
+
+    path = "/v2/settings/gate/workshop"
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        transport=None,
+        timeout_s: float = EVENT_TIMEOUT_S,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.transport = transport or _UrllibTransport(token)
+        self.timeout_s = timeout_s
+
+    @classmethod
+    def from_env(cls, env=os.environ, base_url=None):
+        token = (env.get("BLOCKFIELD_CP_GATE_TOKEN") or "").strip()
+        if not token:
+            return None
+        base = (base_url or env.get("BLOCKFIELD_CP_URL") or "").strip().rstrip("/")
+        if not base:
+            raise ValueError("BLOCKFIELD_CP_URL must be set for gate reporting")
+        scheme = urllib.parse.urlsplit(base).scheme.lower()
+        host = urllib.parse.urlsplit(base).hostname or ""
+        if scheme != "https" and not (
+            scheme == "http" and host in ("127.0.0.1", "localhost", "::1")
+        ):
+            raise ValueError("BLOCKFIELD_CP_URL must be https (http only for loopback)")
+        return cls(base, token)
+
+    def _url(self) -> str:
+        return self.base_url + self.path
+
+    def read(self) -> tuple[int, dict]:
+        """(revision, value) of the current leg; raises on transport failure."""
+        try:
+            raw = self.transport.get_json(self._url(), timeout=self.timeout_s)
+        except CPHttpError as error:
+            if error.status in (401, 403):
+                raise ValueError(
+                    "cp gate report denied: check gate credential"
+                ) from error
+            raise
+        try:
+            document = json.loads(raw.decode())
+        except ValueError:
+            raise ValueError("cp gate settings is not JSON")
+        if not isinstance(document, dict):
+            raise ValueError("cp gate settings is not an object")
+        revision = document.get("revision")
+        value = document.get("value")
+        if type(revision) is not int or not isinstance(value, dict):
+            raise ValueError("cp gate settings misses revision/value")
+        return revision, value
+
+    def _patch(self, revision: int, leg: dict) -> dict:
+        body = {
+            "idempotencyKey": f"workshop-gate-{revision}-{payload_hash(leg)[:16]}",
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": revision,
+            "patch": leg,
+        }
+        raw = self.transport.patch_json(self._url(), body, timeout=self.timeout_s)
+        try:
+            document = json.loads(raw.decode())
+        except ValueError:
+            raise ValueError("cp gate report answer is not JSON") from None
+        if (
+            not isinstance(document, dict)
+            or type(document.get("revision")) is not int
+            or not document.get("operationId")
+        ):
+            raise ValueError("cp gate report answer misses revision/operationId")
+        return {
+            "reported": True,
+            "revision": document["revision"],
+            "operationId": document["operationId"],
+        }
+
+    def report(self, leg: dict) -> dict:
+        """PATCH the leg when it differs from CP; returns reported/revision."""
+        revision, current = self.read()
+        if current == leg:
+            return {"reported": False, "revision": revision}
+        try:
+            return self._patch(revision, leg)
+        except CPHttpError as error:
+            if error.status != 409:
+                raise
+            revision, current = self.read()
+            if current == leg:
+                return {"reported": False, "revision": revision}
+            return self._patch(revision, leg)
 
 
 class CPClient:

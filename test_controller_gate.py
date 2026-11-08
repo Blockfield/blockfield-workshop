@@ -513,5 +513,67 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.controller.step()["gate"], "builders")
 
 
+class GateReportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name)
+        self.backend = FakeBackend()
+        self.controller = Controller(
+            self.dir / "state",
+            self.backend,
+            gate_file=self.dir / "gate.json",
+            public_file=self.dir / "public.json",
+            releases=catalog(),
+        )
+        self.goal = Goal("workshop", "v1.0.0", str(uuid4()))
+
+    def test_gate_leg_reported_with_projected_members(self):
+        reported = []
+
+        class StubReporter:
+            def report(self, leg):
+                reported.append(leg)
+                return {"reported": True, "revision": 1}
+
+        self.controller.gate_reporter = StubReporter()
+        self.controller.set_members(
+            [
+                {
+                    "draslId": DRASL,
+                    "name": "Builder1",
+                    "role": "builder",
+                    "maps": ["hub"],
+                }
+            ]
+        )
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.controller.step()
+        # CP only accepts the projected shape (state/message/plain members).
+        self.assertEqual(
+            reported[-1],
+            {
+                "state": "starting",
+                "message": self.controller.message,
+                "allowed": [{"draslId": DRASL, "name": "Builder1"}],
+            },
+        )
+
+    def test_failed_report_never_breaks_exports(self):
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        self.controller.step()
+        document = json.loads((self.dir / "gate.json").read_text())
+        self.assertEqual(document["backends"]["workshop"]["gate"], "starting")
+
+
 if __name__ == "__main__":
     unittest.main()

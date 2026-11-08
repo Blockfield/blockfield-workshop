@@ -1173,6 +1173,30 @@ class Controller:
             self._replace_if_changed(
                 self.admin_dir / "status.json", status, keep=("updatedAt",)
             )
+        self._report_gate(workshop_gate)
+
+    def _report_gate(self, workshop_gate: dict) -> None:
+        """Report the gate leg to CP when a gate reporter is configured.
+
+        Best-effort: a failed report never breaks the file exports, and the
+        reporter sends no write when the leg is unchanged. CP only accepts
+        the projected shape (state/message/plain members, no roles or maps).
+        """
+        if getattr(self, "gate_reporter", None) is None:
+            return
+        try:
+            self.gate_reporter.report(
+                {
+                    "state": workshop_gate["gate"],
+                    "message": workshop_gate["message"],
+                    "allowed": [
+                        {"draslId": entry["draslId"], "name": entry["name"]}
+                        for entry in workshop_gate["allowed"]
+                    ],
+                }
+            )
+        except Exception as error:
+            print(f"controller: gate report failed: {error!r}", file=sys.stderr)
 
     @staticmethod
     def _replace_if_changed(path: Path, document, keep: tuple) -> None:

@@ -9,7 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from cp_client import CPClient, CPConfig, SnapshotRequired, payload_hash
+from cp_client import (
+    CPClient,
+    CPConfig,
+    CPHttpError,
+    GateReporter,
+    SnapshotRequired,
+    payload_hash,
+)
 from controller import Controller
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
@@ -1009,6 +1016,164 @@ class CPClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a workshop member"):
             self.controller.apply_cp_operation(str(uuid4()), stranger, None)
         self.assertEqual(self.controller.message, self.controller.default_message)
+
+
+class GateStubTransport:
+    """Stub CP settings endpoint: GET returns the stored leg, PATCH advances it."""
+
+    url = "https://cp.invalid/v2/settings/gate/workshop"
+
+    def __init__(self, revision=0, value=None):
+        self.revision = revision
+        self.value = (
+            value
+            if value is not None
+            else {"state": "closed", "message": "", "allowed": []}
+        )
+        self.patches = []
+        self.fail_patch_once_with = None
+
+    def get_json(self, url, timeout):
+        assert url == self.url, url
+        return json.dumps(
+            {
+                "initialized": True,
+                "revision": self.revision,
+                "value": self.value,
+                "hash": "0" * 64,
+                "application": "see operation receipts",
+            }
+        ).encode()
+
+    def patch_json(self, url, body, timeout):
+        assert url == self.url, url
+        self.patches.append(body)
+        if self.fail_patch_once_with is not None:
+            status, self.fail_patch_once_with = self.fail_patch_once_with, None
+            raise CPHttpError("gate", status)
+        assert body["expectedRevision"] == self.revision, body
+        self.revision += 1
+        self.value = body["patch"]
+        return json.dumps(
+            {
+                "operationId": str(uuid4()),
+                "revision": self.revision,
+                "status": "accepted",
+                "result": {"revision": self.revision},
+            }
+        ).encode()
+
+
+class GateReporterTests(unittest.TestCase):
+    LEG = {
+        "state": "builders",
+        "message": "night build",
+        "allowed": [{"draslId": DRASL, "name": "Nether"}],
+    }
+
+    def reporter(self, transport):
+        return GateReporter("https://cp.invalid", "gate-token", transport=transport)
+
+    def test_no_write_when_unchanged(self):
+        transport = GateStubTransport(revision=4, value=dict(self.LEG))
+        result = self.reporter(transport).report(dict(self.LEG))
+        self.assertEqual(result, {"reported": False, "revision": 4})
+        self.assertEqual(transport.patches, [])
+
+    def test_patch_on_change(self):
+        transport = GateStubTransport(revision=3)
+        result = self.reporter(transport).report(dict(self.LEG))
+        self.assertEqual(result["reported"], True)
+        self.assertEqual(result["revision"], 4)
+        (body,) = transport.patches
+        self.assertEqual(body["expectedRevision"], 3)
+        self.assertEqual(body["patch"], self.LEG)
+        self.assertEqual(body["environment"], "prod")
+        self.assertEqual(body["backend"], "game")
+        self.assertTrue(body["idempotencyKey"].startswith("workshop-gate-3-"))
+
+    def test_conflict_refetches_once_and_retries(self):
+        transport = GateStubTransport(revision=3)
+        other = {"state": "closed", "message": "admin", "allowed": []}
+        real_patch = transport.patch_json
+        calls = {"n": 0}
+
+        def racing_patch(url, body, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Another writer lands between our read and our patch.
+                transport.revision = 4
+                transport.value = dict(other)
+                raise CPHttpError("gate", 409)
+            return real_patch(url, body, timeout)
+
+        transport.patch_json = racing_patch
+        result = self.reporter(transport).report(dict(self.LEG))
+        self.assertEqual(result["reported"], True)
+        self.assertEqual(result["revision"], 5)
+        self.assertEqual([b["expectedRevision"] for b in transport.patches], [4])
+
+    def test_conflict_resolved_when_other_writer_matches(self):
+        transport = GateStubTransport(revision=3)
+        transport.fail_patch_once_with = 409
+        calls = {"n": 0}
+        orig_get = transport.get_json
+
+        def racing_get(url, timeout):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # The racing writer reported our exact leg: no write needed.
+                transport.revision = 4
+                transport.value = dict(self.LEG)
+            return orig_get(url, timeout)
+
+        transport.get_json = racing_get
+        result = self.reporter(transport).report(dict(self.LEG))
+        self.assertEqual(result, {"reported": False, "revision": 4})
+        self.assertEqual(len(transport.patches), 1)
+
+    def test_repeated_conflict_raises(self):
+        transport = GateStubTransport(revision=3)
+
+        def always_conflict(url, body, timeout):
+            raise CPHttpError("gate", 409)
+
+        transport.patch_json = always_conflict
+        with self.assertRaises(CPHttpError):
+            self.reporter(transport).report(dict(self.LEG))
+
+    def test_denied_credential_is_explicit(self):
+        transport = GateStubTransport()
+
+        def denied(url, timeout):
+            raise CPHttpError("gate", 403)
+
+        transport.get_json = denied
+        with self.assertRaisesRegex(ValueError, "denied"):
+            self.reporter(transport).report(dict(self.LEG))
+
+    def test_from_env_disabled_without_token(self):
+        self.assertIsNone(GateReporter.from_env({}))
+
+    def test_from_env_rejects_plaintext(self):
+        with self.assertRaises(ValueError):
+            GateReporter.from_env(
+                {
+                    "BLOCKFIELD_CP_URL": "http://cp.invalid",
+                    "BLOCKFIELD_CP_GATE_TOKEN": "t",
+                }
+            )
+
+    def test_from_env_accepts_loopback_for_tests(self):
+        reporter = GateReporter.from_env(
+            {
+                "BLOCKFIELD_CP_URL": "http://127.0.0.1:9",
+                "BLOCKFIELD_CP_GATE_TOKEN": "t",
+            }
+        )
+        self.assertEqual(
+            reporter._url(), "http://127.0.0.1:9/v2/settings/gate/workshop"
+        )
 
 
 if __name__ == "__main__":
