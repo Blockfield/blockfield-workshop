@@ -776,9 +776,12 @@ class CPClient:
                 result = controller.apply_cp_operation(
                     operation_id, operation, self._acl(state, controller)
                 )
-            except BlockingIOError:
-                # Transient controller lock contention: hold the cursor and
-                # retry the whole pass later instead of skipping this frame.
+            except OSError:
+                # Local I/O failure (members/state commit, gate-leg staging):
+                # transient, never a rejection. Hold the cursor and retry the
+                # whole pass later (like lock contention above) instead of
+                # recording rejected or ACKing effective on an undelivered leg.
+                # (BlockingIOError is an OSError; contention stays on this path.)
                 break
             except Exception:
                 self._store_receipt(

@@ -652,26 +652,94 @@ class GateReportTests(unittest.TestCase):
                 ]
             )
         self.assertTrue(self.controller.gate_report_pending())
+        record = json.loads((self.dir / "state" / "gate_pending.json").read_text())
         self.assertEqual(
-            self.controller._pending_gate_leg,
+            record["leg"],
+            {"state": "closed", "message": self.controller.message, "allowed": []},
+        )
+        self.assertIs(type(record["seq"]), int)
+
+    def test_pending_write_failure_raises_instead_of_ghosting(self):
+        """A staging write failure raises: no in-memory fallback, so the op
+        is never ACKed effective on an undelivered leg (finding 4507194521)."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise AssertionError("no delivery while staging fails")
+
+        self.controller.gate_reporter = BoomReporter()
+        real_atomic_write = Controller._stage_gate_leg.__globals__["atomic_write"]
+
+        def fail_pending(path, *args, **kwargs):
+            if Path(path).name == "gate_pending.json":
+                raise OSError("ENOSPC")
+            return real_atomic_write(path, *args, **kwargs)
+
+        with mock.patch("controller.atomic_write", side_effect=fail_pending):
+            with self.assertRaises(OSError):
+                self.controller.set_members(
+                    [
+                        {
+                            "draslId": DRASL,
+                            "name": "Builder1",
+                            "role": "builder",
+                            "maps": ["hub"],
+                        }
+                    ]
+                )
+        self.assertFalse((self.dir / "state" / "gate_pending.json").exists())
+        self.assertFalse(self.controller.gate_report_pending())
+
+    def test_unreadable_state_stages_closed_leg(self):
+        """state.json unreadable in set_members: a closed leg is staged so
+        the hold keeps the members op from going effective (finding 4507194513)."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        builder = {
+            "draslId": DRASL,
+            "name": "Builder1",
+            "role": "builder",
+            "maps": ["hub"],
+        }
+        self.controller.set_members([builder])
+        self.controller.request(
+            str(uuid4()), self.goal, self.controller.status()["revision"]
+        )
+        # Corrupt the state file after a healthy export, then remove a member
+        # while CP is down: the export cannot run, but the closed leg holds.
+        (self.dir / "state" / "state.json").write_bytes(b"{corrupt")
+        self.controller.set_members([])
+        self.assertTrue(self.controller.gate_report_pending())
+        record = json.loads((self.dir / "state" / "gate_pending.json").read_text())
+        self.assertEqual(
+            record["leg"],
             {"state": "closed", "message": self.controller.message, "allowed": []},
         )
 
-    def test_delivered_leg_drops_stale_sidecar(self):
-        """leg == last-delivered must remove the sidecar unconditionally: a
-        stale file from a failed newer report must not be PATCHed back."""
+    def test_delivered_leg_replaces_stale_sidecar(self):
+        """leg == delivered.leg with a stale pending record: staging replaces
+        it with the delivered leg under gate_state.lock (the stale leg is
+        never PATCHed back over what CP holds), and the drain clears it."""
 
         class StubReporter:
             def report(self, leg):
-                raise AssertionError("no report needed for a delivered leg")
+                reported.append(dict(leg))
+                return {"reported": True, "revision": 9}
 
+        reported = []
         self.controller.gate_reporter = StubReporter()
-        delivered = {
+        delivered_leg = {
             "state": "builders",
             "message": "m",
             "allowed": [{"draslId": DRASL, "name": "Nether"}],
         }
-        self.controller._last_delivered_gate_leg = dict(delivered)
+        self.controller._gate_delivered_file.write_bytes(
+            json.dumps({"seq": 7, "leg": delivered_leg}, sort_keys=True).encode()
+        )
         stale = {
             "state": "builders",
             "message": "m",
@@ -681,7 +749,7 @@ class GateReportTests(unittest.TestCase):
             ],
         }
         self.controller._gate_pending_file.write_bytes(
-            json.dumps(stale, sort_keys=True).encode()
+            json.dumps({"seq": 8, "leg": stale}, sort_keys=True).encode()
         )
         self.controller._stage_gate_report(
             {
@@ -690,21 +758,107 @@ class GateReportTests(unittest.TestCase):
                 "allowed": [{"draslId": DRASL, "name": "Nether", "role": "builder"}],
             }
         )
+        # The stale leg is gone from the record: only the delivered leg
+        # remains staged, with a bumped seq.
+        record = json.loads(self.controller._gate_pending_file.read_text())
+        self.assertEqual(record["leg"], delivered_leg)
+        self.assertGreater(record["seq"], 8)
+        self.controller._flush_gate_report()
+        self.assertEqual(reported, [delivered_leg])
+        delivered = json.loads(self.controller._gate_delivered_file.read_text())
+        self.assertEqual(delivered, {"seq": record["seq"], "leg": delivered_leg})
         self.assertFalse(self.controller.gate_report_pending())
         self.assertFalse(self.controller._gate_pending_file.exists())
 
-    def test_concurrent_flushes_deliver_newest_once(self):
-        """Two processes flushing at once: one report in flight (own lock),
-        and the winner sends the newest staged leg, not a stale one."""
-        newest = {
+    def test_file_delivered_leg_never_drops_unrelated_pending(self):
+        """Finding 4507194510: the delivered FILE (not a process cache)
+        decides. Delivered L2 on CP + desired L1 while CP is down stages L1
+        instead of unlinking it: CP converges on L1 once it recovers."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        old_leg = {
             "state": "builders",
             "message": "m",
             "allowed": [{"draslId": DRASL, "name": "Nether"}],
         }
-        stale = {"state": "closed", "message": "m", "allowed": []}
+        new_leg = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [
+                {"draslId": DRASL, "name": "Nether"},
+                {"draslId": "bb" * 16, "name": "Fresh"},
+            ],
+        }
+        # CP holds new_leg (delivered file), desired flips back to old_leg.
+        self.controller._gate_delivered_file.write_bytes(
+            json.dumps({"seq": 4, "leg": new_leg}, sort_keys=True).encode()
+        )
+        self.controller._stage_gate_report(
+            {
+                "gate": "builders",
+                "message": "m",
+                "allowed": [{"draslId": DRASL, "name": "Nether", "role": "builder"}],
+            }
+        )
+        self.assertTrue(self.controller.gate_report_pending())
+        record = json.loads(self.controller._gate_pending_file.read_text())
+        self.assertEqual(record["leg"], old_leg)
+        self.assertGreater(record["seq"], 4)
+        # CP recovers: the staged leg is delivered and recorded.
+        reported = []
+
+        class StubReporter:
+            def report(self, leg):
+                reported.append(leg)
+                return {"reported": True, "revision": 5}
+
+        self.controller.gate_reporter = StubReporter()
+        self.controller._flush_gate_report()
+        self.assertEqual(reported, [old_leg])
+        delivered = json.loads(self.controller._gate_delivered_file.read_text())
+        self.assertEqual(delivered["leg"], old_leg)
+        self.assertEqual(delivered["seq"], record["seq"])
+        self.assertFalse(self.controller.gate_report_pending())
+
+    def test_absent_sidecar_sends_nothing(self):
+        """Finding 4507194517: an absent sidecar means nothing is pending.
+        No in-memory leg exists anymore, so a flush can never send a stale
+        leg another process already delivered over."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise AssertionError("must not report with no pending marker")
+
+        self.controller.gate_reporter = BoomReporter()
+        self.assertFalse(self.controller._gate_pending_file.exists())
+        self.controller._flush_gate_report()
+        self.assertFalse(self.controller.gate_report_pending())
+
+    def test_concurrent_stage_and_delivery_delivers_newest_last(self):
+        """Two processes staging/delivering concurrently end on the newest
+        seq delivered with no lost pending (findings 4507194524/4507194521):
+        the compare-seq unlink under gate_state.lock drops only the record
+        just sent, and a mid-report stage is delivered last."""
+        leg_a = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [{"draslId": DRASL, "name": "Nether"}],
+        }
+        leg_b = {
+            "state": "builders",
+            "message": "m",
+            "allowed": [
+                {"draslId": DRASL, "name": "Nether"},
+                {"draslId": "bb" * 16, "name": "Fresh"},
+            ],
+        }
         state_dir = self.dir / "state"
         # Two processes open the same workshop directory (same state path,
-        # same sidecar, same report lock), with separate in-memory caches.
+        # same records, same report lock). Files are the only shared truth.
         first = Controller(
             state_dir,
             FakeBackend(),
@@ -741,28 +895,32 @@ class GateReportTests(unittest.TestCase):
                 return {"reported": True, "revision": 1}
 
         first.gate_reporter = second.gate_reporter = BarrierReporter()
-        # Newest leg staged on disk; first process holds a stale in-memory leg.
-        first._gate_pending_file.write_bytes(
-            json.dumps(newest, sort_keys=True).encode()
-        )
-        first._pending_gate_leg = dict(stale)
+        # First process stages leg A; delivery starts sending it.
+        first._stage_gate_leg(leg_a)
+        seq_a = json.loads(first._gate_pending_file.read_text())["seq"]
         worker = threading.Thread(target=first._flush_gate_report)
         worker.start()
         try:
             self.assertTrue(entered.wait(15))
-            # The second flush must skip while the first report is in flight,
-            # never block and never send a second concurrent report.
+            # The second process stages leg B mid-report; a rival flush must
+            # skip (never block, never a second concurrent report).
+            second._stage_gate_leg(leg_b)
+            seq_b = json.loads(second._gate_pending_file.read_text())["seq"]
+            self.assertGreater(seq_b, seq_a)
             rival = threading.Thread(target=second._flush_gate_report)
             rival.start()
             rival.join(5)
             self.assertFalse(rival.is_alive(), "rival flush blocked on the report")
-            self.assertEqual(calls, [newest])
+            self.assertEqual(calls, [leg_a])
             self.assertEqual(in_flight["max"], 1)
         finally:
             release.set()
             worker.join(15)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(first._last_delivered_gate_leg, newest)
+        # The drain loop delivered the newer stage last: newest seq wins.
+        self.assertEqual(calls, [leg_a, leg_b])
+        delivered = json.loads(first._gate_delivered_file.read_text())
+        self.assertEqual(delivered, {"seq": seq_b, "leg": leg_b})
         self.assertFalse(first.gate_report_pending())
         self.assertFalse(first._gate_pending_file.exists())
 

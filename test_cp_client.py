@@ -1105,6 +1105,50 @@ class CPClientTests(unittest.TestCase):
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         self.assertEqual(state["cursor"], 1)
 
+    def test_sync_holds_cursor_on_apply_oserror(self):
+        """A staging write failure surfaces as OSError from apply: sync holds
+        the cursor like lock contention (never rejected, never effective)
+        and the retry converges (finding 4507194521 / design point 3)."""
+        envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+
+        class FlakyController:
+            def __init__(self):
+                self.applies = 0
+
+            def apply_cp_releases(self, pending):
+                return None
+
+            def members(self):
+                return [ADMIN]
+
+            def gate_report_pending(self):
+                return False
+
+            def apply_cp_operation(self, operation_id, operation, acl):
+                self.applies += 1
+                if self.applies == 1:
+                    raise OSError("ENOSPC")
+                return {"kind": "cancel"}
+
+        stub = FlakyController()
+        first = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(first, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        # Retry: the op applies and is ACKed through to effective.
+        second = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 2)
+        self.assertEqual(second, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 1)
+
     def test_stranger_message_rejected_without_acl(self):
         stranger = {
             "kind": "message",
