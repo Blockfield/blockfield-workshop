@@ -656,6 +656,32 @@ class WorkshopctlTests(unittest.TestCase):
         )
         self.assertEqual(controller.desired_file, custom)
 
+    def test_gate_reporter_wiring(self):
+        kwargs = dict(
+            state_dir=str(self.root / "controller"),
+            gate_file=str(self.root / "gate" / "gate.json"),
+            public_file=str(self.root / "public" / "public.json"),
+            admin_dir=str(self.root / "admin"),
+            inbox_dir=str(self.root / "inbox"),
+        )
+        controller, _ = workshopctl.build_controller(
+            dict(os.environ), lambda: self.backend, **kwargs
+        )
+        self.assertIsNone(controller.gate_reporter)
+        controller, _ = workshopctl.build_controller(
+            {
+                **os.environ,
+                "BLOCKFIELD_CP_URL": "https://cp.invalid",
+                "BLOCKFIELD_CP_GATE_TOKEN": "gate-token",
+            },
+            lambda: self.backend,
+            **kwargs,
+        )
+        self.assertEqual(
+            controller.gate_reporter._url(),
+            "https://cp.invalid/v2/settings/gate/workshop",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -425,6 +425,44 @@ class SleepTests(unittest.TestCase):
         self.controller.step()
         self.assertEqual(self.backend.events.count("start"), 1)
 
+    def test_wake_retry_reexports_staged_leg(self):
+        """Round 8 / ruling 3: a wake whose first attempt committed
+        REQUESTED but failed staging must stage on same-op retry, not
+        return started:False with the leg unstaged (which sync would ACK
+        effective). Fail-before: the retry returns without staging."""
+        from controller import CommitIncompleteError
+
+        self.controller.set_members([dict(ADMIN)])
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        self.sleep()
+        # The sleep steps staged a sleeping leg that CP never got (Boom);
+        # drop it so only the wake retry can stage anything below.
+        (self.dir / "state" / "gate_pending.json").unlink(missing_ok=True)
+        operation = str(uuid4())
+        real_atomic_write = Controller._stage_gate_leg.__globals__["atomic_write"]
+
+        def fail_pending(path, *args, **kwargs):
+            if Path(path).name == "gate_pending.json":
+                raise OSError("ENOSPC")
+            return real_atomic_write(path, *args, **kwargs)
+
+        with unittest.mock.patch("controller.atomic_write", side_effect=fail_pending):
+            with self.assertRaises(CommitIncompleteError):
+                self.controller.wake(operation)
+            # The failed staging left nothing behind: prove the retry is
+            # what stages, not a leftover leg.
+            self.assertFalse(self.controller.gate_report_pending())
+        result = self.controller.wake(operation)
+        self.assertEqual((result["started"], result["phase"]), (False, "REQUESTED"))
+        self.assertTrue(self.controller.gate_report_pending())
+        record = json.loads((self.dir / "state" / "gate_pending.json").read_text())
+        self.assertEqual(record["leg"]["state"], "starting")
+
     def test_wake_rejects_strangers(self):
         request_id = str(uuid4())
         (self.dir / "inbox" / f"{request_id}.json").write_text(

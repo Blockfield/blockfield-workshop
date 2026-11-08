@@ -9,7 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from cp_client import CPClient, CPConfig, SnapshotRequired, payload_hash
+from cp_client import (
+    CPClient,
+    CPConfig,
+    CPHttpError,
+    GateReporter,
+    SnapshotRequired,
+    payload_hash,
+)
 from controller import Controller
 
 DRASL = "e10438e4797b49718cfecec6a8fa171b"
@@ -404,6 +411,54 @@ class CPClientTests(unittest.TestCase):
         )
 
     # Bot-review findings below: each failed on the pre-fix code.
+
+    def test_held_cancel_not_reapplied_on_retry(self):
+        """A gate-held cancel stores its terminal receipt before holding the
+        cursor, so the next pass re-sends ACKs instead of re-applying the op
+        (a retried cancel would fence and park the workshop in ERROR)."""
+        envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+
+        class GateHeldController:
+            def __init__(self):
+                self.pending = True
+                self.applies = 0
+
+            def apply_cp_releases(self, pending):
+                return None
+
+            def members(self):
+                return [ADMIN]
+
+            def gate_report_pending(self):
+                return self.pending
+
+            def apply_cp_operation(self, operation_id, operation, acl):
+                self.applies += 1
+                return {"kind": "cancel"}
+
+        stub = GateHeldController()
+        first = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(first, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        # Same frame redelivered (cursor held): no re-apply, progress re-ACKed.
+        second = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(second, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied"],
+        )
+        # Once the leg is delivered, the replay converges on effective.
+        stub.pending = False
+        third = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(third, {"applied": 0, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks[-4:]],
+            ["received", "validated", "applied", "effective"],
+        )
 
     def test_cp_members_keeps_admin(self):
         only_builders = [
@@ -999,6 +1054,283 @@ class CPClientTests(unittest.TestCase):
         result = self.client(transport).sync(self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
 
+    def test_failed_gate_report_blocks_effective_ack(self):
+        """A members op whose gate leg cannot be delivered is applied locally
+        but never ACKed effective; the retry delivers and ACKs."""
+        from controller import member as member_fn
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        op = members_op(
+            {"draslId": DRASL, "name": "Nether"},
+            [dict(ADMIN), {"draslId": STRANGER, "name": "Stranger", "role": "builder"}],
+        )
+        envelope = frame(op, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        # Held: applied locally, nothing ACKed, cursor unmoved.
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        self.assertTrue(self.controller.gate_report_pending())
+        self.assertTrue((self.dir / "state" / "gate_pending.json").exists())
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        # Members are committed even though the ACK is held.
+        self.assertEqual(
+            {m["draslId"] for m in self.controller.members()},
+            {
+                member_fn({**ADMIN, "role": "builder"})["draslId"],
+                STRANGER,
+            },
+        )
+        # Next pass with a working reporter delivers the leg, then ACKs
+        # the op effective without re-applying it.
+        gate = GateStubTransport(revision=0)
+        self.controller.gate_reporter = GateReporter(
+            "https://cp.invalid", "gate-token", transport=gate
+        )
+        members_before = list(self.controller.members())
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
+        self.assertEqual(list(self.controller.members()), members_before)
+        self.assertFalse(self.controller.gate_report_pending())
+        self.assertFalse((self.dir / "state" / "gate_pending.json").exists())
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 1)
+
+    def test_sync_rejects_and_advances_on_permanent_oserror(self):
+        """Findings 4507647320/4507647322: a permanent OSError from apply is
+        rejected and the cursor advances (never a silent hold that wedges the
+        queue). The terminal receipt is stored first, so a same-op retry
+        replays instead of re-applying."""
+        envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+
+        class FlakyController:
+            def __init__(self):
+                self.applies = 0
+
+            def apply_cp_releases(self, pending):
+                return None
+
+            def members(self):
+                return [ADMIN]
+
+            def gate_report_pending(self):
+                return False
+
+            def apply_cp_operation(self, operation_id, operation, acl):
+                self.applies += 1
+                if self.applies == 1:
+                    raise OSError("ENOSPC")
+                return {"kind": "cancel"}
+
+        stub = FlakyController()
+        first = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(first, {"applied": 0, "rejected": 1, "acked": 1})
+        self.assertEqual([ack["state"] for ack in transport.acks], ["rejected"])
+        receipts = json.loads((self.dir / "state" / "cp_receipts.json").read_bytes())
+        self.assertEqual(receipts[envelope["operationId"]]["state"], "rejected")
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 1)
+        # Retry: the frame is consumed (cursor advanced), the op never runs again.
+        second = self.client(transport).sync(stub)
+        self.assertEqual(stub.applies, 1)
+        self.assertEqual(second, {"applied": 0, "rejected": 0, "acked": 0})
+
+    def test_committed_cancel_staging_holds_and_drives_error(self):
+        """Findings 4507740330/4507647322, I3: a cancel whose rollback journal
+        committed but whose staging write fails is never stored rejected (the
+        commit stands) and never re-applied (the retry would take the
+        no-rollback branch, fence and park in ERROR). Instead: the workshop
+        drives ERROR visibly, the cursor holds, and the healed retry replays
+        effective without running cancel again. Fail-before: the old code
+        stores rejected, advances, and stays STARTING."""
+        from unittest import mock
+
+        from controller import Goal
+
+        session = str(uuid4())
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v1.0.0", session),
+            self.controller.status()["revision"],
+        )
+        self.controller.step()
+        self.backend.ready(Goal("workshop", "v1.0.0", session))
+        self.controller.step()
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v2.0.0", session),
+            self.controller.status()["revision"],
+        )
+        state = self.controller.step()
+        self.assertEqual(state["phase"], "STARTING")
+        self.assertIsNotNone(state.get("rollback"))
+        gate = GateStubTransport(revision=0)
+        self.controller.gate_reporter = GateReporter(
+            "https://cp.invalid", "gate-token", transport=gate
+        )
+        real_atomic_write = Controller._stage_gate_leg.__globals__["atomic_write"]
+
+        def fail_pending(path, *args, **kwargs):
+            if Path(path).name == "gate_pending.json":
+                raise OSError("ENOSPC")
+            return real_atomic_write(path, *args, **kwargs)
+
+        envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        with mock.patch("controller.atomic_write", side_effect=fail_pending):
+            result = self.client(transport).sync(self.controller)
+        # Held, not rejected: nothing ACKed, cursor unmoved, ERROR visible,
+        # rollback never re-applied (no fence of the restored backend).
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        self.assertEqual(self.controller.status()["phase"], "ERROR")
+        self.assertNotIn("fence", self.backend.events)
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        # Healed retry: the same frame re-applies vacuously (same-op branch:
+        # no second fence), stages the committed closed leg, and converges
+        # effective without running cancel again.
+        transport.event_frames = [envelope]
+        second = self.client(transport).sync(self.controller)
+        self.assertEqual(second, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
+        self.assertNotIn("fence", self.backend.events)
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 1)
+
+    def test_receipt_write_failure_after_commit_holds(self):
+        """Thread 4507741042 / I3: the terminal receipt store itself can fail
+        after a cancel fully committed (journal + backend restart + export +
+        delivery). sync must not let that local write escape, advance, or
+        reject: it holds, and the healed retry converges without re-running
+        the cancel (same-op idempotency key) or fencing. Fail-before: the old
+        code lets _store_receipt raise out of sync."""
+        from unittest import mock
+
+        from controller import Goal
+        from cp_client import CPClient
+
+        session = str(uuid4())
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v1.0.0", session),
+            self.controller.status()["revision"],
+        )
+        self.controller.step()
+        self.backend.ready(Goal("workshop", "v1.0.0", session))
+        self.controller.step()
+        self.controller.request(
+            str(uuid4()),
+            Goal("workshop", "v2.0.0", session),
+            self.controller.status()["revision"],
+        )
+        state = self.controller.step()
+        self.assertEqual(state["phase"], "STARTING")
+        gate = GateStubTransport(revision=0)
+        self.controller.gate_reporter = GateReporter(
+            "https://cp.invalid", "gate-token", transport=gate
+        )
+        envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        real_store = CPClient._store_receipt
+
+        def fail_terminal(client, operation_id, record):
+            if record.get("state") != "received":
+                raise OSError("EIO")
+            return real_store(client, operation_id, record)
+
+        with mock.patch.object(CPClient, "_store_receipt", autospec=True) as store:
+            store.side_effect = fail_terminal
+            result = self.client(transport).sync(self.controller)
+        # No raise, no ACKs, cursor held: the cancel committed exactly once.
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(transport.acks, [])
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+        fences = self.backend.events.count("fence")
+        self.assertEqual(fences, 1)
+        # Healed retry: the same frame is a no-op for the same cancel op id
+        # (no second fence), then ACKs effective and advances.
+        transport.event_frames = [envelope]
+        second = self.client(transport).sync(self.controller)
+        self.assertEqual(second, {"applied": 1, "rejected": 0, "acked": 1})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied", "effective"],
+        )
+        self.assertEqual(self.backend.events.count("fence"), fences)
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 1)
+
+    def test_effective_replay_requires_delivered_leg(self):
+        """I5: a held op replays effective only after its exact staged leg is
+        delivered ((seq, nonce) covering, or a newer delivered seq). A held
+        receipt whose leg is neither pending nor delivered holds instead of
+        going effective. Fail-before: the old code replays effective as soon
+        as no pending file exists."""
+
+        class BoomReporter:
+            def report(self, leg):
+                raise RuntimeError("cp down")
+
+        self.controller.gate_reporter = BoomReporter()
+        op = members_op(
+            {"draslId": DRASL, "name": "Nether"},
+            [dict(ADMIN), {"draslId": STRANGER, "name": "Stranger", "role": "builder"}],
+        )
+        envelope = frame(op, 1)
+        transport = FakeTransport(snapshot_doc(), [envelope])
+        result = self.client(transport).sync(self.controller)
+        self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
+        receipts = json.loads((self.dir / "state" / "cp_receipts.json").read_bytes())
+        marker = receipts[envelope["operationId"]].get("gate")
+        self.assertIs(type(marker), dict)
+        self.assertIs(type(marker["seq"]), int)
+        self.assertIs(type(marker["nonce"]), str)
+        # Tamper simulation: the pending marker is gone but the delivered
+        # record predates the held leg (it was never delivered). The retry
+        # must hold (applied-only replay), not ACK effective.
+        (self.dir / "state" / "gate_pending.json").unlink()
+        (self.dir / "state" / "gate_delivered.json").write_bytes(
+            json.dumps(
+                {
+                    "seq": marker["seq"] - 1,
+                    "nonce": "older",
+                    "leg": {
+                        "state": "closed",
+                        "message": "",
+                        "allowed": [],
+                    },
+                }
+            ).encode()
+        )
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        state["cursor"] = 0
+        (self.dir / "state" / "cp_state.json").write_bytes(json.dumps(state).encode())
+        transport.event_frames = [envelope]
+        held = self.client(transport).sync(self.controller)
+        self.assertEqual(held, {"applied": 0, "rejected": 0, "acked": 0})
+        self.assertEqual(
+            [ack["state"] for ack in transport.acks],
+            ["received", "validated", "applied"],
+        )
+        state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
+        self.assertEqual(state["cursor"], 0)
+
     def test_stranger_message_rejected_without_acl(self):
         stranger = {
             "kind": "message",
@@ -1009,6 +1341,164 @@ class CPClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a workshop member"):
             self.controller.apply_cp_operation(str(uuid4()), stranger, None)
         self.assertEqual(self.controller.message, self.controller.default_message)
+
+
+class GateStubTransport:
+    """Stub CP settings endpoint: GET returns the stored leg, PATCH advances it."""
+
+    url = "https://cp.invalid/v2/settings/gate/workshop"
+
+    def __init__(self, revision=0, value=None):
+        self.revision = revision
+        self.value = (
+            value
+            if value is not None
+            else {"state": "closed", "message": "", "allowed": []}
+        )
+        self.patches = []
+        self.fail_patch_once_with = None
+
+    def get_json(self, url, timeout):
+        assert url == self.url, url
+        return json.dumps(
+            {
+                "initialized": True,
+                "revision": self.revision,
+                "value": self.value,
+                "hash": "0" * 64,
+                "application": "see operation receipts",
+            }
+        ).encode()
+
+    def patch_json(self, url, body, timeout):
+        assert url == self.url, url
+        self.patches.append(body)
+        if self.fail_patch_once_with is not None:
+            status, self.fail_patch_once_with = self.fail_patch_once_with, None
+            raise CPHttpError("gate", status)
+        assert body["expectedRevision"] == self.revision, body
+        self.revision += 1
+        self.value = body["patch"]
+        return json.dumps(
+            {
+                "operationId": str(uuid4()),
+                "revision": self.revision,
+                "status": "accepted",
+                "result": {"revision": self.revision},
+            }
+        ).encode()
+
+
+class GateReporterTests(unittest.TestCase):
+    LEG = {
+        "state": "builders",
+        "message": "night build",
+        "allowed": [{"draslId": DRASL, "name": "Nether"}],
+    }
+
+    def reporter(self, transport):
+        return GateReporter("https://cp.invalid", "gate-token", transport=transport)
+
+    def test_no_write_when_unchanged(self):
+        transport = GateStubTransport(revision=4, value=dict(self.LEG))
+        result = self.reporter(transport).report(dict(self.LEG))
+        self.assertEqual(result, {"reported": False, "revision": 4})
+        self.assertEqual(transport.patches, [])
+
+    def test_patch_on_change(self):
+        transport = GateStubTransport(revision=3)
+        result = self.reporter(transport).report(dict(self.LEG))
+        self.assertEqual(result["reported"], True)
+        self.assertEqual(result["revision"], 4)
+        (body,) = transport.patches
+        self.assertEqual(body["expectedRevision"], 3)
+        self.assertEqual(body["patch"], self.LEG)
+        self.assertEqual(body["environment"], "prod")
+        self.assertEqual(body["backend"], "game")
+        self.assertTrue(body["idempotencyKey"].startswith("workshop-gate-3-"))
+
+    def test_conflict_refetches_once_and_retries(self):
+        transport = GateStubTransport(revision=3)
+        other = {"state": "closed", "message": "admin", "allowed": []}
+        real_patch = transport.patch_json
+        calls = {"n": 0}
+
+        def racing_patch(url, body, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Another writer lands between our read and our patch.
+                transport.revision = 4
+                transport.value = dict(other)
+                raise CPHttpError("gate", 409)
+            return real_patch(url, body, timeout)
+
+        transport.patch_json = racing_patch
+        result = self.reporter(transport).report(dict(self.LEG))
+        self.assertEqual(result["reported"], True)
+        self.assertEqual(result["revision"], 5)
+        self.assertEqual([b["expectedRevision"] for b in transport.patches], [4])
+
+    def test_conflict_resolved_when_other_writer_matches(self):
+        transport = GateStubTransport(revision=3)
+        transport.fail_patch_once_with = 409
+        calls = {"n": 0}
+        orig_get = transport.get_json
+
+        def racing_get(url, timeout):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # The racing writer reported our exact leg: no write needed.
+                transport.revision = 4
+                transport.value = dict(self.LEG)
+            return orig_get(url, timeout)
+
+        transport.get_json = racing_get
+        result = self.reporter(transport).report(dict(self.LEG))
+        self.assertEqual(result, {"reported": False, "revision": 4})
+        self.assertEqual(len(transport.patches), 1)
+
+    def test_repeated_conflict_raises(self):
+        transport = GateStubTransport(revision=3)
+
+        def always_conflict(url, body, timeout):
+            raise CPHttpError("gate", 409)
+
+        transport.patch_json = always_conflict
+        with self.assertRaises(CPHttpError):
+            self.reporter(transport).report(dict(self.LEG))
+
+    def test_denied_credential_is_explicit(self):
+        transport = GateStubTransport()
+
+        def denied(url, timeout):
+            raise CPHttpError("gate", 403)
+
+        transport.get_json = denied
+        with self.assertRaisesRegex(ValueError, "denied"):
+            self.reporter(transport).report(dict(self.LEG))
+
+    def test_from_env_disabled_without_token(self):
+        self.assertIsNone(GateReporter.from_env({}))
+
+    def test_from_env_rejects_plaintext(self):
+        with self.assertRaises(ValueError):
+            GateReporter.from_env(
+                {
+                    "BLOCKFIELD_CP_URL": "http://cp.invalid",
+                    "BLOCKFIELD_CP_GATE_TOKEN": "t",
+                }
+            )
+
+    def test_from_env_accepts_loopback_for_tests(self):
+        reporter = GateReporter.from_env(
+            {
+                "BLOCKFIELD_CP_URL": "http://127.0.0.1:9",
+                "BLOCKFIELD_CP_GATE_TOKEN": "t",
+            }
+        )
+        self.assertEqual(
+            reporter._url(), "http://127.0.0.1:9/v2/settings/gate/workshop"
+        )
 
 
 if __name__ == "__main__":

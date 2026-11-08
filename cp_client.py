@@ -40,7 +40,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-from controller import CP_RELEASE_LIMIT, member
+from controller import CommitIncompleteError, CP_RELEASE_LIMIT, member
 
 AGENT_PATH = "/v2/agents/{agent}"
 SNAPSHOT_TTL_S = 3600
@@ -253,6 +253,19 @@ class _UrllibTransport:
         )
         return _request_body(self.opener, request, timeout, "acks", MAX_FRAME_BYTES)
 
+    def patch_json(self, url: str, body: dict, timeout: float) -> bytes:
+        data = canonical(body)
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                **self._headers("application/json"),
+                "Content-Type": "application/json",
+            },
+            method="PATCH",
+        )
+        return _request_body(self.opener, request, timeout, "gate", MAX_FRAME_BYTES)
+
     def get_events(self, url: str, timeout: float) -> tuple[int, list[dict]]:
         request = urllib.request.Request(
             url, headers=self._headers("text/event-stream")
@@ -322,6 +335,112 @@ def _read_sse(response, timeout: float) -> list[dict]:
                 raise ValueError(f"cp frame exceeds {MAX_FRAME_BYTES} bytes")
         # "id:" (epoch:sequence) and retry/comments carry no payload here.
     return frames
+
+
+class GateReporter:
+    """Reports the controller gate leg to CP (unit CPP3).
+
+    Reads the current (gate, workshop) settings, PATCHes only when the leg
+    differs (idempotent, no write when unchanged). A 409 (someone else
+    reported meanwhile) refetches once and retries against the fresh
+    revision. Transport failures raise; callers must not let a failed
+    report block reconciliation. Disabled unless BLOCKFIELD_CP_GATE_TOKEN
+    (a service credential holding the workshop.gate scope) is set.
+    """
+
+    path = "/v2/settings/gate/workshop"
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        transport=None,
+        timeout_s: float = EVENT_TIMEOUT_S,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.transport = transport or _UrllibTransport(token)
+        self.timeout_s = timeout_s
+
+    @classmethod
+    def from_env(cls, env=os.environ, base_url=None):
+        token = (env.get("BLOCKFIELD_CP_GATE_TOKEN") or "").strip()
+        if not token:
+            return None
+        base = (base_url or env.get("BLOCKFIELD_CP_URL") or "").strip().rstrip("/")
+        if not base:
+            raise ValueError("BLOCKFIELD_CP_URL must be set for gate reporting")
+        scheme = urllib.parse.urlsplit(base).scheme.lower()
+        host = urllib.parse.urlsplit(base).hostname or ""
+        if scheme != "https" and not (
+            scheme == "http" and host in ("127.0.0.1", "localhost", "::1")
+        ):
+            raise ValueError("BLOCKFIELD_CP_URL must be https (http only for loopback)")
+        return cls(base, token)
+
+    def _url(self) -> str:
+        return self.base_url + self.path
+
+    def read(self) -> tuple[int, dict]:
+        """(revision, value) of the current leg; raises on transport failure."""
+        try:
+            raw = self.transport.get_json(self._url(), timeout=self.timeout_s)
+        except CPHttpError as error:
+            if error.status in (401, 403):
+                raise ValueError(
+                    "cp gate report denied: check gate credential"
+                ) from error
+            raise
+        try:
+            document = json.loads(raw.decode())
+        except ValueError:
+            raise ValueError("cp gate settings is not JSON")
+        if not isinstance(document, dict):
+            raise ValueError("cp gate settings is not an object")
+        revision = document.get("revision")
+        value = document.get("value")
+        if type(revision) is not int or not isinstance(value, dict):
+            raise ValueError("cp gate settings misses revision/value")
+        return revision, value
+
+    def _patch(self, revision: int, leg: dict) -> dict:
+        body = {
+            "idempotencyKey": f"workshop-gate-{revision}-{payload_hash(leg)[:16]}",
+            "environment": "prod",
+            "backend": "game",
+            "expectedRevision": revision,
+            "patch": leg,
+        }
+        raw = self.transport.patch_json(self._url(), body, timeout=self.timeout_s)
+        try:
+            document = json.loads(raw.decode())
+        except ValueError:
+            raise ValueError("cp gate report answer is not JSON") from None
+        if (
+            not isinstance(document, dict)
+            or type(document.get("revision")) is not int
+            or not document.get("operationId")
+        ):
+            raise ValueError("cp gate report answer misses revision/operationId")
+        return {
+            "reported": True,
+            "revision": document["revision"],
+            "operationId": document["operationId"],
+        }
+
+    def report(self, leg: dict) -> dict:
+        """PATCH the leg when it differs from CP; returns reported/revision."""
+        revision, current = self.read()
+        if current == leg:
+            return {"reported": False, "revision": revision}
+        try:
+            return self._patch(revision, leg)
+        except CPHttpError as error:
+            if error.status != 409:
+                raise
+            revision, current = self.read()
+            if current == leg:
+                return {"reported": False, "revision": revision}
+            return self._patch(revision, leg)
 
 
 class CPClient:
@@ -522,12 +641,55 @@ class CPClient:
         except (SnapshotRequired, ValueError):
             return None, state
 
+    @staticmethod
+    def _pending_marker(controller) -> dict:
+        """Identity a held ACK waits for: the current pending record, or seq
+        0 when it cannot be read (unknown: covered by any delivery, held
+        while anything is pending)."""
+        pending_fn = getattr(controller, "gate_pending_identity", None)
+        if callable(pending_fn):
+            try:
+                marker = pending_fn()
+            except OSError:
+                marker = None
+            if isinstance(marker, dict):
+                return marker
+        return {"seq": 0, "nonce": ""}
+
+    @staticmethod
+    def _gate_covers(controller, marker) -> bool:
+        """True when the delivered record covers the held leg identity: a
+        newer seq (in-order reporting delivered the held leg before
+        superseding it), or the exact (seq, nonce). Absent, unreadable,
+        older, or malformed records hold instead of going effective."""
+        if type(marker.get("seq")) is not int or type(marker.get("nonce")) is not str:
+            return False
+        delivered_fn = getattr(controller, "gate_delivered_identity", None)
+        if not callable(delivered_fn):
+            return True
+        try:
+            delivered = delivered_fn()
+        except OSError:
+            return False
+        if not isinstance(delivered, dict):
+            return False
+        if (
+            type(delivered.get("seq")) is not int
+            or type(delivered.get("nonce")) is not str
+        ):
+            return False
+        return delivered["seq"] > marker["seq"] or (
+            delivered["seq"] == marker["seq"] and delivered["nonce"] == marker["nonce"]
+        )
+
     def _nack(self, frame, state) -> tuple[int, int]:
         """Best-effort rejected receipt for an unauthenticatable frame.
 
         Returns (rejected, acked). The local cursor advances only past a
         delivered nack, so a failed one is retried on the next pass instead
-        of being counted and skipped.
+        of being counted and skipped. A local receipt-write failure holds
+        (returns zeros) instead of escaping: the frame never executed, so a
+        retry re-nacks safely.
         """
         if not isinstance(frame, dict):
             return 0, 0
@@ -536,9 +698,13 @@ class CPClient:
         if not (type(operation_id) is str and operation_id and type(sequence) is int):
             return 0, 0
         result = self._reject_result(frame, state["generation"])
-        self._store_receipt(
-            operation_id, {"state": "rejected", "sequence": sequence, "result": result}
-        )
+        try:
+            self._store_receipt(
+                operation_id,
+                {"state": "rejected", "sequence": sequence, "result": result},
+            )
+        except OSError:
+            return 0, 0
         try:
             self._post_ack(frame, "rejected", result)
         except Exception:
@@ -617,18 +783,56 @@ class CPClient:
                 "effective",
                 "rejected",
             ):
+                stored = receipts[operation_id]
+                pending_gate = getattr(controller, "gate_report_pending", None)
+                marker = stored.get("gate")
+                if (
+                    stored.get("state") == "effective"
+                    and isinstance(marker, dict)
+                    and callable(pending_gate)
+                    and pending_gate()
+                ):
+                    # Retry the delivery first (no controller lock is held
+                    # here): a pass that only replays must still converge
+                    # once CP is reachable again.
+                    flush = getattr(controller, "_flush_gate_report", None)
+                    if callable(flush):
+                        try:
+                            flush()
+                        except Exception:
+                            pass  # stays pending; the hold below retries later
+                    if pending_gate():
+                        # Leg still undelivered: re-send progress ACKs only
+                        # and hold the cursor, so effective follows delivery
+                        # instead of preceding it. The receipt is already
+                        # terminal: the op is never re-applied (cancel/wake
+                        # are not idempotent).
+                        self._replay_ack(frame, "applied", stored.get("result", "ok"))
+                        break
+                if stored.get("state") == "effective" and isinstance(marker, dict):
+                    # I5: effective replays only once the exact staged leg is
+                    # delivered (or a newer leg superseded it in order). A
+                    # held receipt whose leg is neither pending nor delivered
+                    # holds instead of going effective.
+                    if not self._gate_covers(controller, marker):
+                        self._replay_ack(frame, "applied", stored.get("result", "ok"))
+                        break
                 self._replay_ack(
                     frame,
-                    receipts[operation_id]["state"],
-                    receipts[operation_id].get("result", "ok"),
+                    stored["state"],
+                    stored.get("result", "ok"),
                 )
                 acked += 1
                 state["cursor"] = max(state["cursor"], sequence)
                 self._store_state()
                 continue
-            self._store_receipt(
-                operation_id, {"state": "received", "sequence": sequence}
-            )
+            try:
+                self._store_receipt(
+                    operation_id, {"state": "received", "sequence": sequence}
+                )
+            except OSError:
+                # Nothing applied yet; hold so the retry starts clean.
+                break
             try:
                 result = controller.apply_cp_operation(
                     operation_id, operation, self._acl(state, controller)
@@ -636,30 +840,90 @@ class CPClient:
             except BlockingIOError:
                 # Transient controller lock contention: hold the cursor and
                 # retry the whole pass later instead of skipping this frame.
+                # Every mutating op takes the controller lock before any
+                # commit, so contention raises pre-commit and the retry
+                # re-applies a never-started op (cancel included).
+                break
+            except CommitIncompleteError:
+                # The commit stands but its derivatives failed: never rejected
+                # (CP must retry, visibly held here), and the retry is safe.
+                # Commit sites with non-idempotent compensation ERROR-drove
+                # first (a retry lands on the vacuous "nothing to cancel"
+                # path, or matches its journal key); members/message re-apply
+                # idempotently; wake re-exports through its op-id dedup. No
+                # receipt is stored: the pre-existing received receipt routes
+                # the retry back through apply, never past it. (A receipt
+                # store itself can fail after a commit — thread 4507741042 —
+                # so the hold must not depend on one succeeding here.)
                 break
             except Exception:
-                self._store_receipt(
-                    operation_id,
-                    {
-                        "state": "rejected",
-                        "sequence": sequence,
-                        "result": "invalid_schema",
-                    },
-                )
+                # Rejected, cursor advances: schema violations and permanent
+                # local I/O failures (anything but lock contention) alike. A
+                # terminal receipt is stored first, so a same-op retry replays
+                # instead of re-applying a never-started op.
+                try:
+                    self._store_receipt(
+                        operation_id,
+                        {
+                            "state": "rejected",
+                            "sequence": sequence,
+                            "result": "invalid_schema",
+                        },
+                    )
+                except OSError:
+                    # Pre-commit failure, so the retry re-applies a
+                    # never-started op safely: hold instead of escaping.
+                    break
                 self._post_ack(frame, "rejected", "invalid_schema")
                 rejected += 1
                 acked += 1
             else:
+                # Fail-closed gate delivery: a members/gate op whose leg is
+                # still undelivered is never ACKed effective. Hold the cursor
+                # and retry the whole pass later (like lock contention above),
+                # so a narrowing change cannot read effective while CP still
+                # admits the old leg.
                 # CP only advances the durable cursor across contiguous
                 # receipts in state order, so walk it explicitly.
                 terminal = "applied" if result.get("started") is True else "effective"
+                if result.get("kind") in ("members", "message", "wake", "cancel"):
+                    pending_gate = getattr(controller, "gate_report_pending", None)
+                    if callable(pending_gate) and pending_gate():
+                        # Persist the terminal receipt before holding: the
+                        # next pass replays ACKs from it instead of
+                        # re-applying the op (cancel/wake are not idempotent).
+                        # The gate marker records which exact leg effective
+                        # waits for (I5). If the store itself fails, hold
+                        # anyway: the op is fully applied and its leg staged,
+                        # so the retry re-applies safely (cancel matches its
+                        # journal key and returns the state; members/message
+                        # re-apply idempotently; wake dedups by op id).
+                        try:
+                            self._store_receipt(
+                                operation_id,
+                                {
+                                    "state": terminal,
+                                    "sequence": sequence,
+                                    "result": "ok",
+                                    "gate": self._pending_marker(controller),
+                                },
+                            )
+                        except OSError:
+                            break
+                        break
                 # Durable first: if an ACK post below fails, the replay path
                 # re-sends ACKs for this stored receipt instead of running the
-                # op again (cancel/wake are not idempotent).
-                self._store_receipt(
-                    operation_id,
-                    {"state": terminal, "sequence": sequence, "result": "ok"},
-                )
+                # op again (cancel matches its journal key; members/message
+                # re-apply idempotently; wake dedups by op id).
+                try:
+                    self._store_receipt(
+                        operation_id,
+                        {"state": terminal, "sequence": sequence, "result": "ok"},
+                    )
+                except OSError:
+                    # Fully applied but the receipt is lost: hold. The retry
+                    # re-applies safely (see above) and converges from there.
+                    break
                 for progress in ("received", "validated", "applied"):
                     self._post_ack(frame, progress)
                 if terminal == "effective":

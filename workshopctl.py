@@ -140,6 +140,9 @@ def build_controller(
     controller.cp_client = (
         cp_client.CPClient(cp_config, directory) if cp_config is not None else None
     )
+    controller.gate_reporter = cp_client.GateReporter.from_env(
+        env, base_url=cp_config.base_url if cp_config is not None else None
+    )
     return controller, backend
 
 
