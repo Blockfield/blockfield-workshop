@@ -149,6 +149,45 @@ LIVE_ONLY_KINDS = {
 AI_KEY_PATTERN = re.compile(r"[\x21-\x7e]{20,2048}")
 AI_KEY_UID = 1000
 AI_KEY_GID = 1000
+# Workshop AI sidecar key (server#321): <workshop data>/blockfield-workshop/ai-sidecar.key,
+# 0600 1000:1000. The controller writes it once; the sidecar reads it as its Bearer secret
+# and the game container mounts a read-only copy. Base64url keeps it a valid single-token
+# Bearer value; it never appears in logs, results or exports.
+AI_SIDECAR_KEY_NAME = "ai-sidecar.key"
+AI_SIDECAR_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,2048}")
+
+
+def ensure_ai_sidecar_key(base: Path) -> Path:
+    """Create the AI sidecar Bearer secret once; never rotate or overwrite here.
+
+    Returns the key path. An existing file (or symlink attack surface) is left alone:
+    rotation is an explicit operator action, not a controller step.
+    """
+    directory, path = (
+        Path(base) / "blockfield-workshop",
+        Path(base) / f"blockfield-workshop/{AI_SIDECAR_KEY_NAME}",
+    )
+    if path.exists() or path.is_symlink():
+        return path
+    try:
+        info = os.stat(directory)
+    except FileNotFoundError:
+        directory.mkdir(mode=0o755, parents=True)
+        os.chmod(directory, 0o755)
+        os.chown(directory, AI_KEY_UID, AI_KEY_GID)
+    else:
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != AI_KEY_UID
+            or info.st_gid != AI_KEY_GID
+        ):
+            raise ValueError("unsafe ai-sidecar-key directory")
+    data = secrets.token_urlsafe(32).encode()
+    assert AI_SIDECAR_KEY_PATTERN.fullmatch(data.decode())
+    atomic_write(path, data, owner=(AI_KEY_UID, AI_KEY_GID))
+    return path
+
+
 # Provider registry ids (contract with the site): presets keep their historic key
 # file and status names; a custom id uses <id>.key and <id>-key.json. The shape
 # excludes dots and slashes, so a custom file name can never escape its directory.
@@ -362,6 +401,9 @@ class Controller:
                 os.chmod(path, 0o755)
             ensure_workshop_key(self.admin_dir / "workshop.key")
         self.backend = backend
+        base = self._workshop_data_base()
+        if base is not None:
+            ensure_ai_sidecar_key(base)
         # Gate-report delivery state (unit CPP3-R4): files are the only
         # truth. gate_pending.json = {seq, leg} desired-but-undelivered;
         # gate_delivered.json = {seq, leg} last confirmed on CP. No

@@ -9,6 +9,10 @@ services:
       BLOCKFIELD_WORKSHOP_AI_USAGE_FILE: /data/blockfield-workshop/ai-usage.json
       # At approved enablement, the owner supplies BLOCKFIELD_WORKSHOP_AI_OPENROUTER_KEY
       # in this service's private environment: a separate capped normal-credit key.
+      # AI sidecar (server#321): URL plus the read-only copy of the controller-written
+      # ai-sidecar.key the mod presents as Bearer; provider keys never mount here.
+      BLOCKFIELD_WORKSHOP_AI_SIDECAR_URL: http://ai-sidecar:8101
+      BLOCKFIELD_WORKSHOP_AI_SIDECAR_KEY_FILE: /etc/ai-sidecar/ai-sidecar.key
     volumes:
       - type: bind
         source: /srv/minecraft/workshop/data
@@ -17,4 +21,26 @@ services:
       - type: bind
         source: /srv/minecraft/views/blockfield-admin
         target: /blockfield-admin
+        read_only: true
+      - type: bind
+        source: /srv/minecraft/workshop/data/blockfield-workshop/ai-sidecar.key
+        target: /etc/ai-sidecar/ai-sidecar.key
+        read_only: true
+  # Workshop AI sidecar (server#321): own image next to the controller (ai-sidecar/Dockerfile).
+  # Provider keys mount sidecar-only; the game container above sees only ai-sidecar.key.
+  ai-sidecar:
+    image: ghcr.io/blockfield/blockfield-workshop-ai-sidecar:approved
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      AI_SIDECAR_BIND: 0.0.0.0
+      AI_SIDECAR_PORT: 8101
+      AI_SIDECAR_KEY_FILE: /keys/ai-sidecar.key
+    volumes:
+      - type: bind
+        source: /srv/minecraft/workshop/data/blockfield-workshop
+        target: /keys
         read_only: true
