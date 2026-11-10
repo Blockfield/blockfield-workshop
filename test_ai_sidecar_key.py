@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import controller
 from controller import (
     AI_SIDECAR_KEY_NAME,
     AI_SIDECAR_KEY_PATTERN,
@@ -380,6 +381,67 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
                 before = text
             else:
                 self.assertEqual(text, before, "restart never rotates the key")
+
+
+class ProviderKeyAsOwnerTests(unittest.TestCase):
+    """r4521877438: a root controller applies provider keys as the key owner."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name) / "workshop-data"
+        (self.base / "blockfield-workshop").mkdir(parents=True)
+        owner = mock.patch("controller.AI_KEY_UID", os.getuid())
+        owner.start()
+        self.addCleanup(owner.stop)
+
+    def run_as_owner(self, key):
+        import subprocess
+
+        real_run = subprocess.run
+        seen = {}
+
+        def drop_check(args, **kwargs):
+            seen["kwargs"] = dict(kwargs)
+            seen["args"] = list(args)
+            # A test cannot setuid; the child must agree on the owner uid.
+            script = args[3].replace(
+                "import controller\n",
+                "import controller, os\ncontroller.AI_KEY_UID = os.geteuid()\n",
+            )
+            for name in ("user", "group", "extra_groups"):
+                kwargs.pop(name)
+            return real_run([*args[:3], script, *args[4:]], **kwargs)
+
+        with (
+            mock.patch("controller.os.geteuid", return_value=0),
+            mock.patch("subprocess.run", side_effect=drop_check),
+        ):
+            stored = controller._write_ai_key_as_owner(
+                self.base, "openrouter.key", "ai-key", key
+            )
+        return stored, seen
+
+    def test_root_writes_and_removes_through_owner_child(self):
+        key = "sk-or-" + "a" * 40
+        stored, seen = self.run_as_owner(key)
+        self.assertEqual(seen["kwargs"]["user"], os.getuid())
+        self.assertEqual(seen["kwargs"]["extra_groups"], [])
+        self.assertNotIn(key, " ".join(seen["args"]))  # key only on stdin
+        self.assertEqual(stored["last4"], key[-4:])
+        path = self.base / "blockfield-workshop" / "openrouter.key"
+        self.assertEqual(path.read_text(), key)
+        stored, _ = self.run_as_owner(None)
+        self.assertFalse(stored["set"])
+        self.assertFalse(path.exists())
+
+    def test_child_failure_is_a_value_error_without_the_key(self):
+        os.chmod(self.base / "blockfield-workshop", 0o777)
+        key = "sk-or-" + "b" * 40
+        with self.assertRaises(ValueError) as caught:
+            self.run_as_owner(key)
+        self.assertIn("unsafe ai-key directory", str(caught.exception))
+        self.assertNotIn(key, str(caught.exception))
 
 
 if __name__ == "__main__":

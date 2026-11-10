@@ -364,6 +364,86 @@ def _replace_ai_key(dir_fd: int, filename: str, data: bytes, *, kind: str) -> No
             pass
 
 
+def _write_ai_key(base, filename: str, kind: str, key: str | None) -> dict:
+    """Set (or with None remove) one provider key; runs as the key owner.
+
+    Returns the public summary only; the key never reaches the result,
+    logs or exceptions.
+    """
+    base_fd, dir_fd = _open_pinned_ai_key_dir(Path(base), kind=kind)
+    try:
+        _require_owned_ai_key_dir(
+            dir_fd, kind=kind, display=f"{base}/blockfield-workshop"
+        )
+        if key is None:
+            try:
+                os.unlink(filename, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+            return {"set": False, "last4": "", "sha256Prefix": ""}
+        data = key.encode()
+        _replace_ai_key(dir_fd, filename, data, kind=kind)
+        return {
+            "set": True,
+            "last4": key[-4:],
+            "sha256Prefix": hashlib.sha256(data).hexdigest()[:8],
+        }
+    finally:
+        os.close(dir_fd)
+        os.close(base_fd)
+
+
+# Child for a root controller: the key work runs as the key owner, so root
+# never touches the directory the workshop user can write. The key arrives on
+# stdin, never in argv; only the summary or a ValueError message comes back.
+_AI_KEY_CHILD = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import controller
+request = json.load(sys.stdin)
+try:
+    stored = controller._write_ai_key(
+        request["base"], request["filename"], request["kind"], request["key"]
+    )
+except ValueError as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(2)
+print(json.dumps(stored))
+"""
+
+
+def _write_ai_key_as_owner(base, filename: str, kind: str, key: str | None) -> dict:
+    """Run _write_ai_key as AI_KEY_UID: in-process when we are that user,
+    in a child that drops to it when we are root, refused otherwise."""
+    if os.geteuid() != 0:
+        return _write_ai_key(base, filename, kind, key)
+    import subprocess
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _AI_KEY_CHILD,
+            str(Path(__file__).resolve().parent),
+        ],
+        input=json.dumps(
+            {"base": str(base), "filename": filename, "kind": kind, "key": key}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        user=AI_KEY_UID,
+        group=AI_KEY_GID,
+        extra_groups=[],
+    )
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        reason = lines[-1][:300] if lines else f"exit {result.returncode}"
+        raise ValueError(f"{kind} as uid {AI_KEY_UID} failed: {reason}")
+    return json.loads(result.stdout)
+
+
 def ensure_ai_sidecar_key(base: Path) -> Path:
     """Create the AI sidecar Bearer secret once; never rotate or overwrite here.
 
@@ -3490,30 +3570,7 @@ class Controller:
                     base = apps["workshop"].data
             if base is None:
                 raise ValueError("workshop data directory is not configured")
-            base_fd, dir_fd = _open_pinned_ai_key_dir(base, kind=kind)
-            try:
-                _require_owned_ai_key_dir(
-                    dir_fd,
-                    kind=kind,
-                    display=f"{base}/blockfield-workshop",
-                )
-                if key is None:
-                    try:
-                        os.unlink(filename, dir_fd=dir_fd)
-                    except FileNotFoundError:
-                        pass
-                    stored = {"set": False, "last4": "", "sha256Prefix": ""}
-                else:
-                    data = key.encode()
-                    _replace_ai_key(dir_fd, filename, data, kind=kind)
-                    stored = {
-                        "set": True,
-                        "last4": key[-4:],
-                        "sha256Prefix": hashlib.sha256(data).hexdigest()[:8],
-                    }
-            finally:
-                os.close(dir_fd)
-                os.close(base_fd)
+            stored = _write_ai_key_as_owner(base, filename, kind, key)
             applied_at = self._now_ms()
             atomic_write(
                 self.admin_dir / status_name,
