@@ -33,8 +33,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
+import ipaddress
 import json
 import os
+import re
+import socket
 import time
 import urllib.request
 import urllib.error
@@ -65,6 +68,44 @@ class CPHttpError(ValueError):
         self.status = status
 
 
+# A DNS label that starts with a letter: never a numeric IPv4 form like 134744072.
+_SERVICE_NAME = re.compile(r"[a-z]([a-z0-9-]*[a-z0-9])?")
+
+
+# RFC 6598 shared space: Python calls it neither private nor global.
+_SHARED_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _resolves_privately(host: str) -> bool:
+    # A search domain could map a bare name to a public host; plaintext is only
+    # for names that resolve to overlay/loopback addresses alone.
+    # An unresolvable name is a transient start-up failure (OSError, the
+    # orchestrator restarts us), not a configuration error.
+    infos = socket.getaddrinfo(host, None)
+    addresses = {ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos}
+    return bool(addresses) and all(
+        a.is_private or a.is_loopback or a in _SHARED_SPACE for a in addresses
+    )
+
+
+def _check_cp_url(base: str) -> None:
+    # CP has no public domain: prod reaches it over the private Docker overlay by
+    # its single-label service name, like the game server and proxy do. A dotted
+    # host could resolve publicly, so plaintext stays refused for it.
+    parts = urllib.parse.urlsplit(base)
+    host = parts.hostname or ""
+    if parts.scheme.lower() == "https":
+        return
+    if parts.scheme.lower() == "http" and (
+        host in ("127.0.0.1", "localhost", "::1")
+        or (_SERVICE_NAME.fullmatch(host) and _resolves_privately(host))
+    ):
+        return
+    raise ValueError(
+        "BLOCKFIELD_CP_URL must be https (http only for loopback or an internal service name)"
+    )
+
+
 @dataclass(frozen=True)
 class CPConfig:
     base_url: str
@@ -80,12 +121,7 @@ class CPConfig:
         token = env.get("BLOCKFIELD_CP_AGENT_TOKEN") or ""
         if not base or not agent or not token:
             return None
-        scheme = urllib.parse.urlsplit(base).scheme.lower()
-        host = urllib.parse.urlsplit(base).hostname or ""
-        if scheme != "https" and not (
-            scheme == "http" and host in ("127.0.0.1", "localhost", "::1")
-        ):
-            raise ValueError("BLOCKFIELD_CP_URL must be https (http only for loopback)")
+        _check_cp_url(base)
         try:
             timeout = float(env.get("BLOCKFIELD_CP_POLL_TIMEOUT_S", EVENT_TIMEOUT_S))
         except (TypeError, ValueError):
@@ -229,7 +265,12 @@ def _request_body(opener, request, timeout: float, what: str, cap: int) -> bytes
 class _UrllibTransport:
     def __init__(self, token: str):
         self.token = token
-        self.opener = urllib.request.build_opener(_NoRedirect)
+        # A plaintext (overlay) bearer must never go through HTTP_PROXY; an
+        # HTTPS CP keeps the environment's HTTPS proxy.
+        proxies = {k: v for k, v in urllib.request.getproxies().items() if k != "http"}
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler(proxies), _NoRedirect
+        )
 
     def _headers(self, accept: str) -> dict:
         return {"Authorization": f"Bearer {self.token}", "Accept": accept}
@@ -369,12 +410,7 @@ class GateReporter:
         base = (base_url or env.get("BLOCKFIELD_CP_URL") or "").strip().rstrip("/")
         if not base:
             raise ValueError("BLOCKFIELD_CP_URL must be set for gate reporting")
-        scheme = urllib.parse.urlsplit(base).scheme.lower()
-        host = urllib.parse.urlsplit(base).hostname or ""
-        if scheme != "https" and not (
-            scheme == "http" and host in ("127.0.0.1", "localhost", "::1")
-        ):
-            raise ValueError("BLOCKFIELD_CP_URL must be https (http only for loopback)")
+        _check_cp_url(base)
         return cls(base, token)
 
     def _url(self) -> str:
