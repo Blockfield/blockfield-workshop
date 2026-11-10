@@ -288,3 +288,36 @@ class PackagingFunctionalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ImageModuleClosureTest(unittest.TestCase):
+    def test_every_local_module_the_entrypoint_imports_is_copied(self):
+        """A local module missing from the image COPY list crashes the controller
+        at start (prod 2026-11-10: desired.py and cp_client.py were not copied)."""
+        import ast
+
+        text = DOCKERFILE.read_text()
+        copy = re.search(r"^COPY (.*?) /app/$", text, re.M | re.S).group(1)
+        copied = {name for name in re.split(r"[\\\s]+", copy) if name.endswith(".py")}
+        local = {
+            path.name for path in ROOT.glob("*.py") if not path.name.startswith("test_")
+        }
+        seen, todo = set(), ["entrypoint.py"]
+        while todo:
+            name = todo.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            for node in ast.walk(ast.parse((ROOT / name).read_text())):
+                modules = []
+                if isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                elif (
+                    isinstance(node, ast.ImportFrom) and node.module and not node.level
+                ):
+                    modules = [node.module]
+                for module in modules:
+                    file = module.split(".")[0] + ".py"
+                    if file in local:
+                        todo.append(file)
+        self.assertEqual(sorted(seen - copied), [])
