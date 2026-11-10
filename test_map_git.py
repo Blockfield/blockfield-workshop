@@ -523,6 +523,17 @@ class MapLinearTests(unittest.TestCase):
             self.store.create("fresh", ACTOR, expected_head=None)
         self.assertEqual(self.versions.head("fresh")["versionDigest"], head)
 
+    def test_interrupted_first_publish_retries_to_converge(self):
+        # r4524665112: a first publish (expectedHead null) that activated but
+        # stopped before returning must recover on retry, not fail as stale.
+        self.seed_draft_map()
+        first = self.store.create("fresh", ACTOR, expected_head=None)
+        self.store.publish(first["id"], ACTOR, expected_head=None)
+        head = self.versions.head("fresh")["versionDigest"]
+        again = self.store.publish(first["id"], ACTOR, expected_head=None)
+        self.assertEqual(again["status"], "accepted")
+        self.assertEqual(self.versions.head("fresh")["versionDigest"], head)
+
     def test_session_publish_then_keep_editing_then_publish_again(self):
         # Core flow: the publishing copy advances onto the new head with its
         # pending-review edits intact, so the same session can publish again.

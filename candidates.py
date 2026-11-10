@@ -480,8 +480,9 @@ class MapStore:
             map_id = meta["mapId"]
             head = self.versions.head(map_id)
             if (
-                expected_head is not None
-                and not force
+                # expectedHead null is an explicit expectation (first publish),
+                # so its interrupted retry recovers here like any other.
+                not force
                 and head is not None
                 and meta.get("status") == "accepted"
                 and meta.get("committedVersion") == meta.get("versionDigest")
