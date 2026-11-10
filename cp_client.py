@@ -72,15 +72,20 @@ class CPHttpError(ValueError):
 _SERVICE_NAME = re.compile(r"[a-z]([a-z0-9-]*[a-z0-9])?")
 
 
+# RFC 6598 shared space: Python calls it neither private nor global.
+_SHARED_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
+
 def _resolves_privately(host: str) -> bool:
     # A search domain could map a bare name to a public host; plaintext is only
     # for names that resolve to overlay/loopback addresses alone.
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError:
-        return False
+    # An unresolvable name is a transient start-up failure (OSError, the
+    # orchestrator restarts us), not a configuration error.
+    infos = socket.getaddrinfo(host, None)
     addresses = {ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos}
-    return bool(addresses) and all(a.is_private or a.is_loopback for a in addresses)
+    return bool(addresses) and all(
+        a.is_private or a.is_loopback or a in _SHARED_SPACE for a in addresses
+    )
 
 
 def _check_cp_url(base: str) -> None:
@@ -260,10 +265,11 @@ def _request_body(opener, request, timeout: float, what: str, cap: int) -> bytes
 class _UrllibTransport:
     def __init__(self, token: str):
         self.token = token
-        # CP is only on loopback or the private overlay: never route its bearer
-        # through an HTTP(S)_PROXY from the environment.
+        # A plaintext (overlay) bearer must never go through HTTP_PROXY; an
+        # HTTPS CP keeps the environment's HTTPS proxy.
+        proxies = {k: v for k, v in urllib.request.getproxies().items() if k != "http"}
         self.opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _NoRedirect
+            urllib.request.ProxyHandler(proxies), _NoRedirect
         )
 
     def _headers(self, accept: str) -> dict:

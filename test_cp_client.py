@@ -810,6 +810,30 @@ class CPClientTests(unittest.TestCase):
                 }
             )
 
+    def test_shared_space_service_name_allowed_for_cp_url(self):
+        self._resolve_to("100.64.3.4")
+        config = CPConfig.from_env(
+            {
+                "BLOCKFIELD_CP_URL": "http://app-cp-service:8080",
+                "BLOCKFIELD_CP_AGENT_ID": AGENT,
+                "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+            }
+        )
+        self.assertEqual(config.base_url, "http://app-cp-service:8080")
+
+    def test_unresolved_service_name_is_transient(self):
+        from unittest import mock
+
+        with mock.patch("cp_client.socket.getaddrinfo", side_effect=OSError("dns")):
+            with self.assertRaises(OSError):
+                CPConfig.from_env(
+                    {
+                        "BLOCKFIELD_CP_URL": "http://app-cp-service:8080",
+                        "BLOCKFIELD_CP_AGENT_ID": AGENT,
+                        "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                    }
+                )
+
     def test_internal_service_name_http_allowed_for_cp_url(self):
         self._resolve_to("10.0.1.7")
         base = "http://app-cp-service:8080"
@@ -843,14 +867,15 @@ class CPClientTests(unittest.TestCase):
         from cp_client import _UrllibTransport
 
         env = {
-            "HTTP_PROXY": "http://proxy.invalid:1",
             "http_proxy": "http://proxy.invalid:1",
+            "https_proxy": "http://proxy.invalid:2",
         }
         with mock.patch.dict("os.environ", env):
             handlers = _UrllibTransport("t").opener.handlers
-        self.assertFalse(
-            [h for h in handlers if isinstance(h, urllib.request.ProxyHandler)]
-        )
+        proxies = [
+            h.proxies for h in handlers if isinstance(h, urllib.request.ProxyHandler)
+        ]
+        self.assertEqual(proxies, [{"https": "http://proxy.invalid:2"}])
 
     def test_redirect_refused_without_bearer(self):
         import http.server
