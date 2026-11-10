@@ -791,7 +791,27 @@ class CPClientTests(unittest.TestCase):
             )
             self.assertEqual(config.base_url, base)
 
+    def _resolve_to(self, address):
+        from unittest import mock
+
+        info = [(2, 1, 6, "", (address, 0))]
+        patcher = mock.patch("cp_client.socket.getaddrinfo", return_value=info)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_service_name_resolving_publicly_refused_for_cp_url(self):
+        self._resolve_to("8.8.8.8")
+        with self.assertRaisesRegex(ValueError, "https"):
+            CPConfig.from_env(
+                {
+                    "BLOCKFIELD_CP_URL": "http://app-cp-service:8080",
+                    "BLOCKFIELD_CP_AGENT_ID": AGENT,
+                    "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                }
+            )
+
     def test_internal_service_name_http_allowed_for_cp_url(self):
+        self._resolve_to("10.0.1.7")
         base = "http://app-cp-service:8080"
         config = CPConfig.from_env(
             {

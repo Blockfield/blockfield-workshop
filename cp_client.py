@@ -33,9 +33,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 import urllib.request
 import urllib.error
@@ -70,6 +72,17 @@ class CPHttpError(ValueError):
 _SERVICE_NAME = re.compile(r"[a-z]([a-z0-9-]*[a-z0-9])?")
 
 
+def _resolves_privately(host: str) -> bool:
+    # A search domain could map a bare name to a public host; plaintext is only
+    # for names that resolve to overlay/loopback addresses alone.
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    addresses = {ipaddress.ip_address(info[4][0].split("%")[0]) for info in infos}
+    return bool(addresses) and all(a.is_private or a.is_loopback for a in addresses)
+
+
 def _check_cp_url(base: str) -> None:
     # CP has no public domain: prod reaches it over the private Docker overlay by
     # its single-label service name, like the game server and proxy do. A dotted
@@ -79,7 +92,8 @@ def _check_cp_url(base: str) -> None:
     if parts.scheme.lower() == "https":
         return
     if parts.scheme.lower() == "http" and (
-        host in ("127.0.0.1", "localhost", "::1") or _SERVICE_NAME.fullmatch(host)
+        host in ("127.0.0.1", "localhost", "::1")
+        or (_SERVICE_NAME.fullmatch(host) and _resolves_privately(host))
     ):
         return
     raise ValueError(
