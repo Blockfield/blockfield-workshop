@@ -5,6 +5,7 @@ from release_fixtures import catalog
 import json
 import tempfile
 import unittest
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -804,6 +805,32 @@ class CPClientTests(unittest.TestCase):
             {"BLOCKFIELD_CP_URL": base, "BLOCKFIELD_CP_GATE_TOKEN": "t"}
         )
         self.assertEqual(reporter.base_url, base)
+
+    def test_numeric_host_http_refused_for_cp_url(self):
+        for base in ("http://134744072", "http://0x8080808", "http://cp.internal"):
+            with self.assertRaisesRegex(ValueError, "https"):
+                CPConfig.from_env(
+                    {
+                        "BLOCKFIELD_CP_URL": base,
+                        "BLOCKFIELD_CP_AGENT_ID": AGENT,
+                        "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                    }
+                )
+
+    def test_transport_ignores_environment_proxy(self):
+        from unittest import mock
+
+        from cp_client import _UrllibTransport
+
+        env = {
+            "HTTP_PROXY": "http://proxy.invalid:1",
+            "http_proxy": "http://proxy.invalid:1",
+        }
+        with mock.patch.dict("os.environ", env):
+            handlers = _UrllibTransport("t").opener.handlers
+        self.assertFalse(
+            [h for h in handlers if isinstance(h, urllib.request.ProxyHandler)]
+        )
 
     def test_redirect_refused_without_bearer(self):
         import http.server

@@ -35,6 +35,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import re
 import time
 import urllib.request
 import urllib.error
@@ -65,6 +66,10 @@ class CPHttpError(ValueError):
         self.status = status
 
 
+# A DNS label that starts with a letter: never a numeric IPv4 form like 134744072.
+_SERVICE_NAME = re.compile(r"[a-z]([a-z0-9-]*[a-z0-9])?")
+
+
 def _check_cp_url(base: str) -> None:
     # CP has no public domain: prod reaches it over the private Docker overlay by
     # its single-label service name, like the game server and proxy do. A dotted
@@ -74,8 +79,7 @@ def _check_cp_url(base: str) -> None:
     if parts.scheme.lower() == "https":
         return
     if parts.scheme.lower() == "http" and (
-        host in ("127.0.0.1", "localhost", "::1")
-        or (host and "." not in host and ":" not in host)
+        host in ("127.0.0.1", "localhost", "::1") or _SERVICE_NAME.fullmatch(host)
     ):
         return
     raise ValueError(
@@ -242,7 +246,11 @@ def _request_body(opener, request, timeout: float, what: str, cap: int) -> bytes
 class _UrllibTransport:
     def __init__(self, token: str):
         self.token = token
-        self.opener = urllib.request.build_opener(_NoRedirect)
+        # CP is only on loopback or the private overlay: never route its bearer
+        # through an HTTP(S)_PROXY from the environment.
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect
+        )
 
     def _headers(self, accept: str) -> dict:
         return {"Authorization": f"Bearer {self.token}", "Accept": accept}
