@@ -65,6 +65,24 @@ class CPHttpError(ValueError):
         self.status = status
 
 
+def _check_cp_url(base: str) -> None:
+    # CP has no public domain: prod reaches it over the private Docker overlay by
+    # its single-label service name, like the game server and proxy do. A dotted
+    # host could resolve publicly, so plaintext stays refused for it.
+    parts = urllib.parse.urlsplit(base)
+    host = parts.hostname or ""
+    if parts.scheme.lower() == "https":
+        return
+    if parts.scheme.lower() == "http" and (
+        host in ("127.0.0.1", "localhost", "::1")
+        or (host and "." not in host and ":" not in host)
+    ):
+        return
+    raise ValueError(
+        "BLOCKFIELD_CP_URL must be https (http only for loopback or an internal service name)"
+    )
+
+
 @dataclass(frozen=True)
 class CPConfig:
     base_url: str
@@ -80,12 +98,7 @@ class CPConfig:
         token = env.get("BLOCKFIELD_CP_AGENT_TOKEN") or ""
         if not base or not agent or not token:
             return None
-        scheme = urllib.parse.urlsplit(base).scheme.lower()
-        host = urllib.parse.urlsplit(base).hostname or ""
-        if scheme != "https" and not (
-            scheme == "http" and host in ("127.0.0.1", "localhost", "::1")
-        ):
-            raise ValueError("BLOCKFIELD_CP_URL must be https (http only for loopback)")
+        _check_cp_url(base)
         try:
             timeout = float(env.get("BLOCKFIELD_CP_POLL_TIMEOUT_S", EVENT_TIMEOUT_S))
         except (TypeError, ValueError):
@@ -369,12 +382,7 @@ class GateReporter:
         base = (base_url or env.get("BLOCKFIELD_CP_URL") or "").strip().rstrip("/")
         if not base:
             raise ValueError("BLOCKFIELD_CP_URL must be set for gate reporting")
-        scheme = urllib.parse.urlsplit(base).scheme.lower()
-        host = urllib.parse.urlsplit(base).hostname or ""
-        if scheme != "https" and not (
-            scheme == "http" and host in ("127.0.0.1", "localhost", "::1")
-        ):
-            raise ValueError("BLOCKFIELD_CP_URL must be https (http only for loopback)")
+        _check_cp_url(base)
         return cls(base, token)
 
     def _url(self) -> str:

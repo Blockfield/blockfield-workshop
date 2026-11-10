@@ -790,6 +790,21 @@ class CPClientTests(unittest.TestCase):
             )
             self.assertEqual(config.base_url, base)
 
+    def test_internal_service_name_http_allowed_for_cp_url(self):
+        base = "http://app-cp-service:8080"
+        config = CPConfig.from_env(
+            {
+                "BLOCKFIELD_CP_URL": base,
+                "BLOCKFIELD_CP_AGENT_ID": AGENT,
+                "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+            }
+        )
+        self.assertEqual(config.base_url, base)
+        reporter = GateReporter.from_env(
+            {"BLOCKFIELD_CP_URL": base, "BLOCKFIELD_CP_GATE_TOKEN": "t"}
+        )
+        self.assertEqual(reporter.base_url, base)
+
     def test_redirect_refused_without_bearer(self):
         import http.server
         import os
