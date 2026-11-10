@@ -1004,6 +1004,7 @@ class AiProviderKeyInboxTests(unittest.TestCase):
             ("non-string", {"provider": 7, "key": self.key}),
             ("missing", {"key": self.key}),
             ("reserved key stem", {"provider": "gateway", "key": self.key}),
+            ("reserved sidecar key", {"provider": "ai-sidecar", "key": self.key}),
             ("reserved status stem", {"provider": "ai", "key": self.key}),
             ("bad key", {"provider": self.CUSTOM, "key": "x" * 19}),
         ):

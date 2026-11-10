@@ -2,10 +2,12 @@
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import controller
 from controller import (
     AI_SIDECAR_KEY_NAME,
     AI_SIDECAR_KEY_PATTERN,
@@ -104,6 +106,89 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 ensure_ai_sidecar_key(self.base)
+
+    def test_symlink_swap_during_harden_leaves_victim_alone(self):
+        """A dir-writer swapping the key for a symlink mid-harden must not
+        move ownership/mode changes onto the target (r4520336542)."""
+        path = self.key_path()
+        path.parent.mkdir(parents=True)
+        path.write_text("operator-managed-secret-0123456789-_AB")
+        victim = self.dir / "victim.txt"
+        victim.write_text("victim-content-here-0123456789ABCD")
+        os.chmod(victim, 0o644)
+        real_chown = os.chown
+
+        def swapping_chown(target, *args):
+            if Path(target) == path:
+                path.unlink()
+                path.symlink_to(victim)
+            return real_chown(target, *args)
+
+        with mock.patch("controller.os.chown", side_effect=swapping_chown):
+            ensure_ai_sidecar_key(self.base)
+        self.assertEqual(victim.read_text(), "victim-content-here-0123456789ABCD")
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
+
+    def test_concurrent_creators_commit_single_key(self):
+        """Racers starting with the key absent end with one key: the loser
+        reads the winner instead of rotating it (r4520336551)."""
+        workers = 8
+        (self.base / "blockfield-workshop").mkdir(parents=True)
+        gate = threading.Barrier(workers)
+        lock = threading.Lock()
+        given = iter(f"race-{i:04d}-" + "k" * 24 for i in range(workers))
+
+        def token_urlsafe(_size):
+            with lock:
+                value = next(given)
+            gate.wait(timeout=30)
+            return value
+
+        key = self.key_path()
+        committed: list[bytes] = []
+        commit_lock = threading.Lock()
+        real_atomic_write = controller.atomic_write
+        real_link = os.link
+
+        def recording_atomic_write(target, data, *args, **kwargs):
+            if Path(target) == key:
+                with commit_lock:
+                    committed.append(bytes(data))
+            return real_atomic_write(target, data, *args, **kwargs)
+
+        def recording_link(source, destination, *args, **kwargs):
+            real_link(source, destination, *args, **kwargs)
+            if Path(destination) == key:
+                with commit_lock:
+                    committed.append(Path(source).read_bytes())
+
+        errors: list[BaseException] = []
+        seen: list[str] = []
+
+        def work():
+            try:
+                ensure_ai_sidecar_key(self.base)
+                seen.append(key.read_text())
+            except BaseException as error:  # collected, re-raised below
+                errors.append(error)
+
+        with (
+            mock.patch("controller.secrets.token_urlsafe", side_effect=token_urlsafe),
+            mock.patch("controller.atomic_write", side_effect=recording_atomic_write),
+            mock.patch("controller.os.link", side_effect=recording_link),
+        ):
+            threads = [threading.Thread(target=work) for _ in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(
+            len(set(committed)), 1, "exactly one secret reaches the key path"
+        )
+        for text in seen:
+            self.assertIsNotNone(AI_SIDECAR_KEY_PATTERN.fullmatch(text))
 
     def test_controller_init_ensures_key(self):
         inbox = self.dir / "inbox"

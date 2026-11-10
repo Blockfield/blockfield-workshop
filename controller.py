@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace, asdict, dataclass
+import errno
 import fcntl
 import json
 import hashlib
@@ -165,28 +166,79 @@ def _chown_ai_key(path: Path) -> None:
         pass  # tests and non-root runs: the key stays with the caller's ownership
 
 
+def _read_ai_sidecar_key_fd(fd: int) -> str:
+    """Harden and read an open sidecar key through its descriptor, never its path.
+
+    The caller opens with O_NOFOLLOW, so a symlink swapped in mid-harden can
+    never redirect the fchown/fchmod/read onto another file.
+    """
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise ValueError("invalid ai-sidecar key file")
+    try:
+        os.fchown(fd, AI_KEY_UID, AI_KEY_GID)
+    except PermissionError:
+        pass  # tests and non-root runs: the key stays with the caller's ownership
+    os.fchmod(fd, 0o600)
+    chunks = []
+    while True:
+        block = os.read(fd, 65536)
+        if not block:
+            break
+        chunks.append(block)
+    try:
+        text = b"".join(chunks).decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise ValueError("invalid ai-sidecar key file") from None
+    if AI_SIDECAR_KEY_PATTERN.fullmatch(text) is None:
+        raise ValueError("invalid ai-sidecar key file")
+    return text
+
+
+def _commit_ai_sidecar_key(directory: Path, path: Path, data: bytes) -> bool:
+    """Link a fresh secret onto the key path without ever replacing it.
+
+    Returns True when this call won the creation race; False when another
+    process linked its key first (read the winner instead of rotating it).
+    """
+    fd, temporary = tempfile.mkstemp(
+        prefix="." + AI_SIDECAR_KEY_NAME + "-", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            try:
+                os.fchown(handle.fileno(), AI_KEY_UID, AI_KEY_GID)
+            except PermissionError:
+                pass  # tests and non-root runs: the key stays with the caller's ownership
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return True
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def ensure_ai_sidecar_key(base: Path) -> Path:
     """Create the AI sidecar Bearer secret once; never rotate or overwrite here.
 
     Returns the key path. An existing regular file is hardened in place
     (0600, validated) and never rotated: rotation is an explicit operator
-    action, not a controller step. Anything else fails closed.
+    action, not a controller step. Creation is exclusive with no replace, so
+    concurrent starters converge on the winner's key. Anything else fails closed.
     """
     directory, path = (
         Path(base) / "blockfield-workshop",
         Path(base) / f"blockfield-workshop/{AI_SIDECAR_KEY_NAME}",
     )
-    if path.is_symlink():
-        raise ValueError("unsafe ai-sidecar-key path")
-    if path.exists():
-        # Harden a pre-existing operator key: never leave a Bearer secret
-        # world-readable. Symlinks are rejected above so chmod/chown below
-        # can only touch the real key file.
-        _chown_ai_key(path)
-        os.chmod(path, 0o600)
-        if AI_SIDECAR_KEY_PATTERN.fullmatch(path.read_text().strip()) is None:
-            raise ValueError("invalid ai-sidecar key file")
-        return path
     try:
         info = os.stat(directory)
     except FileNotFoundError:
@@ -202,11 +254,30 @@ def ensure_ai_sidecar_key(base: Path) -> Path:
             info.st_uid != AI_KEY_UID or info.st_gid != AI_KEY_GID
         ):
             raise ValueError("unsafe ai-sidecar-key directory")
-    data = secrets.token_urlsafe(32).encode()
-    assert AI_SIDECAR_KEY_PATTERN.fullmatch(data.decode())
-    atomic_write(path, data)
-    _chown_ai_key(path)
-    return path
+    # Check-free from here: the key file is only ever touched through an
+    # O_NOFOLLOW descriptor (ELOOP fails closed), and creation commits with
+    # os.link, which never replaces — the loser of a startup race reads the
+    # winner's key instead of rotating it.
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            pass  # absent: create below, then converge on the winner
+        except OSError as error:
+            if error.errno != errno.ELOOP:
+                raise
+            raise ValueError("unsafe ai-sidecar-key path") from None
+        else:
+            try:
+                _read_ai_sidecar_key_fd(fd)
+            finally:
+                os.close(fd)
+            return path
+        data = secrets.token_urlsafe(32).encode()
+        assert AI_SIDECAR_KEY_PATTERN.fullmatch(data.decode())
+        if _commit_ai_sidecar_key(directory, path, data):
+            return path
+    raise ValueError("cannot establish ai-sidecar key file")
 
 
 # Provider registry ids (contract with the site): presets keep their historic key
@@ -219,6 +290,8 @@ AI_PROVIDER_KEY_PRESETS = {
 }
 # Custom ids that would reuse a preset key file or status name stay reserved,
 # so a custom key can never overwrite (or satisfy) another provider's key.
+# The sidecar Bearer secret lives in the same directory under its own name,
+# so its id stays reserved too: no provider key may address that file.
 AI_PROVIDER_RESERVED_IDS = frozenset(
     {
         *AI_PROVIDER_KEY_PRESETS,
@@ -231,6 +304,7 @@ AI_PROVIDER_RESERVED_IDS = frozenset(
             for _, status, _ in AI_PROVIDER_KEY_PRESETS.values()
             if status.endswith("-key.json")
         ),
+        AI_SIDECAR_KEY_NAME.removesuffix(".key"),
     }
 )
 
