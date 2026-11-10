@@ -31,7 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini=0.19.0-1+b
     && chown -R 1000:1000 /state /data /locks \
     && python3 -I -c 'import sys, zlib; assert sys.version_info[:3] == (3, 12, 14), sys.version; zlib.compress(b"blockfield"); print(sys.version.split()[0], zlib.ZLIB_VERSION)'
 
-COPY controller.py releases.py journal.py candidates.py \
+COPY controller.py releases.py journal.py candidates.py desired.py cp_client.py \
     map_package.py limbo.py map_ids.json docker_backend.py dokploy_backend.py \
     workshopctl.py entrypoint.py /app/
 RUN chmod 0644 /app/*.py /app/*.json && chmod 0755 /app/entrypoint.py
