@@ -870,7 +870,7 @@ class CPClientTests(unittest.TestCase):
             "http_proxy": "http://proxy.invalid:1",
             "https_proxy": "http://proxy.invalid:2",
         }
-        with mock.patch.dict("os.environ", env):
+        with mock.patch.dict("os.environ", env, clear=True):
             handlers = _UrllibTransport("t").opener.handlers
         proxies = [
             h.proxies for h in handlers if isinstance(h, urllib.request.ProxyHandler)
