@@ -1,6 +1,7 @@
 """Controller-written AI sidecar key (server#321 U-W1)."""
 
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -304,6 +305,49 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 ensure_ai_sidecar_key(self.base)
         self.assertIn("workshop user", str(caught.exception))
+
+    def test_root_refuses_even_a_root_owned_directory(self):
+        """r4521707958: a root controller in a root-owned dir would stage a
+        root-owned 0600 key its readers (uid 1000) cannot open. Refused."""
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        real_fstat = os.fstat
+
+        class FakeStat:
+            def __init__(self, values):
+                self.st_mode, self.st_uid, self.st_gid, self.st_ino = values
+
+        def patched(fd, *args, **kwargs):
+            info = real_fstat(fd, *args, **kwargs)
+            try:
+                resolved = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                return info
+            if Path(resolved) == directory:
+                return FakeStat((info.st_mode, 0, 0, info.st_ino))
+            return info
+
+        with (
+            mock.patch("controller.os.geteuid", return_value=0),
+            mock.patch("os.fstat", side_effect=patched),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                ensure_ai_sidecar_key(self.base)
+        self.assertIn("workshop user", str(caught.exception))
+        self.assertEqual(list(directory.iterdir()), [])
+
+    def test_directory_mode_is_never_changed(self):
+        """r4521707966: the dir's mode was fchmod-ed before the ownership
+        check, also when another process had created it. No chmod at all."""
+        real_fchmod = os.fchmod
+
+        def guarded(fd, mode):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise AssertionError("controller must not chmod the key directory")
+            return real_fchmod(fd, mode)
+
+        with mock.patch("os.fchmod", side_effect=guarded):
+            ensure_ai_sidecar_key(self.base)
 
     def test_group_writable_directory_fails_closed(self):
         """Group/other write on the key dir is refused even when owned by us:

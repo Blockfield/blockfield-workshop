@@ -163,14 +163,15 @@ def _require_owned_ai_key_dir(dir_fd: int, *, kind: str, display: str) -> None:
 
     The controller never repairs ownership or mode: a foreign-owned or
     group/world-writable directory is refused with the path, the found
-    owner/mode and the expectation. A root controller only adopts a
-    root-owned directory (the confused-deputy case); anything else tells
-    the operator to run as the workshop user instead.
+    owner/mode and the expectation. A root controller is refused outright:
+    a foreign directory is the confused-deputy case, and in a root-owned one
+    the 0600 key would be unreadable to its readers (the sidecar and the
+    game run as the workshop user).
     """
     info = os.fstat(dir_fd)
     euid = os.geteuid()
     mode = stat.S_IMODE(info.st_mode)
-    if info.st_uid == euid and not mode & 0o022:
+    if euid != 0 and info.st_uid == euid and not mode & 0o022:
         return
     if euid == 0:
         remedy = "run the controller as the workshop user instead of root"
@@ -186,8 +187,12 @@ def _require_owned_ai_key_dir(dir_fd: int, *, kind: str, display: str) -> None:
     )
 
 
-def _open_pinned_ai_key_dir(base: Path, *, kind: str) -> tuple[int, int, bool]:
-    """Open <base>/blockfield-workshop once and pin it: (base_fd, dir_fd, created).
+def _open_pinned_ai_key_dir(base: Path, *, kind: str) -> tuple[int, int]:
+    """Open <base>/blockfield-workshop once and pin it: (base_fd, dir_fd).
+
+    The directory's mode is never changed afterwards: mkdir's 0755 can only
+    be narrowed by the umask, and a directory someone else created first is
+    judged by _require_owned_ai_key_dir, not repaired.
 
     Both opens use O_DIRECTORY|O_NOFOLLOW, so a symlink planted in the
     attacker-writable data dir fails closed (ELOOP/ENOTDIR -> ValueError)
@@ -211,20 +216,18 @@ def _open_pinned_ai_key_dir(base: Path, *, kind: str) -> tuple[int, int, bool]:
     try:
         try:
             dir_fd = os.open("blockfield-workshop", flags, dir_fd=base_fd)
-            created = False
         except FileNotFoundError:
             try:
                 os.mkdir("blockfield-workshop", 0o755, dir_fd=base_fd)
             except FileExistsError:
                 pass  # a concurrent creator won the race; open the winner
             dir_fd = os.open("blockfield-workshop", flags, dir_fd=base_fd)
-            created = True
     except OSError as error:
         os.close(base_fd)
         if error.errno in (errno.ELOOP, errno.ENOTDIR):
             raise ValueError(f"unsafe {kind} directory") from error
         raise
-    return base_fd, dir_fd, created
+    return base_fd, dir_fd
 
 
 # The validated key is at most 2048 chars; anything larger is invalid. The cap
@@ -379,11 +382,8 @@ def ensure_ai_sidecar_key(base: Path) -> Path:
     concurrent starters converge on the winner's key. Anything else fails closed.
     """
     path = Path(base) / f"blockfield-workshop/{AI_SIDECAR_KEY_NAME}"
-    base_fd, dir_fd, created = _open_pinned_ai_key_dir(base, kind="ai-sidecar-key")
+    base_fd, dir_fd = _open_pinned_ai_key_dir(base, kind="ai-sidecar-key")
     try:
-        if created:
-            # Our own directory (umask may have widened mkdir): fix via fd.
-            os.fchmod(dir_fd, 0o755)
         _require_owned_ai_key_dir(dir_fd, kind="ai-sidecar-key", display=str(path))
         # Pinned from here: the key file is only ever touched through dir_fd,
         # opened with O_NOFOLLOW|O_NONBLOCK (ELOOP fails closed, a FIFO can
@@ -3488,11 +3488,8 @@ class Controller:
                     base = apps["workshop"].data
             if base is None:
                 raise ValueError("workshop data directory is not configured")
-            base_fd, dir_fd, created = _open_pinned_ai_key_dir(base, kind=kind)
+            base_fd, dir_fd = _open_pinned_ai_key_dir(base, kind=kind)
             try:
-                if created:
-                    # Our own directory (umask may have widened mkdir): fix via fd.
-                    os.fchmod(dir_fd, 0o755)
                 _require_owned_ai_key_dir(
                     dir_fd,
                     kind=kind,
