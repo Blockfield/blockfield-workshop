@@ -318,6 +318,7 @@ Changed files add blobs; unchanged files reuse hashes. A small full manifest con
 Map history is linear: every manifest has exactly one parent (restores parent the restored-onto head).
 At startup `migrate_branches_to_snapshots()` converts every pre-linear named branch tip that differs from
 the map head into a named snapshot and then removes the branch ref; tips already at the head need no snapshot.
+The migration runs under the controller lock, so concurrent CLI invocations cannot race on the refs.
 There is no automatic history/ZIP deletion or binary patch chain. Existing ZIPs/releases/schematics remain intact;
 `BF_LEGACY_CANDIDATES_DIR` reads old candidates without moving them, and current metadata takes precedence.
 

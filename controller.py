@@ -25,6 +25,7 @@ from typing import Callable, Protocol
 import unicodedata
 from uuid import UUID, uuid4
 
+import candidates
 import desired as desired_state
 import map_package
 import releases as release_catalog
@@ -3255,7 +3256,7 @@ class Controller:
         note: str,
         *,
         working_copy_id=None,
-        expected_head=None,
+        expected_head=candidates.EXPECTED_HEAD_ABSENT,
         commit=False,
         review=False,
         authorize=False,
@@ -3264,13 +3265,19 @@ class Controller:
     ) -> dict:
         # Pre-linear compat: branch/expected_branch_head are ignored; a branch
         # tip is not a head, so it only ever feeds the head CAS (fail closed).
-        if expected_head is None and expected_branch_head is not None:
+        if expected_branch_head is not None and (
+            expected_head is candidates.EXPECTED_HEAD_ABSENT or expected_head is None
+        ):
             expected_head = expected_branch_head
         # Refuse a missing draft before issuing any save commands.
         options = (
             {"working_copy_id": working_copy_id} if working_copy_id is not None else {}
         )
-        if expected_head is not None and not isinstance(expected_head, str):
+        if (
+            expected_head is not candidates.EXPECTED_HEAD_ABSENT
+            and expected_head is not None
+            and not isinstance(expected_head, str)
+        ):
             raise ValueError("expectedHead must be a map version digest")
         self.maps.check(map_id, **options)
         with self._locked():
@@ -3640,18 +3647,23 @@ class Controller:
             if kind in {"candidate", "commit"}:
                 if "commit" in document and type(document["commit"]) is not bool:
                     raise ValueError("commit must be a boolean")
+                head_options = (
+                    {"expected_head": document["expectedHead"]}
+                    if "expectedHead" in document
+                    else {}
+                )
                 result = self._snapshot(
                     document.get("mapId"),
                     actor,
                     document.get("note", ""),
                     working_copy_id=document.get("workingCopyId"),
-                    expected_head=document.get("expectedHead"),
                     # candidate {commit: true} is the tablet's commit-and-review in one request.
                     commit=kind == "commit" or document.get("commit") is True,
                     review=kind == "candidate" and document.get("commit") is True,
                     authorize=True,
                     branch=document.get("branch"),
                     expected_branch_head=document.get("expectedBranchHead"),
+                    **head_options,
                 )
             elif kind == "limbo-export":
                 self.export_limbo(document.get("versionDigest"))

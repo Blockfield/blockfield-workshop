@@ -489,6 +489,86 @@ class MapLinearTests(unittest.TestCase):
             self.versions.read("train", committed)["parents"], [heads["train"]]
         )
 
+    def seed_draft_map(self, map_id="fresh"):
+        world = self.data / "world" / "dimensions" / "blockfield_workshop" / map_id
+        (world / "region").mkdir(parents=True)
+        (world / "region" / "r.0.0.mca").write_bytes(b"fresh-region")
+        (self.data / "blockfield/maps" / f"{map_id}.json").write_text(
+            json.dumps(seed_config(map_id))
+        )
+        template = self.templates / map_id
+        (template / "region").mkdir(parents=True)
+        (template / "region" / "r.0.0.mca").write_bytes(b"fresh-template-region")
+        (world / "blockfield-base.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "templateDigest": candidates.template_digest(template),
+                }
+            )
+        )
+        return world
+
+    def test_explicit_null_head_is_checked_against_the_current_head(self):
+        # A caller that saw a headless map passes expectedHead null: a
+        # concurrent first publish must fail it, never be silently adopted.
+        world = self.seed_draft_map()
+        first = self.store.create("fresh", ACTOR, expected_head=None)
+        self.store.publish(first["id"], ACTOR, expected_head=None)
+        head = self.versions.head("fresh")["versionDigest"]
+        (world / "region" / "r.0.0.mca").write_bytes(b"concurrent edit")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.store.create("fresh", ACTOR, expected_head=None)
+        self.assertEqual(self.versions.head("fresh")["versionDigest"], head)
+
+    def test_session_publish_then_keep_editing_then_publish_again(self):
+        # Core flow: the publishing copy advances onto the new head with its
+        # pending-review edits intact, so the same session can publish again.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"first edit")
+        first = self.commit(copy_id, self.base)
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=first
+        )
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"edit while review pending")
+        self.store.publish(review["id"], ACTOR, expected_head=self.base)
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], first)
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", copy_id)["versionDigest"],
+            first,
+        )
+        self.assertEqual(
+            (bundle / "world/region/r.0.0.mca").read_bytes(),
+            b"edit while review pending",
+        )
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"second edit")
+        second = self.commit(copy_id, first)
+        self.assertEqual(self.versions.read("konstaxa", second)["parents"], [first])
+        review2 = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=second
+        )
+        self.store.publish(review2["id"], ACTOR, expected_head=first)
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], second)
+        self.assertEqual(
+            (bundle / "world/region/r.0.0.mca").read_bytes(), b"second edit"
+        )
+
+    def test_legacy_candidate_without_target_head_publishes(self):
+        # Pre-upgrade records carry baseVersion but no targetHead: publishable
+        # when the immutable version directly parents the current head.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"legacy edit")
+        committed = self.commit(copy_id, self.base)
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=committed
+        )
+        meta_path = self.store.candidates / f"{review['id']}.json"
+        meta = json.loads(meta_path.read_text())
+        del meta["targetHead"]
+        meta_path.write_text(json.dumps(meta))
+        self.store.publish(review["id"], ACTOR, expected_head=self.base)
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], committed)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -131,6 +131,28 @@ def build_controller(
     )
     if hasattr(backend, "maps"):
         backend.maps = controller.maps
+    # Linearize pre-linear history here, under the controller lock: this
+    # shared construction is the entry for both the CLI and the container
+    # loop, and every map mutation runs under the same lock. Gated on the
+    # refs existing so lock-free reads (status) never take the lock.
+    branches = (
+        controller.maps.versions.archive / "branches"
+        if controller.maps is not None
+        else None
+    )
+    if branches is not None and (branches.exists() or branches.is_symlink()):
+        with controller._locked():
+            try:
+                summary = controller.maps.versions.migrate_branches_to_snapshots()
+            except ValueError as error:
+                raise ValueError(f"map branch migration failed: {error}") from error
+        migrated, at_head = summary["migrated"], summary["atHead"]
+        if migrated or at_head:
+            print(
+                "workshop: linearized map branches: "
+                f"{len(migrated)} snapshots, {len(at_head)} already at head",
+                file=sys.stderr,
+            )
     os.chmod(directory, 0o700)
     import cp_client
 
@@ -195,20 +217,6 @@ def _map_store(env, backend):
         store.limbo = LimboArtifacts(
             Path(env.get("BF_LIMBO_DERIVED_DIR", str(archive / "limbo"))),
             getattr(backend, "proxy_stopped", lambda: False),
-        )
-    # Linearize pre-linear history at startup: every named branch tip that
-    # differs from the map head becomes a named snapshot; refs are removed
-    # only after their snapshot is written and re-read. Idempotent.
-    try:
-        summary = store.versions.migrate_branches_to_snapshots()
-    except ValueError as error:
-        raise ValueError(f"map branch migration failed: {error}") from error
-    migrated, at_head = summary["migrated"], summary["atHead"]
-    if migrated or at_head:
-        print(
-            "workshop: linearized map branches: "
-            f"{len(migrated)} snapshots, {len(at_head)} already at head",
-            file=sys.stderr,
         )
     return store
 

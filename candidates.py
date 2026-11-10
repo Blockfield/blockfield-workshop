@@ -30,6 +30,9 @@ MISSING = object()
 SNAPSHOT_MARGIN = 16 << 20
 EXPORTS_KEPT = 16
 ACCEPT_ONLY = object()
+# A snapshot/commit call without any head expectation. Distinct from an
+# explicit null head (the caller saw a headless map), which is checked.
+EXPECTED_HEAD_ABSENT = object()
 OWNER = (
     1000,
     1000,
@@ -291,7 +294,7 @@ class MapStore:
         note: str = "",
         *,
         working_copy_id=None,
-        expected_head=None,
+        expected_head=EXPECTED_HEAD_ABSENT,
         review=True,
     ) -> dict:
         # Linear history: a commit parents the exact current head (CAS); the
@@ -306,11 +309,13 @@ class MapStore:
             base_version = self._base_version(map_id)
         head = self.versions.head(map_id)
         head_digest = head["versionDigest"] if head else None
-        if expected_head is not None:
+        if expected_head is not EXPECTED_HEAD_ABSENT:
             self.versions.check_head(map_id, expected_head)
-            if base_version != expected_head:
+            if expected_head is not None and base_version != expected_head:
                 raise ValueError("working copy is behind the map head; resume it first")
-            parent = expected_head
+            # An explicit null head pins a headless map: the first commit
+            # bootstraps history from the template import.
+            parent = base_version if expected_head is None else expected_head
         elif head_digest is None:
             parent = base_version
         else:
@@ -368,7 +373,15 @@ class MapStore:
         self._write_meta(meta)
         return meta
 
-    def commit(self, map_id, author, note, *, working_copy_id, expected_head):
+    def commit(
+        self,
+        map_id,
+        author,
+        note,
+        *,
+        working_copy_id,
+        expected_head=EXPECTED_HEAD_ABSENT,
+    ):
         if not isinstance(note, str) or not note.strip() or len(note) > 200:
             raise ValueError("commit message required (1–200 characters)")
         return self.create(
@@ -445,7 +458,12 @@ class MapStore:
                 raise ValueError("linear map history accepts no conflict choices")
             map_id = meta["mapId"]
             self.versions.check_head(map_id, expected_head)
-            if meta.get("targetHead") != expected_head:
+            # Pre-upgrade records carry baseVersion but no targetHead: their
+            # target is derived from the immutable version's parent below.
+            if (
+                meta.get("targetHead") is not None
+                and meta["targetHead"] != expected_head
+            ):
                 raise ValueError("review target changed; request a fresh review")
             if expected_head is not None:
                 manifest = self.versions.read(map_id, meta["versionDigest"])
@@ -469,6 +487,12 @@ class MapStore:
                         raise ValueError(
                             "base changed: the map's template changed after this draft was copied; confirm to overwrite"
                         )
+            # The published version came from this copy's world, so the copy now
+            # sits on the new head: advance its base pointer, keeping edits.
+            if meta.get("workingCopyId") is not None:
+                self.versions.advance_working_copy(
+                    map_id, meta["workingCopyId"], meta["versionDigest"]
+                )
             self.versions.prepare(map_id, meta["versionDigest"])
             meta.update(
                 status="accepted",
@@ -1379,7 +1403,8 @@ class MapVersions:
                 if name == "main":
                     raise ValueError("main must use the active map head")
                 self._branch_name(name)
-                value = map_package._json(path.read_bytes())
+                raw = path.read_bytes()
+                value = map_package._json(raw)
                 if (
                     not isinstance(value, dict)
                     or value.get("mapId") != map_id
@@ -1416,6 +1441,11 @@ class MapVersions:
                     migrated.append(
                         {"mapId": map_id, "name": name, "versionDigest": tip}
                     )
+                # Recheck before removing: the ref must still be the one the
+                # snapshot was taken from (migration runs under the lock, so a
+                # change here means the lock did not serialize writers).
+                if path.read_bytes() != raw:
+                    raise ValueError("map branch changed during migration")
                 path.unlink()
                 _sync_directory(map_dir)
             try:
@@ -2037,6 +2067,43 @@ class MapVersions:
             "workingCopyId": working_copy_id,
             "bundle": str(target),
         }
+
+    def advance_working_copy(
+        self, map_id: str, working_copy_id: str, version: str
+    ) -> bool:
+        """Move a working copy's base pointer to a newer immutable version.
+
+        Only the copy a published version was snapshotted from may advance:
+        its world already contains that version, so later commits parent it
+        without dropping anything. The world files (pending edits) are kept.
+        A missing copy was removed after the review; that is not an error.
+        """
+        target = self.working_copy(map_id, working_copy_id)
+        if not target.exists() and not target.is_symlink():
+            return False
+        manifest = self.read(map_id, version)
+        marker_path = target / "world" / BASE_MARKER
+        for path in (target, target / "world", target / "manifest.json", marker_path):
+            if path.is_symlink() or not path.exists():
+                raise ValueError("working copy missing or unsafe")
+        marker = map_package._json(marker_path.read_bytes())
+        # The copy sits on the published version's parent — or already on the
+        # version itself (first publish on a headless map, or a republish
+        # after the activation below failed midway).
+        if marker.get("versionDigest") not in {version, manifest["parent"]}:
+            raise ValueError("working copy moved during review; resume it first")
+        _atomic_json(target / "manifest.json", manifest, owner=False)
+        _atomic_json(
+            marker_path,
+            {
+                "schema": 1,
+                "templateDigest": manifest["worldDigest"],
+                "versionDigest": version,
+            },
+            owner=False,
+        )
+        _chown_tree(target)
+        return True
 
     def validate_working_copy(self, map_id: str, working_copy_id: str) -> dict:
         target = self.working_copy(map_id, working_copy_id)

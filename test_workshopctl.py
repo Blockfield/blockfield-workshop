@@ -664,6 +664,68 @@ class WorkshopctlTests(unittest.TestCase):
             "https://cp.invalid/v2/settings/gate/workshop",
         )
 
+    def seed_branch_ref(self, name="oldwork", map_id="konstaxa"):
+        store = workshopctl._map_store(os.environ, self.backend)
+        templates = Path(os.environ["BF_TEMPLATES_DIR"])
+        (templates / map_id / "region" / "r.0.0.mca").write_bytes(b"branch tip")
+        tip = store.versions.import_template(
+            map_id,
+            templates / map_id,
+            Path(os.environ["BF_GAME_MAPS_DIR"]) / f"{map_id}.json",
+        )
+        path = (
+            Path(os.environ["BF_MAP_ARCHIVE_DIR"])
+            / "branches"
+            / map_id
+            / f"{name}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "mapId": map_id,
+                    "name": name,
+                    "versionDigest": tip,
+                    "generation": 2,
+                    "createdAt": 1000,
+                    "createdBy": {"draslId": "fixture", "name": "fixture"},
+                }
+            )
+        )
+        return tip
+
+    def branch_ref_path(self, name="oldwork", map_id="konstaxa"):
+        return (
+            Path(os.environ["BF_MAP_ARCHIVE_DIR"])
+            / "branches"
+            / map_id
+            / f"{name}.json"
+        )
+
+    def test_map_store_does_not_run_branch_migration(self):
+        # Building a store must not mutate branch refs: migration runs under
+        # the controller lock at build_controller time, not on every store.
+        self.seed_branch_ref()
+        workshopctl._map_store(os.environ, self.backend)
+        self.assertTrue(self.branch_ref_path().exists())
+
+    def test_build_controller_migrates_branches(self):
+        tip = self.seed_branch_ref()
+        kwargs = dict(
+            state_dir=str(self.root / "controller"),
+            gate_file=str(self.root / "gate" / "gate.json"),
+            public_file=str(self.root / "public" / "public.json"),
+            admin_dir=str(self.root / "admin"),
+            inbox_dir=str(self.root / "inbox"),
+        )
+        controller, _ = workshopctl.build_controller(
+            dict(os.environ), lambda: self.backend, **kwargs
+        )
+        snap = controller.maps.versions.snapshot("konstaxa", "oldwork")
+        self.assertEqual(snap["versionDigest"], tip)
+        self.assertFalse(self.branch_ref_path().exists())
+
 
 if __name__ == "__main__":
     unittest.main()
