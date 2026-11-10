@@ -170,17 +170,13 @@ def _require_owned_ai_key_dir(dir_fd: int, *, kind: str, display: str) -> None:
     info = os.fstat(dir_fd)
     euid = os.geteuid()
     mode = stat.S_IMODE(info.st_mode)
-    # Group write is fine when the group is the key owner's own group (the
-    # workshop containers share gid AI_KEY_GID; prod's data dir is 0775
-    # 1000:1000); any other group, or other-write, can swap the keys.
-    foreign_write = mode & 0o002 or (mode & 0o020 and info.st_gid != AI_KEY_GID)
-    if euid == AI_KEY_UID and info.st_uid == AI_KEY_UID and not foreign_write:
+    if euid == AI_KEY_UID and info.st_uid == AI_KEY_UID and not mode & 0o022:
         return
     raise ValueError(
         f"unsafe {kind} directory: {display} is owned by "
         f"uid={info.st_uid} gid={info.st_gid} mode={mode:04o} and the controller "
-        f"runs as uid={euid}; expected owner uid={AI_KEY_UID}, no write for other "
-        f"users or groups, and the controller running as the workshop user (uid {AI_KEY_UID})"
+        f"runs as uid={euid}; expected owner uid={AI_KEY_UID}, no group/other "
+        f"write, and the controller running as the workshop user (uid {AI_KEY_UID})"
     )
 
 
@@ -757,7 +753,8 @@ class Controller:
         base = self._workshop_data_base()
         if base is not None:
             # The AI sidecar is optional: an unusable key directory must not take
-            # the whole controller (wake, inbox, gate) down with it.
+            # the whole controller (wake, inbox, gate) down with it. Nothing is
+            # written then; the sidecar must not be deployed until this passes.
             try:
                 ensure_ai_sidecar_key(base)
             except (OSError, ValueError) as error:

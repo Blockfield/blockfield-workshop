@@ -327,29 +327,14 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
             ensure_ai_sidecar_key(self.base)
 
     def test_group_writable_directory_fails_closed(self):
-        """Write by another group or by others on the key dir is refused even
-        when owned by us: it lets another local user swap the key under us."""
+        """Group/other write on the key dir is refused even when owned by us:
+        a writable dir lets another local user swap the key under us."""
         directory = self.base / "blockfield-workshop"
         directory.mkdir(parents=True)
         os.chmod(directory, 0o775)
-        with mock.patch("controller.AI_KEY_GID", os.getgid() + 1):
-            with self.assertRaises(ValueError) as caught:
-                ensure_ai_sidecar_key(self.base)
-        self.assertIn("unsafe ai-sidecar-key directory", str(caught.exception))
-        os.chmod(directory, 0o757)
-        with mock.patch("controller.AI_KEY_GID", os.getgid()):
-            with self.assertRaises(ValueError):
-                ensure_ai_sidecar_key(self.base)
-
-    def test_own_group_writable_directory_is_accepted(self):
-        """Prod's data dir is 0775 owned by the workshop uid and gid: group
-        write by the key owner's own group is not a foreign writer."""
-        directory = self.base / "blockfield-workshop"
-        directory.mkdir(parents=True)
-        os.chmod(directory, 0o775)
-        with mock.patch("controller.AI_KEY_GID", os.getgid()):
+        with self.assertRaises(ValueError) as caught:
             ensure_ai_sidecar_key(self.base)
-        self.assertTrue(self.key_path().is_file())
+        self.assertIn("unsafe ai-sidecar-key directory", str(caught.exception))
 
     def test_controller_starts_when_the_key_directory_is_unusable(self):
         """The sidecar key is optional: an unsafe key dir is logged, and the
