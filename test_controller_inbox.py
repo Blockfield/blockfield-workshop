@@ -290,15 +290,14 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(os.listdir(self.inbox), [])
         self.assertEqual(self.controller.message, "first")
 
-    def test_only_merge_requests_accept_large_exact_conflict_choices(self):
+    def test_only_publish_accepts_large_payloads(self):
         choices = {f"world/region/r.{index}.0.mca": "ours" for index in range(10000)}
-        for kind in ("merge-preview", "publish"):
-            request_id = self.put(kind, resolutions=choices)
-            path = self.inbox / f"{request_id}.json"
-            self.assertGreater(path.stat().st_size, 65536)
-            document, error = self.controller._load_request(path.name)
-            self.assertIsNone(error)
-            self.assertEqual(document["resolutions"], choices)
+        request_id = self.put("publish", resolutions=choices)
+        path = self.inbox / f"{request_id}.json"
+        self.assertGreater(path.stat().st_size, 65536)
+        document, error = self.controller._load_request(path.name)
+        self.assertIsNone(error)
+        self.assertEqual(document["resolutions"], choices)
         for kind in (
             "candidate",
             "commit",
@@ -314,12 +313,11 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(error, "request too large")
         self.assertEqual(self.backend.events, ["start"])
 
-    def test_extended_merge_limit_and_duplicate_json_keys_fail_closed(self):
-        for kind in ("merge-preview", "publish"):
-            request_id = self.put(kind, padding="x" * INBOX_MERGE_MAX_BYTES)
-            document, error = self.controller._load_request(f"{request_id}.json")
-            self.assertIsNone(document)
-            self.assertEqual(error, "request too large")
+    def test_extended_publish_limit_and_duplicate_json_keys_fail_closed(self):
+        request_id = self.put("publish", padding="x" * INBOX_MERGE_MAX_BYTES)
+        document, error = self.controller._load_request(f"{request_id}.json")
+        self.assertIsNone(document)
+        self.assertEqual(error, "request too large")
         request_id = str(uuid4())
         (self.inbox / f"{request_id}.json").write_bytes(
             b'{"schema":1,"kind":"message","kind":"publish"}'
@@ -643,7 +641,7 @@ class AiKeyInboxTests(unittest.TestCase):
         directory.symlink_to(linked, target_is_directory=True)
         cases.append(self.put(key=self.key))
         self.process()
-        self.assertEqual(self.result(cases[-1])["error"], "unsafe ai-key path")
+        self.assertEqual(self.result(cases[-1])["error"], "unsafe ai-key directory")
         self.assertEqual(target.read_text(), "untouched")
         self.assertEqual(list(linked.iterdir()), [])
         self.assertFalse(self.key_file().exists())
@@ -652,23 +650,27 @@ class AiKeyInboxTests(unittest.TestCase):
     def test_existing_directory_must_be_a_plain_owned_directory(self):
         directory = self.workshop_data / "blockfield-workshop"
         directory.mkdir()
-        real_stat = os.stat
+        real_fstat = os.fstat
 
         class FakeStat:
             def __init__(self, values):
                 self.st_mode, self.st_uid, self.st_gid, self.st_ino = values
 
-        def patched(path, *args, **kwargs):
-            info = real_stat(path, *args, **kwargs)
-            if Path(path) == directory:
+        def patched(fd, *args, **kwargs):
+            info = real_fstat(fd, *args, **kwargs)
+            try:
+                resolved = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                return info
+            if Path(resolved) == directory:
                 return FakeStat((info.st_mode, 4242, 4242, info.st_ino))
             return info
 
-        with unittest.mock.patch("os.stat", side_effect=patched):
+        with unittest.mock.patch("os.fstat", side_effect=patched):
             request_id = self.put(key=self.key)
             self.process()
-            self.assertEqual(
-                self.result(request_id)["error"], "unsafe ai-key directory"
+            self.assertTrue(
+                self.result(request_id)["error"].startswith("unsafe ai-key directory")
             )
         (directory / "marker.txt").write_text("x")
         for child in directory.iterdir():
@@ -681,24 +683,34 @@ class AiKeyInboxTests(unittest.TestCase):
         self.assertFalse((self.admin / "ai-key.json").exists())
 
     def test_key_file_gets_exact_owner_and_mode(self):
+        # No privileged repair: the controller never changes ownership, so
+        # any chown attempt fails the test; the caller-owned file is 0600.
+        def no_privileged_repair(*args, **kwargs):
+            raise AssertionError("controller must not change ownership")
+
         with (
-            unittest.mock.patch("os.chown") as chown,
-            unittest.mock.patch("os.fchown") as fchown,
+            unittest.mock.patch("os.chown", side_effect=no_privileged_repair),
+            unittest.mock.patch("os.fchown", side_effect=no_privileged_repair),
         ):
             request_id = self.put(key=self.key)
             self.process()
             self.assertTrue(self.result(request_id)["ok"])
-        directory = self.workshop_data / "blockfield-workshop"
-        chown.assert_called_once_with(directory, os.getuid(), os.getgid())
-        self.assertEqual(fchown.call_args[0][1:], (os.getuid(), os.getgid()))
         self.assertEqual((PRODUCTION_KEY_UID, PRODUCTION_KEY_GID), (1000, 1000))
+        info = self.key_file().stat()
+        self.assertEqual(
+            (stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid),
+            (0o600, os.getuid(), os.getgid()),
+        )
         self.assertEqual(self.key_file().read_text(), self.key)
 
     def test_failed_key_write_leaves_no_partial_key(self):
         real_fsync = os.fsync
 
         def full_disk(fd):
-            if "openrouter.key" in os.readlink(f"/proc/self/fd/{fd}"):
+            # The secret is staged unnamed (O_TMPFILE): its /proc/self/fd
+            # link carries "(deleted)" until linked. Failing fsync there must
+            # leave no published key and no staged remnant behind.
+            if "(deleted)" in os.readlink(f"/proc/self/fd/{fd}"):
                 raise OSError(28, "No space left on device")
             return real_fsync(fd)
 
@@ -1004,6 +1016,7 @@ class AiProviderKeyInboxTests(unittest.TestCase):
             ("non-string", {"provider": 7, "key": self.key}),
             ("missing", {"key": self.key}),
             ("reserved key stem", {"provider": "gateway", "key": self.key}),
+            ("reserved sidecar key", {"provider": "ai-sidecar", "key": self.key}),
             ("reserved status stem", {"provider": "ai", "key": self.key}),
             ("bad key", {"provider": self.CUSTOM, "key": "x" * 19}),
         ):

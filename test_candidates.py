@@ -107,7 +107,7 @@ class CandidateTests(unittest.TestCase):
         workshop = backend.processes[-1]
         create = self.store.create
 
-        def snapshot(*args):
+        def snapshot(*args, **kwargs):
             self.assertIn(workshop, backend.processes)
             self.assertEqual(control.status()["gate"], "builders")
             return create(*args)
@@ -161,7 +161,7 @@ class CandidateTests(unittest.TestCase):
         meta = self.store.create("konstaxa", ACTOR)
         self.assertEqual(self.held, ["off", "on"])
         self.assertEqual((meta["status"], meta["regions"]), ("pending", 1))
-        self.store.publish(meta["id"], ACTOR)
+        self.store.publish(meta["id"], ACTOR, expected_head=None)
         with zipfile.ZipFile(self.store.archive_path(meta["id"])) as archive:
             self.assertEqual(json.loads(archive.read("map.json"))["name"], "edited")
 
@@ -187,7 +187,7 @@ class CandidateTests(unittest.TestCase):
         meta = self.store.create("konstaxa", ACTOR)
         archive = self.store.archive_path(meta["id"])
         before = archive.read_bytes()
-        accepted = self.store.publish(meta["id"], ACTOR)
+        accepted = self.store.publish(meta["id"], ACTOR, expected_head=None)
         self.assertEqual(accepted["status"], "accepted")
         self.assertEqual(archive.read_bytes(), before)
         self.assertEqual(
@@ -204,9 +204,9 @@ class CandidateTests(unittest.TestCase):
         old = self.store.create("konstaxa", ACTOR)
         self.clock[0] += 1
         new = self.store.create("konstaxa", ACTOR)
-        self.store.publish(new["id"], ACTOR)
-        with self.assertRaisesRegex(ValueError, "newer"):
-            self.store.publish(old["id"], ACTOR)
+        self.store.publish(new["id"], ACTOR, expected_head=None)
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.store.publish(old["id"], ACTOR, expected_head=None)
         self.store.reject(old["id"], ACTOR)
         self.assertEqual(
             {m["id"]: m["status"] for m in self.store.list()},
@@ -332,29 +332,42 @@ class BaseAndPlaytestTests(unittest.TestCase):
         )
         self.assertEqual(self.store.export()["candidates"][0]["baseMatches"], False)
         with self.assertRaisesRegex(ValueError, "^base changed"):
-            self.store.publish(meta["id"], ACTOR)
+            self.store.publish(meta["id"], ACTOR, expected_head=None)
         self.assertEqual(
             (self.templates / "konstaxa" / "region" / "r.0.0.mca").read_bytes(),
             b"someone-else-published",
         )
-        self.assertTrue(self.store.publish(meta["id"], ACTOR, force=True)["forced"])
+        self.assertTrue(
+            self.store.publish(meta["id"], ACTOR, force=True, expected_head=None)[
+                "forced"
+            ]
+        )
         marker = json.loads((self.world / "blockfield-base.json").read_text())[
             "templateDigest"
         ]
         self.assertNotEqual(marker, template_digest(self.templates / "konstaxa"))
         self.clock[0] += 1
+        (self.world / "region" / "r.0.0.mca").write_bytes(REGION_ENTITIES)
         self.assertEqual(
             self.store.publish(
-                self.store.create("konstaxa", ACTOR)["id"], ACTOR, force=True
+                self.store.create("konstaxa", ACTOR)["id"],
+                ACTOR,
+                force=True,
+                expected_head=self.store.versions.head("konstaxa")["versionDigest"],
             )["status"],
             "accepted",
         )
         (self.world / "blockfield-base.json").unlink()
         self.clock[0] += 1
+        (self.world / "region" / "r.0.0.mca").write_bytes(REGION_DRAFT)
         unknown = self.store.create("konstaxa", ACTOR)
         self.assertIsNone(self.store.export()["candidates"][0]["baseMatches"])
         with self.assertRaisesRegex(ValueError, "^base unknown"):
-            self.store.publish(unknown["id"], ACTOR)
+            self.store.publish(
+                unknown["id"],
+                ACTOR,
+                expected_head=self.store.versions.head("konstaxa")["versionDigest"],
+            )
 
     def test_failed_publish_leaves_template_and_no_staging(self):
         meta = self.store.create("konstaxa", ACTOR)
@@ -362,7 +375,7 @@ class BaseAndPlaytestTests(unittest.TestCase):
             candidates, "_atomic_json", side_effect=OSError("disk full")
         ):
             with self.assertRaises(OSError):
-                self.store.publish(meta["id"], ACTOR)
+                self.store.publish(meta["id"], ACTOR, expected_head=None)
         self.assertEqual(
             (self.templates / "konstaxa" / "region" / "r.0.0.mca").read_bytes(),
             REGION_TEMPLATE,

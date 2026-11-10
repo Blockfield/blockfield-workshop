@@ -16,6 +16,55 @@ HQ_MOD = quality
 HQ_ROOT = quality.ROOT
 
 
+def shared_tool_cache():
+    """The fixture reuses the parent checkout's warm tool cache (the core reads
+    BF_TOOL_CACHE), so it never downloads into its own empty tree."""
+    return patch.dict(
+        os.environ, {"BF_TOOL_CACHE": str(HQ_ROOT / ".cache" / "quality")}
+    )
+
+
+def dead_proxy_env():
+    """Env for the hermetic hook test: the shared cache serves every pinned
+    tool, and any download attempt fails fast instead of stalling on egress."""
+    offline = dict(os.environ)
+    for var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        offline.pop(var, None)
+    offline.update(
+        {
+            "BF_TOOL_CACHE": str(HQ_ROOT / ".cache" / "quality"),
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "ALL_PROXY": "http://127.0.0.1:9",
+            "http_proxy": "http://127.0.0.1:9",
+            "https_proxy": "http://127.0.0.1:9",
+            "all_proxy": "http://127.0.0.1:9",
+        }
+    )
+    return offline
+
+
+FIXTURE_SCRIPTS = (
+    ".gitignore",
+    "justfile",
+    "scripts/quality.py",
+    "scripts/toolchain.py",
+    "scripts/toolchain_local.py",
+    "scripts/tools.lock.json",
+    "scripts/terminal.py",
+    "scripts/dev_cache.py",
+)
+
+
 class PreCommitHook(unittest.TestCase):
     def test_hook_formats_staged_files_without_gradle(self):
         hook = quality.ROOT / ".githooks" / "pre-commit"
@@ -50,14 +99,12 @@ class PreCommitHook(unittest.TestCase):
 
     def test_commit_formats_staged_files(self):
         # Fail-before: without the hook + format-staged, the raw bytes commit.
-        with tempfile.TemporaryDirectory(prefix="bf precommit ") as tmp:
+        with (
+            shared_tool_cache(),
+            tempfile.TemporaryDirectory(prefix="bf precommit ") as tmp,
+        ):
             root = Path(tmp)
-            for name in (
-                ".gitignore",
-                "justfile",
-                "scripts/quality.py",
-                "scripts/toolchain.py",
-            ):
+            for name in FIXTURE_SCRIPTS:
                 src = quality.ROOT / name
                 dst = root / name
                 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +151,51 @@ class PreCommitHook(unittest.TestCase):
                 ).returncode,
                 0,
             )
+
+    def test_commit_formats_staged_files_without_network(self):
+        # The hook fixture must not download tools: CI runners hit transient
+        # egress stalls and the commit fails with the hook stderr swallowed.
+        offline = dead_proxy_env()
+        with tempfile.TemporaryDirectory(prefix="bf precommit ") as tmp:
+            root = Path(tmp)
+            for name in FIXTURE_SCRIPTS:
+                src = quality.ROOT / name
+                dst = root / name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(src.read_bytes())
+            (root / ".githooks").mkdir()
+            (root / ".githooks" / "pre-commit").write_bytes(
+                (quality.ROOT / ".githooks" / "pre-commit").read_bytes()
+            )
+            (root / ".githooks" / "pre-commit").chmod(0o755)
+
+            def git(*args):
+                try:
+                    return subprocess.run(
+                        ["git", *args],
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        env=offline,
+                    ).stdout
+                except subprocess.CalledProcessError as error:
+                    raise AssertionError(
+                        f"git {' '.join(args)} failed:\n"
+                        f"STDOUT:\n{error.stdout}\nSTDERR:\n{error.stderr}"
+                    ) from error
+
+            git("init", "--quiet")
+            git("config", "user.email", "hook-test@example.com")
+            git("config", "user.name", "hook-test")
+            git("config", "core.hooksPath", str(root / ".githooks"))
+            git("add", ".")
+            git("commit", "--quiet", "-m", "fixture")
+            (root / "probe.py").write_text("x=1\n", encoding="utf-8")
+            git("add", "probe.py")
+            git("commit", "--quiet", "-m", "probe")
+            self.assertNotEqual(git("show", "HEAD:probe.py"), "x=1\n")
 
     def test_wire_hooks_reports_already_wired_as_success(self):
         with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
@@ -175,14 +267,13 @@ class PreCommitHook(unittest.TestCase):
     def test_commit_leaves_partially_staged_files_alone(self):
         # Fail-before: the old hook formatted the worktree copy and staged it
         # whole, committing hunks the user never staged.
-        with tempfile.TemporaryDirectory(prefix="bf precommit ") as tmp:
+        # Same shared tool cache as above: no downloads into the fixture tree.
+        with (
+            shared_tool_cache(),
+            tempfile.TemporaryDirectory(prefix="bf precommit ") as tmp,
+        ):
             root = Path(tmp)
-            for name in (
-                ".gitignore",
-                "justfile",
-                "scripts/quality.py",
-                "scripts/toolchain.py",
-            ):
+            for name in FIXTURE_SCRIPTS:
                 src = HQ_ROOT / name
                 dst = root / name
                 dst.parent.mkdir(parents=True, exist_ok=True)

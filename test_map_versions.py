@@ -187,12 +187,22 @@ class MapVersionTests(unittest.TestCase):
 
     def test_base_uses_head_not_latest_accepted_and_every_version_is_retained(self):
         first = self.candidate()
-        self.store.publish(first["id"], ACTOR)
+        first_head = self.activate(first)
+        # A resumed draft tracks the live head: refresh the stale template marker.
+        live_world = Path(first_head["bundle"]) / "world"
+        (self.world / "blockfield-base.json").write_text(
+            json.dumps({"schema": 1, "templateDigest": template_digest(live_world)})
+        )
+        (self.world / "region" / "r.0.0.mca").write_bytes(fixtures.region_variant(9))
         second = self.candidate()
-        self.assertEqual(second["baseVersion"], first["baseVersion"])
-        self.activate(second)
+        self.assertEqual(second["baseVersion"], first["versionDigest"])
+        self.activate(second, first_head["versionDigest"])
         copy_id = str(uuid4())
         self.store.checkout("konstaxa", second["versionDigest"], copy_id)
+        (
+            self.store.versions.working_copy("konstaxa", copy_id)
+            / "world/region/r.0.0.mca"
+        ).write_bytes(fixtures.region_variant(10))
         third = self.candidate(working_copy_id=copy_id)
         self.assertEqual(third["baseVersion"], second["versionDigest"])
         for _ in range(32):
@@ -215,10 +225,14 @@ class MapVersionTests(unittest.TestCase):
             if map_id != "konstaxa":
                 self.another_map(map_id, kind)
             meta = self.candidate(map_id)
-            self.store.publish(meta["id"], ACTOR)
-            head = self.store.versions.activate(
-                map_id, meta["versionDigest"], ACTOR, None
-            )
+            if kind == "limbo":
+                # Limbo activation needs the stopped-proxy backend; the layout
+                # check below only needs the materialized head bundle.
+                head = self.store.versions.activate(
+                    map_id, meta["versionDigest"], ACTOR, None
+                )
+            else:
+                head = self.activate(meta)
             manifest = self.store.versions.read(map_id, meta["versionDigest"])
             self.assertEqual(head["kind"], kind)
             self.assertEqual(manifest["kind"], kind)
@@ -269,7 +283,7 @@ class MapVersionTests(unittest.TestCase):
             legacy_candidates=self.store.candidates,
         )
         self.assertEqual(relocated.sha256_of(first["id"]), legacy["sha256"])
-        relocated.publish(first["id"], ACTOR)
+        relocated.publish(first["id"], ACTOR, expected_head=None)
         self.assertEqual(old_copy.read_bytes(), before)
         self.assertEqual(relocated.list()[0]["status"], "accepted")
 
@@ -293,7 +307,10 @@ class MapVersionTests(unittest.TestCase):
         self.clock[0] += 1
         self.assertEqual(self.store.archive_path(first["id"]).read_bytes(), before)
         self.assertEqual(self.store.sha256_of(first["id"]), checksum)
-        for _ in range(candidates.EXPORTS_KEPT):
+        for index in range(candidates.EXPORTS_KEPT):
+            (self.world / "region" / "r.0.0.mca").write_bytes(
+                fixtures.region_variant(index % 250 + 1)
+            )
             meta = self.candidate()
             self.store.archive_path(meta["id"])
         self.assertFalse(archive.exists())
@@ -399,12 +416,14 @@ class MapVersionTests(unittest.TestCase):
         send(
             "checkout",
             mapId="konstaxa",
-            versionDigest=first["baseVersion"],
+            versionDigest=catalog[0]["head"]["versionDigest"],
             workingCopyId=copy_id,
         )
         self.clock[0] += 1
         controller.backend.ready(Goal(**controller.status()["desired"]))
         controller.step()
+        checked = self.store.versions.working_copy("konstaxa", copy_id)
+        (checked / "world/region/r.0.0.mca").write_bytes(b"post-restore edit")
         send("candidate", mapId="konstaxa", workingCopyId=copy_id)
         self.assertEqual(self.store.list()[0]["workingCopyId"], copy_id)
 
@@ -417,7 +436,12 @@ class MapVersionTests(unittest.TestCase):
             releases=release_catalog_fixture(),
         )
         first = self.candidate()
-        self.store.publish(first["id"], ACTOR)
+        first_head = self.activate(first)
+        live_world = Path(first_head["bundle"]) / "world"
+        (self.world / "blockfield-base.json").write_text(
+            json.dumps({"schema": 1, "templateDigest": template_digest(live_world)})
+        )
+        (self.world / "region" / "r.0.0.mca").write_bytes(fixtures.region_variant(11))
         original = self.store.archive_path(first["id"])
         checksum = self.store.sha256_of(first["id"])
         self.store.packages.mkdir(parents=True)
@@ -426,14 +450,17 @@ class MapVersionTests(unittest.TestCase):
         controller.export_maps()
         self.assertFalse(self.store.list()[0].get("derivedPackage", False))
         second = self.candidate()
-        self.store.publish(second["id"], ACTOR)
+        self.activate(second, first_head["versionDigest"])
         self.store.archive_path(second["id"])
         controller.export_maps()
         accepted = self.store.list()[0]
         created = self.store.packages / f"{accepted['sha256']}.zip"
         self.assertTrue(accepted["derivedPackage"])
         self.assertTrue(created.exists())
-        for _ in range(candidates.EXPORTS_KEPT):
+        for index in range(candidates.EXPORTS_KEPT):
+            (self.world / "region" / "r.0.0.mca").write_bytes(
+                fixtures.region_variant((index + 20) % 250 + 1)
+            )
             meta = self.candidate()
             self.store.archive_path(meta["id"])
         self.assertTrue(historical.exists())

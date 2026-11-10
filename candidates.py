@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import zipfile
@@ -30,6 +31,19 @@ MISSING = object()
 SNAPSHOT_MARGIN = 16 << 20
 EXPORTS_KEPT = 16
 ACCEPT_ONLY = object()
+# A snapshot/commit call without any head expectation. Distinct from an
+# explicit null head (the caller saw a headless map), which is checked.
+EXPECTED_HEAD_ABSENT = object()
+# A working copy whose base is not the current head is stale. Publishing from
+# it is refused with this message; nothing is edited or merged. The way out
+# is snapshot_working_copy plus checkout_fresh_copy.
+STALE_COPY_MESSAGE = (
+    "stale working copy: the map has a newer version; "
+    "save your draft as a snapshot and start from the current version"
+)
+# Pre-upgrade pending reviews are not carried into the linear model: their
+# versions and files stay in the archive, but the review itself is closed.
+CANDIDATE_SUPERSEDE_REASON = "pre-upgrade review; submit again after the upgrade"
 OWNER = (
     1000,
     1000,
@@ -108,10 +122,7 @@ class MapStore:
         self.versions._actor(actor)
         config = map_package.seed_config(map_id, name, modes)
         existing = self.session(session_id)
-        selection = {map_id: "work-" + session_id}
-        if existing is not None and (
-            existing["maps"] != [map_id] or existing["branches"] != selection
-        ):
+        if existing is not None and existing["maps"] != [map_id]:
             raise ValueError("creation UUID is bound to another session")
         recorded = self.versions.archive / "versions" / map_id
         if recorded.is_symlink():
@@ -134,7 +145,7 @@ class MapStore:
         locations = [
             self.templates / map_id,
             self.versions.active / map_id,
-            self.versions.archive / "branches" / map_id,
+            self.versions.archive / "snapshots" / map_id,
         ]
         if (
             any(path.exists() or path.is_symlink() for path in locations)
@@ -167,15 +178,12 @@ class MapStore:
 
     def create_map(self, map_id, name, modes, session_id, actor):
         config, version = self.check_create(map_id, name, modes, session_id, actor)
-        branch = "work-" + session_id
         fresh = version is None
         archive = self._session_path(session_id)
         copy = self.versions.working_copy(map_id, session_id)
-        refs = self.versions.archive / "branches" / map_id
         records = self.versions.archive / "versions" / map_id
         try:
             if archive.exists():
-                self.versions.branch(map_id, branch)
                 self.versions.validate_working_copy(map_id, session_id)
             if fresh:
                 files = {
@@ -196,17 +204,14 @@ class MapStore:
                     source_id=session_id,
                     note="Create private map",
                 )
-            branch_path = self.versions._branch_path(map_id, branch)
-            if not branch_path.exists() and not branch_path.is_symlink():
-                self.versions.create_branch(map_id, branch, version, actor)
             if not copy.exists() and not copy.is_symlink():
                 self.versions.checkout(map_id, version, session_id)
             self.versions.validate_working_copy(map_id, session_id)
-            session = self.bind_session(session_id, [map_id], {map_id: branch}, actor)
+            session = self.bind_session(session_id, [map_id], actor)
         except Exception:
             # Only an unpublished first attempt is rolled back. A durable archive keeps its complete private work.
             if fresh and not archive.exists():
-                for path in (copy, refs, records):
+                for path in (copy, records):
                     if path.is_dir() and not path.is_symlink():
                         shutil.rmtree(path)
                         _sync_directory(path.parent)
@@ -214,7 +219,6 @@ class MapStore:
         return {
             "mapId": map_id,
             "versionDigest": version,
-            "branch": self.versions.branch(map_id, branch),
             "session": session,
         }
 
@@ -301,27 +305,41 @@ class MapStore:
         note: str = "",
         *,
         working_copy_id=None,
-        branch=None,
-        expected_branch_head=None,
+        expected_head=EXPECTED_HEAD_ABSENT,
         review=True,
     ) -> dict:
-        if branch is not None and review:
-            return self.review(
-                map_id,
-                author,
-                note,
-                working_copy_id=working_copy_id,
-                branch=branch,
-                expected_head=expected_branch_head,
-            )
+        # Linear history: a commit parents the exact current head (CAS); the
+        # head itself advances only on publish/activate/restore, never on merge.
         world = self.check(map_id, working_copy_id)
         if working_copy_id is not None:
-            base_version = map_package._json((world / BASE_MARKER).read_bytes())[
-                "versionDigest"
-            ]
-            self.versions.read(map_id, base_version)
+            # Manifest-authoritative: also repairs a torn base write on read.
+            _, base_version, _ = self.versions._working_copy_manifest(
+                map_id, working_copy_id
+            )
         else:
             base_version = self._base_version(map_id)
+        head = self.versions.head(map_id)
+        head_digest = head["versionDigest"] if head else None
+        if expected_head is not EXPECTED_HEAD_ABSENT:
+            self.versions.check_head(map_id, expected_head)
+            if expected_head is None:
+                # An explicit null head pins a headless map: the first commit
+                # bootstraps history from the template import.
+                parent = base_version
+            elif base_version != expected_head:
+                # Stale base with a fresh expectation: this PR removed merges,
+                # so an automatic file rebase is a merge in disguise. Refuse
+                # and leave the draft untouched; the explicit snapshot path
+                # preserves it.
+                raise ValueError(STALE_COPY_MESSAGE)
+            else:
+                parent = expected_head
+        elif head_digest is None:
+            parent = base_version
+        else:
+            if base_version != head_digest:
+                raise ValueError(STALE_COPY_MESSAGE)
+            parent = head_digest
         self.candidates.mkdir(parents=True, exist_ok=True)
         # Exports run under the controller lock, so any temporary archive here was left by one that was killed.
         for stale in self.candidates.glob(".*.zip.tmp"):
@@ -337,38 +355,24 @@ class MapStore:
                 world, json.dumps(config, ensure_ascii=False, indent=2).encode()
             )
         # Publish refs only after autosave restoration has succeeded.
-        if branch is not None:
-            if working_copy_id is None or expected_branch_head is None:
-                raise ValueError(
-                    "branch snapshot requires working copy and expectedBranchHead"
-                )
-            version = self.versions.commit_branch(
-                map_id,
-                branch,
-                files,
-                author,
-                note or f"Update map {map_id}",
-                expected_branch_head,
-                working_copy_id,
-                base_version,
-            )
-            base_version = expected_branch_head
-        else:
-            version = self.versions._record(
-                map_id,
-                files,
-                parent=base_version,
-                author=author,
-                created_at=now_ms,
-                source="candidate",
-                source_id=candidate_id,
-                note=note,
-            )
+        # The version records its origin: a review candidate points back at
+        # the candidate, a plain commit at the copy that made it — so publish
+        # can verify the copy it is about to advance actually produced it.
+        version = self.versions.commit_head(
+            map_id,
+            files,
+            author,
+            note or f"Update map {map_id}",
+            parent,
+            working_copy_id,
+            base_version,
+            source="candidate" if review else "commit",
+            source_id=candidate_id if review else None,
+        )
         if not review:
             return {
                 "mapId": map_id,
                 "versionDigest": version,
-                "branch": self.versions.branch(map_id, branch),
             }
         meta = {
             "id": candidate_id,
@@ -384,17 +388,21 @@ class MapStore:
             "regions": sum(1 for name in files if name.startswith("world/region/")),
             "base": self._draft_base(world),
             "baseVersion": base_version,
+            "targetHead": head_digest,
             "workingCopyId": working_copy_id,
         }
-        if branch is not None:
-            head = self.versions.head(map_id)
-            meta.update(
-                sourceBranch=branch, targetHead=head["versionDigest"] if head else None
-            )
         self._write_meta(meta)
         return meta
 
-    def commit(self, map_id, author, note, *, working_copy_id, branch, expected_head):
+    def commit(
+        self,
+        map_id,
+        author,
+        note,
+        *,
+        working_copy_id,
+        expected_head=EXPECTED_HEAD_ABSENT,
+    ):
         if not isinstance(note, str) or not note.strip() or len(note) > 200:
             raise ValueError("commit message required (1–200 characters)")
         return self.create(
@@ -402,23 +410,28 @@ class MapStore:
             author,
             note,
             working_copy_id=working_copy_id,
-            branch=branch,
-            expected_branch_head=expected_head,
+            expected_head=expected_head,
             review=False,
         )
 
-    def review(self, map_id, author, note, *, working_copy_id, branch, expected_head):
+    def review(self, map_id, author, note, *, working_copy_id, expected_head):
+        # Linear review freezes one immutable version: it must be the fresh
+        # child of the current head (anything else is stale, never merged).
+        # A headless map reviews its first commit with targetHead None.
         self.versions._actor(author)
         self.versions.working_copy(map_id, working_copy_id)
-        ref = self.versions.branch(map_id, branch)
-        if branch == "main" or ref["versionDigest"] != expected_head:
-            raise ValueError("stale review branch head")
+        manifest = self.versions.read(map_id, expected_head)
         head = self.versions.head(map_id)
-        if head is not None and head["versionDigest"] == expected_head:
-            raise ValueError("commit changes on the branch before requesting review")
+        if head is None:
+            target = None
+        else:
+            if head["versionDigest"] == expected_head:
+                raise ValueError("commit changes before requesting review")
+            if manifest.get("parent") != head["versionDigest"]:
+                raise ValueError("review target changed; commit on the current head")
+            target = head["versionDigest"]
         if not isinstance(note, str) or len(note) > 200:
             raise ValueError("review message too long")
-        manifest = self.versions.read(map_id, expected_head)
         map_package.validate_playable(self.versions._config(manifest["files"]))
         for digest in manifest["files"].values():
             self.versions._verify_blob(digest)
@@ -435,9 +448,8 @@ class MapStore:
             "versionDigest": expected_head,
             "baseVersion": manifest["parent"],
             "workingCopyId": working_copy_id,
-            "sourceBranch": branch,
-            "targetHead": head["versionDigest"] if head else None,
-            "base": None,
+            "targetHead": target,
+            "base": self._draft_base(self._draft_world(map_id, working_copy_id)),
             "regions": sum(
                 name.startswith("world/region/") for name in manifest["files"]
             ),
@@ -457,82 +469,97 @@ class MapStore:
         meta = self._pending(
             candidate_id, allow_accepted=expected_head is not ACCEPT_ONLY
         )
-        if meta.get("sourceBranch") and expected_head is ACCEPT_ONLY:
-            raise ValueError("branch publication requires an explicit expectedHead")
-        if resolutions is not None and not isinstance(resolutions, dict):
-            raise ValueError("merge conflict choices must be an object")
+        # Linear history: branch/merge fields are legacy reads only. A stale
+        # head is an error here, never a merge; force only waives the
+        # template-base guard, never the head CAS.
+        if meta.get("native"):
+            if expected_head is ACCEPT_ONLY:
+                raise ValueError("publication requires an explicit expectedHead")
+            if resolutions is not None:
+                raise ValueError("linear map history accepts no conflict choices")
+            map_id = meta["mapId"]
+            head = self.versions.head(map_id)
+            if (
+                # expectedHead null is an explicit expectation (first publish),
+                # so its interrupted retry recovers here like any other.
+                not force
+                and head is not None
+                and meta.get("status") == "accepted"
+                and meta.get("committedVersion") == meta.get("versionDigest")
+                and head["versionDigest"] == meta.get("versionDigest")
+                and (
+                    meta.get("targetHead") is None
+                    or meta["targetHead"] == expected_head
+                )
+            ):
+                # A retry of this candidate's own committed publication: the
+                # accepted status plus the marker written before activation
+                # prove the publish, so only best-effort work remains. A
+                # pending duplicate that merely shares the version never
+                # enters here; it falls through to the target/parent checks
+                # and fails. A forced retry still refuses a stale head: force
+                # waives only the template-base guard, never the head CAS.
+                self._settle_publish(meta)
+                return meta
+            self.versions.check_head(map_id, expected_head)
+            # Pre-upgrade records carry baseVersion but no targetHead: their
+            # target is derived from the immutable version's parent below.
+            if (
+                meta.get("targetHead") is not None
+                and meta["targetHead"] != expected_head
+            ):
+                raise ValueError("review target changed; request a fresh review")
+            if expected_head is not None:
+                manifest = self.versions.read(map_id, meta["versionDigest"])
+                if manifest.get("parent") != expected_head:
+                    raise ValueError("stale map head: the review is behind the head")
+            map_package.validate_playable(self._candidate_config(meta))
+            manifest = self.versions.read(map_id, meta["versionDigest"])
+            for digest in manifest["files"].values():
+                self.versions._verify_blob(digest)
+            if not force:
+                current = self.versions.live_world(map_id, self.templates / map_id)
+                live = template_digest(current)
+                # No live template (fresh map, no head and no template dir):
+                # nothing exists yet that a snapshot could clobber.
+                if live is not None:
+                    if meta.get("base") is None:
+                        raise ValueError(
+                            "base unknown: the draft predates base tracking; confirm to publish anyway"
+                        )
+                    if meta["base"] != live:
+                        raise ValueError(
+                            "base changed: the map's template changed after this draft was copied; confirm to overwrite"
+                        )
+            # Publication is a transaction: validate, stage, move the head (the
+            # commit point). A failed stage or activation leaves the copy at
+            # its old base, so the unchanged head stays publishable by another
+            # review.
+            self.versions.prepare(map_id, meta["versionDigest"])
+            meta.update(
+                status="accepted",
+                decidedBy=actor,
+                decidedAt=int(self._now() * 1000),
+                forced=force,
+                committedVersion=meta["versionDigest"],
+            )
+            meta.pop("sourceBranch", None)
+            self._write_meta(meta)
+            self.activate(map_id, meta["versionDigest"], actor, expected_head)
+            # The copy advance after activation is best effort: the publish is
+            # final at activation. A failing advance is logged and leaves the
+            # copy stale (a stale copy is refused, never merged), and the
+            # result reports the publish plus copyAdvanced False.
+            self._settle_publish(meta)
+            return meta
         map_package.validate_playable(self._candidate_config(meta))
-        if meta.get("sourceBranch") and expected_head is None:
-            if force or resolutions:
-                raise ValueError(
-                    "initial publication does not accept force or conflict choices"
-                )
-            if meta.get("targetHead") is not None:
-                raise ValueError("review target changed; request a fresh review")
-            map_id, version = meta["mapId"], meta["versionDigest"]
-            self.versions.check_head(map_id, None)
-            self.versions.prepare(map_id, version)
-            meta.update(
-                status="accepted",
-                decidedBy=actor,
-                decidedAt=int(self._now() * 1000),
-                forced=False,
-                mergeVersion=version,
-                mergeTarget=None,
-                mergeResolutions={},
-            )
-            self._write_meta(meta)
-            self.activate(map_id, version, actor, None)
-            return meta
-        if (
-            expected_head is not ACCEPT_ONLY
-            and expected_head is not None
-            and meta.get("native")
-        ):
-            if force:
-                raise ValueError("force cannot bypass map merge conflicts")
-            if meta.get("sourceBranch") and meta.get("targetHead") != expected_head:
-                raise ValueError("review target changed; request a fresh review")
-            choices = {} if resolutions is None else resolutions
-            prepared = (
-                meta.get("mergeVersion")
-                if meta.get("mergeTarget") == expected_head
-                and meta.get("mergeResolutions") == choices
-                else None
-            )
-            if prepared is None:
-                prepared = self.versions.prepare_merge(
-                    meta["mapId"],
-                    meta["versionDigest"],
-                    actor,
-                    expected_head,
-                    note=meta.get("note", ""),
-                    resolutions=choices,
-                )
-            else:
-                self.versions.check_head(meta["mapId"], expected_head)
-                self.versions.read(meta["mapId"], prepared)
-            meta.update(
-                status="accepted",
-                decidedBy=actor,
-                decidedAt=int(self._now() * 1000),
-                forced=False,
-                mergeVersion=prepared,
-                mergeTarget=expected_head,
-                mergeResolutions=choices,
-            )
-            if meta.get("exportVersion") != prepared:
-                meta.update(sha256=None, size=None)
-            self._write_meta(meta)
-            self.activate(meta["mapId"], prepared, actor, expected_head)
-            return meta
         if (
             expected_head is not ACCEPT_ONLY
             and expected_head is not None
             and not meta.get("versionDigest")
         ):
             raise ValueError(
-                "legacy candidate has no verified commit parent; import it into a branch"
+                "legacy candidate has no verified commit; re-snapshot it first"
             )
         newer = [
             m
@@ -564,6 +591,9 @@ class MapStore:
                 raise ValueError(
                     "base changed: the map's template changed after this draft was copied; confirm to overwrite"
                 )
+        if expected_head is not ACCEPT_ONLY:
+            # CAS before recording: a stale head must not strand an import.
+            self.versions.check_head(map_id, expected_head)
         version = meta.get("versionDigest")
         if version is None:
             version = self.versions.import_package(
@@ -576,7 +606,6 @@ class MapStore:
                 note=meta.get("note", ""),
             )
         if expected_head is not ACCEPT_ONLY:
-            self.versions.check_head(map_id, expected_head)
             if (
                 not force
                 and expected_head is not None
@@ -592,11 +621,73 @@ class MapStore:
             decidedAt=int(self._now() * 1000),
             forced=force,
             versionDigest=version,
+            committedVersion=version,
         )
         self._write_meta(meta)
         if expected_head is not ACCEPT_ONLY:
             self.activate(map_id, version, actor, expected_head)
         return meta
+
+    def _settle_publish(self, meta) -> None:
+        """Best-effort work after the activation commit point.
+
+        The publish is final at activation; only the working-copy advance and
+        the final metadata rewrite remain. Either may fail (e.g. disk full)
+        without unpublishing the head: the copy stays stale for the explicit
+        path, and the result reports the publish plus copyAdvanced False or
+        metaSynced False. The committed state itself always derives from the
+        head, never from this metadata.
+        """
+        copy_advanced = True
+        copy_id = meta.get("workingCopyId")
+        if copy_id is not None and not self._version_from_copy(meta):
+            # The published version was not snapshotted from this candidate's
+            # copy (e.g. a pre-upgrade review of another session's tip):
+            # advancing it would strand the copy on foreign content, so it
+            # stays stale for the explicit path instead.
+            copy_advanced = False
+            print(
+                "candidate: published version is not from this working copy; "
+                "leaving the copy stale",
+                file=sys.stderr,
+            )
+        elif copy_id is not None:
+            try:
+                copy_advanced = self.versions.advance_working_copy(
+                    meta["mapId"], copy_id, meta["versionDigest"]
+                )
+            except Exception as error:
+                copy_advanced = False
+                print(
+                    f"candidate: working copy advance failed after publish: {error!r}",
+                    file=sys.stderr,
+                )
+        meta["copyAdvanced"] = copy_advanced
+        try:
+            self._write_meta(meta)
+        except Exception as error:
+            meta["metaSynced"] = False
+            print(
+                f"candidate: publish metadata sync failed after activation: {error!r}",
+                file=sys.stderr,
+            )
+
+    def _version_from_copy(self, meta) -> bool:
+        """The published version must have been snapshotted from this candidate's copy.
+
+        The version manifest points back at its origin: a candidate-created
+        version carries this candidate's id, a plain commit carries the
+        committing copy's id. Anything else (another candidate's version,
+        another copy's commit, a restore) must never advance this copy.
+        """
+        try:
+            manifest = self.versions.read(meta["mapId"], meta["versionDigest"])
+        except (OSError, ValueError):
+            return False
+        return manifest.get("sourceId") in (
+            meta.get("id"),
+            meta.get("workingCopyId"),
+        )
 
     def reject(self, candidate_id: str, actor: dict) -> dict:
         meta = self._pending(candidate_id)
@@ -660,6 +751,276 @@ class MapStore:
     def checkout(self, map_id: str, version_digest: str, working_copy_id: str) -> dict:
         return self.versions.checkout(map_id, version_digest, working_copy_id)
 
+    def snapshot_working_copy(
+        self, map_id: str, name: str, working_copy_id: str, actor: dict
+    ) -> dict:
+        """Preserve a (possibly stale) draft as a named snapshot; the copy is untouched.
+
+        Records the draft's current world as an immutable version parented at
+        the copy's base — never at the head, never merged — then pins it with
+        the existing snapshot create. An unedited draft adds no new content,
+        so the snapshot points at its base version. The draft is read only
+        after hold_saves() flushed and paused the running editor.
+        """
+        self.versions._actor(actor)
+        self.versions._branch_name(name)
+        with self.hold_saves():
+            target, base_version, base_manifest = self.versions._working_copy_manifest(
+                map_id, working_copy_id
+            )
+            config = self._map_json(map_id, working_copy_id)
+            files = self.versions.world_files(
+                target / "world",
+                json.dumps(config, ensure_ascii=False, indent=2).encode(),
+            )
+            files = self.versions._same_config_files(files, base_manifest["files"])
+        if files == base_manifest["files"]:
+            version = base_version
+        else:
+            version = self.versions._record(
+                map_id,
+                files,
+                parent=base_version,
+                author=actor,
+                created_at=int(self._now() * 1000),
+                source="snapshot",
+                source_id=working_copy_id,
+                note=f"Draft snapshot {name}",
+            )
+        return self.versions.create_snapshot(map_id, name, version, actor)
+
+    def checkout_fresh_copy(
+        self, map_id: str, working_copy_id: str, actor: dict
+    ) -> dict:
+        """Start from the current head: materialize it into a new copy id.
+
+        The copy goes through the normal session path, so an archived session
+        record binds the new id exactly like a session start — an inbox
+        client can then select it for editing via an archived resume. The
+        draft is never read, but the copy lands on disk beside the live
+        editor, so this also runs after hold_saves(). An existing id is
+        refused rather than overwritten.
+        """
+        target = self.versions.working_copy(map_id, working_copy_id)
+        if target.exists() or target.is_symlink():
+            raise ValueError("working copy already exists; resume it instead")
+        with self.hold_saves():
+            return self.prepare_session(working_copy_id, [map_id], actor=actor)[0]
+
+    @staticmethod
+    def _is_legacy_pending(meta: dict) -> bool:
+        """A pending review the linear model cannot honor.
+
+        Post-upgrade candidates record targetHead + workingCopyId at
+        creation; branch-era reviews recorded those fields under
+        shared-branch semantics (two sessions could select the same branch,
+        two reviews could share one version), which the linear publish path
+        cannot verify. Either shape stays out of the linear model.
+        """
+        return meta.get("status") == "pending" and (
+            "targetHead" not in meta
+            or "workingCopyId" not in meta
+            or meta.get("sourceBranch") is not None
+        )
+
+    def legacy_pending_candidates(self) -> list[dict]:
+        """Pending reviews migration would supersede (lock-free read)."""
+        return [m for m in self.list() if self._is_legacy_pending(m)]
+
+    def migrate_branches_to_snapshots(self) -> dict:
+        """Store-level linearization: pending pre-upgrade reviews, stale legacy
+        drafts, then branch refs.
+
+        Pre-upgrade pending reviews become `superseded` first (their versions
+        and files stay in the archive, nothing is deleted): the linear model
+        cannot verify their copy/version binding. Then drafts are preserved
+        (each snapshot written and fsynced before the next), and the branch
+        refs are removed only afterwards by the archive migration — a stop
+        between the steps keeps the refs, so the rerun still finds and
+        preserves every draft. Each step is idempotent on rerun: superseded
+        reviews stay superseded, an already preserved draft reuses its
+        snapshot, and removed refs stay removed. Every stale edited draft on
+        a map that had legacy branch refs is preserved as a migrated-draft-<hex> snapshot (the draft's content can no longer be
+        committed, so without this it would be silently lost). Each draft is
+        read after hold_saves(); when the editor cannot be paused the draft
+        is logged and left for the explicit snapshot_working_copy path.
+        Unedited drafts need no snapshot: their content is already immutable
+        history. Assumes the controller lock, like every other map mutation.
+        """
+        superseded = []
+        for meta in self.list():
+            if not self._is_legacy_pending(meta):
+                continue
+            meta.update(
+                status="superseded",
+                supersedeReason=CANDIDATE_SUPERSEDE_REASON,
+                supersededAt=int(self._now() * 1000),
+            )
+            self._write_meta(meta)
+            superseded.append(
+                {
+                    "id": meta["id"],
+                    "mapId": meta.get("mapId"),
+                    "versionDigest": meta.get("versionDigest"),
+                }
+            )
+        branch_authors: dict[str, dict] = {}
+        ref_maps: set[str] = set()
+        root = self.versions.archive / "branches"
+        if not root.is_symlink() and root.is_dir():
+            for map_dir in sorted(root.iterdir()):
+                if map_dir.is_symlink() or not map_dir.is_dir():
+                    continue
+                for path in sorted(map_dir.glob("*.json")):
+                    try:
+                        value = map_package._json(path.read_bytes())
+                    except (OSError, ValueError):
+                        continue
+                    if (
+                        isinstance(value, dict)
+                        and value.get("mapId") == map_dir.name
+                        and isinstance(value.get("createdBy"), dict)
+                    ):
+                        branch_authors.setdefault(map_dir.name, value["createdBy"])
+                        ref_maps.add(map_dir.name)
+        draft_snapshots, draft_skipped = [], []
+        drafts = self.versions.active / "drafts"
+        if ref_maps and not drafts.is_symlink() and drafts.is_dir():
+            for copy_dir in sorted(drafts.iterdir()):
+                if copy_dir.is_symlink() or not copy_dir.is_dir():
+                    continue
+                try:
+                    working_copy_id = str(UUID(copy_dir.name))
+                except (ValueError, AttributeError):
+                    continue
+                for map_dir in sorted(copy_dir.iterdir()):
+                    if (
+                        map_dir.is_symlink()
+                        or not map_dir.is_dir()
+                        or map_dir.name not in ref_maps
+                    ):
+                        continue
+                    map_id = map_dir.name
+                    try:
+                        head = self.versions.head(map_id)
+                        head_digest = head["versionDigest"] if head else None
+                        target, base, base_manifest = (
+                            self.versions._working_copy_manifest(
+                                map_id, working_copy_id
+                            )
+                        )
+                    except ValueError as error:
+                        draft_skipped.append(
+                            {
+                                "mapId": map_id,
+                                "workingCopyId": working_copy_id,
+                                "reason": str(error),
+                            }
+                        )
+                        print(
+                            f"workshop: draft snapshot skipped for {map_id}: {error!r}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if head_digest is None or base == head_digest:
+                        continue
+                    actor = branch_authors.get(map_id)
+                    try:
+                        session = self.session(working_copy_id)
+                    except ValueError:
+                        session = None
+                    if session is not None:
+                        actor = session["startedBy"]
+                    if actor is None:
+                        draft_skipped.append(
+                            {
+                                "mapId": map_id,
+                                "workingCopyId": working_copy_id,
+                                "reason": "no draft author",
+                            }
+                        )
+                        print(
+                            "workshop: draft snapshot skipped for"
+                            f" {map_id}: no draft author",
+                            file=sys.stderr,
+                        )
+                        continue
+                    try:
+                        with self.hold_saves():
+                            config = self._map_json(map_id, working_copy_id)
+                            files = self.versions.world_files(
+                                target / "world",
+                                json.dumps(
+                                    config, ensure_ascii=False, indent=2
+                                ).encode(),
+                            )
+                            files = self.versions._same_config_files(
+                                files, base_manifest["files"]
+                            )
+                    except Exception as error:
+                        draft_skipped.append(
+                            {
+                                "mapId": map_id,
+                                "workingCopyId": working_copy_id,
+                                "reason": str(error),
+                            }
+                        )
+                        print(
+                            f"workshop: draft snapshot skipped for {map_id}: {error!r}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if files == base_manifest["files"]:
+                        continue
+                    version = None
+                    for already in self.versions.snapshots(map_id):
+                        if not already["name"].startswith("migrated-draft-"):
+                            continue
+                        if (
+                            self.versions.read(map_id, already["versionDigest"])[
+                                "files"
+                            ]
+                            == files
+                        ):
+                            # A rerun after a stop between the steps: the same
+                            # draft content already has a snapshot.
+                            version = already["versionDigest"]
+                            break
+                    if version is None:
+                        version = self.versions._record(
+                            map_id,
+                            files,
+                            parent=base,
+                            author=actor,
+                            created_at=int(self._now() * 1000),
+                            source="snapshot",
+                            source_id=working_copy_id,
+                            note=f"Migrated stale draft of {map_id}",
+                        )
+                    name = f"migrated-draft-{version[:12]}"
+                    try:
+                        existing = self.versions.snapshot(map_id, name)
+                    except ValueError:
+                        existing = None
+                    if existing is not None and (existing["versionDigest"] == version):
+                        continue
+                    snap = self.versions.create_snapshot(map_id, name, version, actor)
+                    draft_snapshots.append(
+                        {
+                            "mapId": map_id,
+                            "name": name,
+                            "versionDigest": snap["versionDigest"],
+                        }
+                    )
+        # The branch refs go last: their snapshots are written and re-read
+        # inside, and only then is each ref removed — so every draft above is
+        # already preserved before the first ref disappears.
+        summary = self.versions.migrate_branches_to_snapshots()
+        summary["candidatesSuperseded"] = superseded
+        summary["draftSnapshots"] = draft_snapshots
+        summary["draftSkipped"] = draft_skipped
+        return summary
+
     def prepare_session(
         self,
         working_copy_id: str,
@@ -678,25 +1039,28 @@ class MapStore:
             raise ValueError("session requires distinct selected maps")
         if set(maps) - self.map_ids():
             raise ValueError("session selects an unavailable map")
-        if branches is not None and (
-            not isinstance(branches, dict)
-            or set(branches) != set(maps)
-            or any(
-                not isinstance(name, str) or name == "main"
-                for name in branches.values()
-            )
-        ):
-            raise ValueError("session branches must match its selected maps")
         if branches is not None:
-            self.versions._actor(actor)
-            existing = self.session(working_copy_id)
-            if existing is not None and (
-                existing["maps"] != maps or existing["branches"] != branches
-            ):
-                raise ValueError(
-                    "working copy is already bound to another map/branch selection"
+            # Pre-linear compat: named branch selections are validated for
+            # shape only, then ignored — one head per map. Live sessions keep
+            # their working copies, which are keyed by session UUID.
+            if (
+                not isinstance(branches, dict)
+                or set(branches) != set(maps)
+                or any(
+                    not isinstance(name, str) or name == "main"
+                    for name in branches.values()
                 )
-        copies, missing, refs = [], [], []
+            ):
+                raise ValueError("session branches must match its selected maps")
+            self.versions._actor(actor)
+            for name in branches.values():
+                self.versions._branch_name(name)
+            existing = self.session(working_copy_id)
+            if existing is not None and existing["maps"] != maps:
+                raise ValueError(
+                    "working copy is already bound to another map selection"
+                )
+        copies, missing = [], []
         for map_id in maps:
             target = self.versions.working_copy(map_id, working_copy_id)
             copy = (
@@ -704,48 +1068,22 @@ class MapStore:
                 if target.exists() or target.is_symlink()
                 else None
             )
-            selected = None
-            if branches is not None:
-                name = branches[map_id]
-                self.versions._branch_name(name)
-                branch_file = self.versions._branch_path(map_id, name)
-                if not branch_file.exists() and not branch_file.is_symlink():
-                    if name != f"work-{working_copy_id}":
-                        raise ValueError("selected named branch is missing")
-                    self.versions._actor(actor)
-                    if copy is not None:
-                        origin = copy["versionDigest"]
-                    else:
-                        head = self.versions.head(map_id)
-                        if head is None:
-                            raise ValueError("map has no active head; import it first")
-                        origin = head["versionDigest"]
-                    refs.append((map_id, name, origin))
-                    selected = {"versionDigest": origin}
-                else:
-                    selected = self.versions.branch(map_id, name)
             if copy is not None:
                 copies.append(copy)
             else:
                 if resume_only:
                     raise ValueError("selected working copy is missing")
-                head = selected if branches is not None else self.versions.head(map_id)
+                head = self.versions.head(map_id)
                 if head is None:
                     raise ValueError(
                         f"map {map_id} has no active head; import and activate it first"
                     )
                 self.versions.prepare(map_id, head["versionDigest"])
                 missing.append((map_id, head["versionDigest"]))
-        created_copies, created_refs = [], []
+        created_copies = []
         try:
             for map_id, version in missing:
-                if branches is None or any(item[0] == map_id for item in refs):
-                    self.versions.check_head(map_id, version)
-                elif (
-                    self.versions.branch(map_id, branches[map_id])["versionDigest"]
-                    != version
-                ):
-                    raise ValueError("stale session branch head")
+                self.versions.check_head(map_id, version)
                 self.checkout(map_id, version, working_copy_id)
                 created_copies.append(
                     self.versions.working_copy(map_id, working_copy_id)
@@ -753,19 +1091,15 @@ class MapStore:
                 copies.append(
                     self.versions.validate_working_copy(map_id, working_copy_id)
                 )
-            for map_id, name, origin in refs:
-                self.versions.create_branch(map_id, name, origin, actor)
-                created_refs.append(self.versions._branch_path(map_id, name))
-            if branches is not None:
-                self.bind_session(working_copy_id, maps, branches, actor)
+            if actor is not None:
+                self.bind_session(working_copy_id, maps, actor)
         except Exception:
-            # A renamed archive is the commit point; a failed final fsync must not destroy its complete copies.
-            if branches is not None and self._session_path(working_copy_id).exists():
+            # A renamed session file is the commit point; a failed final
+            # fsync must not destroy its complete copies.
+            if self._session_path(working_copy_id).exists():
                 raise
-            # Only this attempt's new copies/refs are removed; pre-existing dirty work stays intact.
-            for path in created_refs:
-                path.unlink()
-                _sync_directory(path.parent)
+            # Only this attempt's new copies are removed; pre-existing dirty
+            # work stays intact.
             for path in created_copies:
                 shutil.rmtree(path)
                 _sync_directory(path.parent)
@@ -781,7 +1115,11 @@ class MapStore:
 
     @staticmethod
     def _selection_digest(value):
-        fields = {key: value[key] for key in ("id", "maps", "branches")}
+        # Linear sessions track maps only; pre-linear archives also carry
+        # branches and keep their old digest.
+        fields = {key: value[key] for key in ("id", "maps") if key in value}
+        if "branches" in value:
+            fields["branches"] = value["branches"]
         return hashlib.sha256(
             json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -802,14 +1140,14 @@ class MapStore:
             or not value["maps"]
             or any(not isinstance(item, str) for item in value["maps"])
             or len(value["maps"]) != len(set(value["maps"]))
-            or not isinstance(value.get("branches"), dict)
-            or set(value["branches"]) != set(value["maps"])
+            or ("branches" in value and not isinstance(value["branches"], dict))
+            or ("branches" in value and set(value["branches"]) != set(value["maps"]))
             or type(value.get("startedAt")) is not int
             or value["startedAt"] < 0
         ):
             raise ValueError("invalid archived session")
         self.versions._actor(value.get("startedBy"))
-        for map_id, branch in value["branches"].items():
+        for map_id, branch in (value.get("branches") or {}).items():
             self.versions._map_id(map_id)
             if self.versions._branch_name(branch) == "main":
                 raise ValueError("session cannot edit protected main")
@@ -817,20 +1155,19 @@ class MapStore:
             raise ValueError("archived session selection checksum mismatch")
         return value
 
-    def bind_session(self, session_id, maps, branches, actor):
+    def bind_session(self, session_id, maps, actor, branches=None):
         self.versions._actor(actor)
         existing = self.session(session_id)
         if existing is not None:
-            if existing["maps"] != maps or existing["branches"] != branches:
+            if existing["maps"] != maps:
                 raise ValueError(
-                    "working copy is already bound to another map/branch selection"
+                    "working copy is already bound to another map selection"
                 )
             return existing
         value = {
             "schema": 1,
             "id": session_id,
             "maps": maps,
-            "branches": branches,
             "startedAt": int(self._now() * 1000),
             "startedBy": actor,
         }
@@ -909,7 +1246,7 @@ class MapStore:
                     **entry,
                     "kind": config.get("kind", "arena"),
                     "mapJson": config,
-                    "branches": self.versions.branches(map_id),
+                    "snapshots": self.versions.snapshots(map_id),
                 }
             )
         return catalog
@@ -1341,38 +1678,26 @@ class MapVersions:
 
     @staticmethod
     def _branch_name(name):
+        # Shared name rule for snapshots and pre-linear compat reads.
         if not isinstance(name, str) or not BRANCH_NAME.fullmatch(name):
-            raise ValueError("canonical map branch name required")
+            raise ValueError("canonical map snapshot name required")
         return name
 
-    def _branch_path(self, map_id, name):
+    def _snapshot_path(self, map_id, name):
         self._map_id(map_id)
         self._branch_name(name)
-        directory = self.archive / "branches" / map_id
+        directory = self.archive / "snapshots" / map_id
         for path in (directory.parent, directory):
             if path.is_symlink() or path.exists() and not path.is_dir():
-                raise ValueError("unsafe map branch directory")
+                raise ValueError("unsafe map snapshot directory")
         return directory / f"{name}.json"
 
-    def branch(self, map_id, name) -> dict:
-        self._branch_name(name)
-        if name == "main":
-            head = self.head(map_id)
-            if head is None:
-                raise ValueError("map main has no active head")
-            return {
-                "schema": 1,
-                "mapId": map_id,
-                "name": name,
-                "versionDigest": head["versionDigest"],
-                "generation": head["generation"],
-                "workingCopyId": None,
-                "createdBy": head["activatedBy"],
-                "createdAt": head["activatedAt"],
-            }
-        path = self._branch_path(map_id, name)
+    def snapshot(self, map_id, name) -> dict:
+        path = self._snapshot_path(map_id, name)
+        if not path.exists() and not path.is_symlink():
+            raise ValueError("unknown map snapshot")
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
-            raise ValueError("map branch missing or unsafe")
+            raise ValueError("map snapshot missing or unsafe")
         value = map_package._json(path.read_bytes())
         if (
             not isinstance(value, dict)
@@ -1385,119 +1710,188 @@ class MapVersions:
             or type(value.get("createdAt")) is not int
             or value["createdAt"] < 0
         ):
-            raise ValueError("invalid map branch")
+            raise ValueError("invalid map snapshot")
         self._actor(value.get("createdBy"))
         self.read(map_id, value.get("versionDigest"))
-        if value.get("workingCopyId") is not None:
-            self.working_copy(map_id, value["workingCopyId"])
         return value
 
-    def branches(self, map_id) -> list[dict]:
-        values = [self.branch(map_id, "main")] if self.head(map_id) else []
-        directory = self._branch_path(map_id, "work").parent
-        for path in sorted(directory.glob("*.json")):
-            if path.stem == "main":
-                raise ValueError("main must use the active map head")
-            values.append(self.branch(map_id, path.stem))
-        return values
+    def snapshots(self, map_id) -> list[dict]:
+        directory = self._snapshot_path(map_id, "work").parent
+        return [
+            self.snapshot(map_id, path.stem)
+            for path in sorted(directory.glob("*.json"))
+        ]
 
-    def create_branch(self, map_id, name, version, actor) -> dict:
+    def create_snapshot(self, map_id, name, version, actor) -> dict:
         self._actor(actor)
         if self._branch_name(name) == "main":
-            raise ValueError("main is protected; submit a review")
+            raise ValueError("main is the active head, not a snapshot")
         self.read(map_id, version)
-        path = self._branch_path(map_id, name)
+        path = self._snapshot_path(map_id, name)
         if path.exists() or path.is_symlink():
-            raise ValueError("map branch already exists")
+            existing = self.snapshot(map_id, name)
+            if existing["versionDigest"] != version:
+                raise ValueError("map snapshot already exists")
+            return existing
+        head = self.head(map_id)
         value = {
             "schema": 1,
             "mapId": map_id,
             "name": name,
             "versionDigest": version,
-            "generation": 1,
-            "workingCopyId": None,
+            "generation": head["generation"] if head else 1,
             "createdAt": int(self._now() * 1000),
             "createdBy": actor,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_json(path, value, owner=False)
-        return value
+        return self.snapshot(map_id, name)
 
-    def _ancestors(self, map_id, version) -> dict[str, dict]:
-        pending, found = [self._digest(version)], {}
-        while pending:
-            digest = pending.pop()
-            if digest in found:
-                continue
-            if len(found) >= 10000:
-                raise ValueError("map history traversal limit exceeded")
-            manifest = self.read(map_id, digest)
-            found[digest] = manifest
-            pending.extend(
-                manifest.get(
-                    "parents", [manifest["parent"]] if manifest["parent"] else []
-                )
-            )
-        return found
+    def delete_snapshot(self, map_id, name) -> None:
+        path = self._snapshot_path(map_id, name)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("unknown map snapshot")
+        self.snapshot(map_id, name)
+        path.unlink()
+        _sync_directory(path.parent)
 
-    def commit_branch(
+    def migrate_branches_to_snapshots(self) -> dict:
+        """One-way linearization of pre-linear branch refs.
+
+        Every named branch tip that differs from the map head becomes a named
+        snapshot (generation/author/timestamp preserved); tips already at the
+        head need no snapshot. Branch refs are removed only after their
+        snapshot is written and re-read. Idempotent: a second run finds no
+        branch refs and changes nothing. Never deletes a version or blob;
+        working copies and sessions are untouched, so live sessions keep
+        working against the same files.
+        """
+        root = self.archive / "branches"
+        migrated, at_head = [], []
+        if root.is_symlink():
+            raise ValueError("unsafe map branch directory")
+        if not root.is_dir():
+            return {"migrated": migrated, "atHead": at_head}
+        for map_dir in sorted(root.iterdir()):
+            if map_dir.is_symlink() or not map_dir.is_dir():
+                raise ValueError("unsafe map branch directory")
+            map_id = self._map_id(map_dir.name)
+            head = self.head(map_id)
+            head_digest = head["versionDigest"] if head else None
+            for path in sorted(map_dir.glob("*.json")):
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("map branch missing or unsafe")
+                name = path.stem
+                if name == "main":
+                    raise ValueError("main must use the active map head")
+                self._branch_name(name)
+                raw = path.read_bytes()
+                value = map_package._json(raw)
+                if (
+                    not isinstance(value, dict)
+                    or value.get("mapId") != map_id
+                    or value.get("name") != name
+                ):
+                    raise ValueError("invalid map branch")
+                self._actor(value.get("createdBy"))
+                tip = value.get("versionDigest")
+                self.read(map_id, tip)
+                if tip == head_digest:
+                    at_head.append(
+                        {"mapId": map_id, "name": name, "versionDigest": tip}
+                    )
+                else:
+                    snap_path = self._snapshot_path(map_id, name)
+                    if not snap_path.exists() and not snap_path.is_symlink():
+                        snap_path.parent.mkdir(parents=True, exist_ok=True)
+                        _atomic_json(
+                            snap_path,
+                            {
+                                "schema": 1,
+                                "mapId": map_id,
+                                "name": name,
+                                "versionDigest": tip,
+                                "generation": value.get("generation", 1),
+                                "createdAt": value.get("createdAt", 0),
+                                "createdBy": value.get("createdBy"),
+                            },
+                            owner=False,
+                        )
+                    snap = self.snapshot(map_id, name)
+                    if snap["versionDigest"] != tip:
+                        raise ValueError("map snapshot already exists")
+                    migrated.append(
+                        {"mapId": map_id, "name": name, "versionDigest": tip}
+                    )
+                # Recheck before removing: the ref must still be the one the
+                # snapshot was taken from (migration runs under the lock, so a
+                # change here means the lock did not serialize writers).
+                if path.read_bytes() != raw:
+                    raise ValueError("map branch changed during migration")
+                path.unlink()
+                _sync_directory(map_dir)
+            try:
+                map_dir.rmdir()
+                _sync_directory(root)
+            except OSError:
+                pass
+        try:
+            root.rmdir()
+            _sync_directory(root.parent)
+        except OSError:
+            pass
+        return {"migrated": migrated, "atHead": at_head}
+
+    def commit_head(
         self,
         map_id,
-        name,
         files,
         actor,
         note,
-        expected_head,
+        parent_version,
         working_copy_id,
         base_version,
-    ):
+        *,
+        source="commit",
+        source_id=None,
+    ) -> str:
+        # Linear commit: one parent (the exact current head), no ref to move.
         self._actor(actor)
-        if name == "main":
-            raise ValueError("main is protected; submit a review")
-        self.working_copy(map_id, working_copy_id)
-        branch = self.branch(map_id, name)
-        if branch["versionDigest"] != expected_head:
-            raise ValueError("stale branch head: refresh before committing")
-        if base_version not in self._ancestors(map_id, expected_head) or (
-            base_version != expected_head
-            and branch.get("workingCopyId") != working_copy_id
+        if parent_version is not None:
+            self._digest(parent_version)
+        if base_version != parent_version:
+            raise ValueError(STALE_COPY_MESSAGE)
+        if working_copy_id is not None:
+            self.working_copy(map_id, working_copy_id)
+        previous = self.read(map_id, parent_version)["files"] if parent_version else {}
+        files = self._same_config_files(files, previous)
+        # The first snapshot bootstraps history; every later commit must move it.
+        if (
+            parent_version is not None
+            and files == previous
+            and self.head(map_id) is not None
         ):
-            raise ValueError(
-                "working copy is behind the branch; checkout its current head"
-            )
-        if not isinstance(note, str) or not note.strip() or len(note) > 200:
-            raise ValueError("commit message required (1–200 characters)")
-        previous = self.read(map_id, expected_head)["files"]
-        # JSON whitespace/key order is not a builder edit; preserve the original blob.
-        if self._same(self._config(files), self._config(previous)):
-            files = files | {"map.json": previous["map.json"]}
-        if files == previous:
-            raise ValueError("no changes since the last branch commit")
-        version = self._record(
+            raise ValueError("no changes since the current map head")
+        return self._record(
             map_id,
             files,
-            parent=expected_head,
+            parent=parent_version,
             author=actor,
             created_at=int(self._now() * 1000),
-            source="commit",
-            source_id=working_copy_id,
-            note=note.strip(),
-            parents=[expected_head],
+            source=source,
+            source_id=source_id if source_id is not None else working_copy_id,
+            note=note.strip() if isinstance(note, str) else note,
+            parents=[parent_version] if parent_version else [],
         )
-        # One ref write commits the snapshot; the editable copy and its original base stay intact.
-        if self.branch(map_id, name)["versionDigest"] != expected_head:
-            raise ValueError("stale branch head: refresh before committing")
-        _atomic_json(
-            self._branch_path(map_id, name),
-            branch
-            | {
-                "versionDigest": version,
-                "generation": branch["generation"] + 1,
-                "workingCopyId": working_copy_id,
-            },
-            owner=False,
-        )
-        return version
+
+    def _same_config_files(self, files, previous_files):
+        # JSON whitespace/key order is not a builder edit; keep the old blob
+        # so an untouched draft compares equal to its base version.
+        if previous_files and self._same(
+            self._config(files), self._config(previous_files)
+        ):
+            return files | {"map.json": previous_files["map.json"]}
+        return files
 
     def _config(self, files):
         path = self._verify_blob(files["map.json"])
@@ -1590,161 +1984,6 @@ class MapVersions:
                 self._config(new) if config is None else config,
             ),
         }
-
-    def merge_preview(self, map_id, source, target, resolutions=None) -> dict:
-        left, right = self._ancestors(map_id, source), self._ancestors(map_id, target)
-        common = left.keys() & right.keys()
-        parents = {
-            parent
-            for digest in common
-            for parent in left[digest].get(
-                "parents", [left[digest]["parent"]] if left[digest]["parent"] else []
-            )
-        }
-        bases = common - parents
-        if len(bases) != 1:
-            raise ValueError("merge needs one unambiguous common ancestor")
-        base = bases.pop()
-        base_files, ours, theirs = (
-            left[base]["files"],
-            right[target]["files"],
-            left[source]["files"],
-        )
-        if left[source]["kind"] != right[target]["kind"]:
-            raise ValueError("map kind cannot change during merge")
-        resolutions = {} if resolutions is None else resolutions
-        if (
-            not isinstance(resolutions, dict)
-            or len(resolutions) > 10000
-            or any(
-                not isinstance(path, str)
-                or not isinstance(choice, str)
-                or choice not in {"ours", "theirs"}
-                for path, choice in resolutions.items()
-            )
-        ):
-            raise ValueError("invalid merge conflict choices")
-        conflicts, used = [], set()
-
-        def merge_value(old, own, incoming, path):
-            if self._same(own, incoming) or self._same(incoming, old):
-                return own
-            if self._same(own, old):
-                return incoming
-            if old is MISSING and isinstance(own, dict) and isinstance(incoming, dict):
-                old = {}
-            if all(isinstance(value, dict) for value in (old, own, incoming)):
-                merged = {}
-                for key in sorted(old.keys() | own.keys() | incoming.keys()):
-                    value = merge_value(
-                        old.get(key, MISSING),
-                        own.get(key, MISSING),
-                        incoming.get(key, MISSING),
-                        path + "/" + key.replace("~", "~0").replace("/", "~1"),
-                    )
-                    if value is not MISSING:
-                        merged[key] = value
-                return merged
-            conflict = {
-                "path": path,
-                "kind": "json" if path.startswith("map.json#") else "binary",
-                "basePresent": old is not MISSING,
-                "oursPresent": own is not MISSING,
-                "theirsPresent": incoming is not MISSING,
-                "base": None if old is MISSING else old,
-                "ours": None if own is MISSING else own,
-                "theirs": None if incoming is MISSING else incoming,
-            }
-            conflicts.append(conflict)
-            if path in resolutions:
-                used.add(path)
-                return own if resolutions[path] == "ours" else incoming
-            return own
-
-        files, merged_config = {}, None
-        for name in sorted(base_files.keys() | ours.keys() | theirs.keys()):
-            old, own, incoming = (
-                base_files.get(name, MISSING),
-                ours.get(name, MISSING),
-                theirs.get(name, MISSING),
-            )
-            if (
-                name == "map.json"
-                and own != incoming
-                and own != old
-                and incoming != old
-            ):
-                merged_config = merge_value(
-                    self._config(base_files),
-                    self._config(ours),
-                    self._config(theirs),
-                    "map.json#",
-                )
-                raw = json.dumps(merged_config, ensure_ascii=False, indent=2).encode()
-                files[name] = hashlib.sha256(raw).hexdigest()
-            else:
-                value = merge_value(old, own, incoming, name)
-                if value is not MISSING:
-                    files[name] = value
-        if set(resolutions) != used:
-            raise ValueError("merge choices must name actual conflicts only")
-        changes = self._compare_files(map_id, target, None, ours, files, merged_config)
-        return {
-            "mapId": map_id,
-            "baseVersion": base,
-            "sourceVersion": source,
-            "targetVersion": target,
-            "conflicts": conflicts,
-            "unresolved": [c["path"] for c in conflicts if c["path"] not in used],
-            "files": files,
-            "config": merged_config,
-            "changes": {"files": changes["files"], "config": changes["config"]},
-        }
-
-    def prepare_merge(
-        self, map_id, source, actor, expected_head, *, note="", resolutions=None
-    ) -> str:
-        self._actor(actor)
-        if not isinstance(note, str) or len(note) > 200:
-            raise ValueError("merge message too long")
-        self.check_head(map_id, expected_head)
-        if expected_head is None:
-            raise ValueError("import main before merging")
-        merged = self.merge_preview(map_id, source, expected_head, resolutions)
-        if merged["unresolved"]:
-            raise ValueError("merge conflicts: " + ", ".join(merged["unresolved"]))
-        if merged["config"] is not None:
-            self.validate_config(map_id, merged["config"])
-            merged["files"]["map.json"] = self._put_blob(
-                json.dumps(merged["config"], ensure_ascii=False, indent=2).encode()
-            )
-        for digest in merged["files"].values():
-            self._verify_blob(digest)
-        if source in self._ancestors(map_id, expected_head):
-            return expected_head
-        if expected_head in self._ancestors(map_id, source):
-            version = source
-        else:
-            version = self._record(
-                map_id,
-                merged["files"],
-                parent=expected_head,
-                parents=[expected_head, source],
-                author=actor,
-                created_at=int(self._now() * 1000),
-                source="merge",
-                source_id=source,
-                note=note or "Merge map changes",
-            )
-        return version
-
-    def merge(
-        self, map_id, source, actor, expected_head, *, note="", resolutions=None
-    ) -> dict:
-        version = self.prepare_merge(
-            map_id, source, actor, expected_head, note=note, resolutions=resolutions
-        )
-        return self.activate(map_id, version, actor, expected_head)
 
     def prepare_restore(self, map_id, target, actor, expected_head) -> str:
         self._actor(actor)
@@ -1866,12 +2105,12 @@ class MapVersions:
         ancestors = parents if parents is not None else ([parent] if parent else [])
         if (
             not isinstance(ancestors, list)
-            or len(ancestors) > 2
+            or len(ancestors) > 1
             or any(not isinstance(item, str) for item in ancestors)
             or len(set(ancestors)) != len(ancestors)
             or (ancestors[0] if ancestors else None) != parent
         ):
-            raise ValueError("invalid map commit parents")
+            raise ValueError("map history is linear: single parent required")
         for ancestor in ancestors:
             if self.read(map_id, ancestor)["kind"] != kind:
                 raise ValueError("map commit kind cannot change")
@@ -2218,6 +2457,86 @@ class MapVersions:
             "bundle": str(target),
         }
 
+    def _working_copy_manifest(self, map_id: str, working_copy_id: str) -> tuple:
+        """The copy's authoritative base: manifest.json verified against the CAS.
+
+        manifest.json is byte-identical to an immutable archived version, so its
+        sha256 both identifies and verifies the base; the world marker only
+        mirrors it. A torn advance write (or a legacy/hand-written marker) is
+        repaired here, so no crash point leaves the copy permanently invalid.
+        """
+        target = self.working_copy(map_id, working_copy_id)
+        manifest_file = target / "manifest.json"
+        marker_path = target / "world" / BASE_MARKER
+        for path in (target, target / "world", manifest_file):
+            if path.is_symlink() or not path.exists():
+                raise ValueError("working copy missing or unsafe")
+        if manifest_file.stat().st_size > 4 << 20:
+            raise ValueError("working copy metadata missing or unsafe")
+        version = _sha256(manifest_file)
+        manifest = self.read(map_id, version)
+        if marker_path.is_symlink() or (
+            marker_path.is_file() and marker_path.stat().st_size > 65536
+        ):
+            raise ValueError("working copy missing or unsafe")
+        try:
+            marker = map_package._json(marker_path.read_bytes())
+            intact = (
+                isinstance(marker, dict)
+                and marker.get("versionDigest") == version
+                and marker.get("templateDigest") == manifest["worldDigest"]
+            )
+        except (OSError, ValueError):
+            intact = False
+        if not intact:
+            _atomic_json(
+                marker_path,
+                {
+                    "schema": 1,
+                    "templateDigest": manifest["worldDigest"],
+                    "versionDigest": version,
+                },
+                owner=False,
+            )
+        return target, version, manifest
+
+    def _write_copy_base(self, target: Path, manifest: dict, version: str) -> None:
+        """Move a working copy's base pointer; the world files stay untouched."""
+        _atomic_json(target / "manifest.json", manifest, owner=False)
+        _atomic_json(
+            target / "world" / BASE_MARKER,
+            {
+                "schema": 1,
+                "templateDigest": manifest["worldDigest"],
+                "versionDigest": version,
+            },
+            owner=False,
+        )
+        _chown_tree(target)
+
+    def advance_working_copy(
+        self, map_id: str, working_copy_id: str, version: str
+    ) -> bool:
+        """Move a working copy's base pointer to a newer immutable version.
+
+        Only the copy a published version was snapshotted from may advance:
+        its world already contains that version, so later commits parent it
+        without dropping anything. The world files (pending edits) are kept.
+        A missing copy was removed after the review; that is not an error.
+        """
+        target = self.working_copy(map_id, working_copy_id)
+        if not target.exists() and not target.is_symlink():
+            return False
+        _, current, _ = self._working_copy_manifest(map_id, working_copy_id)
+        manifest = self.read(map_id, version)
+        # The copy sits on the published version's parent — or already on the
+        # version itself (first publish on a headless map, or a republish
+        # after the activation below failed midway).
+        if current not in {version, manifest["parent"]}:
+            raise ValueError("working copy moved during review; resume it first")
+        self._write_copy_base(target, manifest, version)
+        return True
+
     def validate_working_copy(self, map_id: str, working_copy_id: str) -> dict:
         target = self.working_copy(map_id, working_copy_id)
         for path in (
@@ -2240,15 +2559,9 @@ class MapVersions:
                 raise ValueError("working copy metadata missing or unsafe")
         if config_file.stat().st_size > 1 << 20:
             raise ValueError("map config too large")
-        version = _sha256(manifest_file)
-        manifest = self.read(map_id, version)
-        marker = map_package._json((target / "world" / BASE_MARKER).read_bytes())
-        if (
-            not isinstance(marker, dict)
-            or marker.get("versionDigest") != version
-            or marker.get("templateDigest") != manifest["worldDigest"]
-        ):
-            raise ValueError("working copy base mismatch")
+        # The manifest is the authoritative base; resolving it repairs a torn
+        # marker write, so a crash between the two base writes heals on read.
+        _, version, manifest = self._working_copy_manifest(map_id, working_copy_id)
         config = map_package._json(config_file.read_bytes())
         self.validate_config(map_id, config)
         if config.get("kind", "arena") != manifest["kind"]:

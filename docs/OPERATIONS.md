@@ -47,7 +47,7 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 | `/srv/minecraft/workshop/inbox/` (root:1000 0770)   | authenticated site (UID1000) | controller                     | `<id>.json`: `{schema:1,id,kind,actor:{draslId,name},createdAt,...}`; write temp then rename                                              |
 
 Admin status contains `{schema:1,revision,operation,phase,gate,error,errorMessage,since,deadline,desired,message,updatedAt,game:{phase,gate,release}}`.
-Session contains `{schema:1,id,maps,branches?,startedAt,startedBy}`; the mod offers only the selected maps.
+Session contains `{schema:1,id,maps,startedAt,startedBy}`; the mod offers only the selected maps.
 Results contain `{id,ok,error,revision,doneAt,payload?}`; newest200 are kept.
 
 `release` is `build` from the image's `/opt/blockfield-build.json` (the modpack tag, e.g. `v2.27.0`). Readiness counts only
@@ -236,22 +236,24 @@ Every request gets exactly one `admin/results/<id>.json` and its inbox file is r
 the inbox file (idempotent). Rejected with a result: names not `^[0-9a-f-]{36}\.json$` are ignored, symlinks/non-regular
 files, oversized requests, invalid/duplicate-key JSON, `schema != 1`, `id` != file name, invalid actor, `createdAt` older than 10 min,
 unknown kind. A busy `controller.lock` leaves the request for the next step. Each request is logged with the actor name.
-Requests are limited to 64 KiB, except `merge-preview` and `publish`: these allow up to 8 MiB so all 10,000 exact
+Requests are limited to 64 KiB, except `publish`: it allows up to 8 MiB so all 10,000 exact
 conflict choices supported by the core can be submitted. Every other kind retains the smaller limit.
 Map requests additionally resolve the exact Drasl ID and name from the current controller ACL and check map scope.
 Publish, reject, restore and Limbo activation/export require an `admin`; `lead` may edit/review maps but cannot mutate
 protected main. Successful map requests may add `payload` to the existing result envelope, containing the created
-ref, immutable commit/review, comparison or merge preview. Non-map control envelopes retain their existing contract.
+ref, immutable commit/review and comparison. Non-map control envelopes retain their existing contract.
 
 - `mode` `{profile:game|workshop|test,expectedRevision,recover?}`: same as `workshopctl request` with the current release;
   legacy `game` resumes the existing editor. `recover` retains that spelling and runs the Workshop recovery step immediately. Toward workshop: `session: new|resume` (default new)
   and `maps: [mapId]|null` (null = all): a new session gets a fresh id and the chosen maps, resume keeps the previous
   session's id and maps; stored in `controller/session.json`, exported as `admin/session.json`.
-  Canonical sessions also freeze `branches:{mapId:branchName}` for every selected map. Omitted branches default to
-  `work-<sessionUUID>` and preserve existing copies. A named branch must exist; selecting another branch requires a
-  new session UUID so a dirty copy is never overwritten or silently rebased.
-  Canonical UUID/map/branch selections are durably bound in HDD `sessions/<UUID>.json`. For an older retained copy,
-  send `session:resume,sessionId:<UUID>` without `maps` or `branches`; missing/corrupt copies are refused before
+  Canonical sessions track maps only: one head per map, no named branches.
+  A new session gets a fresh id and the chosen maps, resume keeps the previous
+  session's id and maps. Pre-linear `branches` selections are accepted for shape
+  and ignored; live pre-linear sessions keep working against their
+  session-UUID working copies.
+  Canonical UUID/map selections are durably bound in HDD `sessions/<UUID>.json`. For an older retained copy,
+  send `session:resume,sessionId:<UUID>` without `maps`; missing/corrupt copies are refused before
   switching. Session activation retains the site's moderator/admin policy. The host CLI also loads an archived
   selection when `request workshop --session <UUID>` names an existing session.
   Toward test: `candidateId`, optional `modeId`, only from phase `workshop` (see Playtest).
@@ -280,7 +282,7 @@ ref, immutable commit/review, comparison or merge preview. Non-map control envel
 ## Map candidates (candidates.py)
 
 Builders send a map for review from the tablet (site `POST /api/workshop/submit`), admins from the site; admins accept
-or reject on the site. Branch-aware Git reviews are described below; these branchless kinds preserve the legacy
+or reject on the site. Linear Git reviews are described below; these kinds preserve the legacy
 snapshot/release contract (same envelope and validation as above):
 
 - `candidate` `{mapId, workingCopyId?, note?}`: snapshot an isolated working copy or the legacy draft
@@ -307,15 +309,25 @@ forced?, versionDigest?, baseVersion?, workingCopyId?}], backups, overlays, maps
 The following head/CAS contract is implemented in this source tree but has not been installed or deployed.
 
 `BF_MAP_ARCHIVE_DIR` defaults to `/mnt/media-hdd/blockfield/maps` on the homeserver HDD. It holds immutable
-`blobs/<first-two-hex>/<sha256>`, `versions/<mapId>/<versionDigest>.json`, `branches/<mapId>/<name>.json`, candidate metadata and derived export cache.
+`blobs/<first-two-hex>/<sha256>`, `versions/<mapId>/<versionDigest>.json`, `snapshots/<mapId>/<name>.json`, candidate metadata and derived export cache.
 The host unit requires `/mnt/media-hdd` and asserts that it is a mount point; an unmounted directory cannot silently
 put archives on the root SSD. Configure the host mount before enabling the unit. If using another archive mount,
 change both unit paths together with `BF_MAP_ARCHIVE_DIR`, `BF_CANDIDATES_DIR` and `BF_MAP_PACKAGES_DIR`.
 Changed files add blobs; unchanged files reuse hashes. A small full manifest contains `schema:1`, `mapId`,
-`kind`, `parent`, author/time/source, `worldDigest`, `files: {path: sha256}`, `changed` and `deleted`. New commits may add
-`parents`: one previous commit for ordinary commits/restores, both target and source commits for a merge.
-`versionDigest` is the SHA256 of the exact manifest bytes. Parent refs belong to the same map. There is no
-automatic history/ZIP deletion or binary patch chain. Existing ZIPs/releases/schematics remain intact;
+`kind`, `parent`, author/time/source, `worldDigest`, `files: {path: sha256}`, `changed` and `deleted`.
+Map history is linear: every manifest has exactly one parent (restores parent the restored-onto head).
+At startup `migrate_branches_to_snapshots()` first preserves every stale edited draft on
+a map that had branch refs as a `migrated-draft-<hex>` snapshot (unedited drafts need none:
+their content is already immutable history), and only then converts every pre-linear named
+branch tip that differs from the map head into a named snapshot and removes the branch ref;
+tips already at the head need no snapshot. Pending pre-upgrade reviews are not carried
+into the linear model: every pending candidate without the linear creation record
+(`targetHead` + `workingCopyId`, or any pre-linear `sourceBranch` review) becomes
+`superseded` ("submit again after the upgrade") while its version and files stay in the
+archive. Each draft is read after saves are held; a draft
+that cannot be paused is logged and left for the explicit `snapshot-copy` path.
+The migration runs under the controller lock, so concurrent CLI invocations cannot race on the refs.
+There is no automatic history/ZIP deletion or binary patch chain. Existing ZIPs/releases/schematics remain intact;
 `BF_LEGACY_CANDIDATES_DIR` reads old candidates without moving them, and current metadata takes precedence.
 
 All map kinds use the same canonical layout: `map.json` and `world/{region,entities,poi}/r.X.Z.mca`, plus
@@ -352,9 +364,9 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   with a letter or digit; `hub`, `lobby` and `limbo` are reserved. Names are trimmed, 1–100 characters without Cc
   controls or `§`. Select a distinct nonempty subset of `campaign`, `room`, `tdm`, `snipers`, `awp`, `deathmatch`,
   `training`. The authenticated site generates a fresh canonical UUID. The controller saves/stops only Workshop,
-  creates a private root commit and `work-<UUID>` branch, binds an isolated session, then starts its editor.
+  creates a private root commit, binds an isolated session, then starts its editor.
   The 1.21.1 Anvil seed is a void chunk with a 16×16 stone platform at Y64 and deliberately incomplete mode markup.
-  No template, active head or published overlay is installed. Payload is `{mapId,versionDigest,branch,session}`.
+  No template, active head or published overlay is installed. Payload is `{mapId,versionDigest,session}`.
   Failed creation restarts the previous editor when stopping was proven safe; uncertain saves/stops stay closed.
   The old session and its dirty copies remain archived. A same-UUID retry preserves existing work; a different
   selection/name/mode request cannot reuse that UUID. Disk/copy failures cannot archive an incomplete session.
@@ -366,58 +378,65 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   selected mode against the game readers: both effective team spawns; capture points/zones for campaign/room;
   at least two unique in-bounds deathmatch spawns; and training spawn, 1–32 unique targets, valid armor/strafe,
   at most 64 forced chunks and optional in-bounds zones. Optional team lobbies use the game's shared fallback.
-  Private first review freezes `targetHead:null`; its merge preview compares the committed tree with an empty
-  tree (`baseVersion:null,targetVersion:null`). Initial publication requires explicit `expectedHead:null`, refuses
+  Private first review freezes `targetHead:null`; its compare against the empty tree uses
+  `baseVersion:null,targetVersion:null`. Initial publication requires explicit `expectedHead:null`, refuses
   force/conflict choices and fails if another head appeared. Activation failures can retry against that same absent head.
 - `sessions {offset, limit?}` reads archived session pages for an authenticated Workshop member. Default page size is
   100; `offset` is a nonnegative integer and `limit` is 1–100. Its payload is `{sessions,total,next}`. DTOs contain
-  `{schema:1,id,maps,branches,startedAt,startedBy,selectionDigest}`; the digest binds the immutable ID/maps/branches.
-  Reading/listing never deletes history or recreates a missing working copy.
-- `branch-create {mapId, branch, versionDigest}` creates a named work branch at that immutable commit. Names are
-  canonical bounded identifiers; `main` is protected and derives directly from the existing active head. Ref metadata
-  includes `name`, `versionDigest`, CAS `generation`, `workingCopyId`, `createdBy` and `createdAt`.
-- `commit {mapId, branch, workingCopyId, expectedBranchHead, note}` saves a sequential commit from the exact selected
-  ready editor session and its selected map branch. A nonempty 1–200-character message and explicit expected branch
-  head are required. The hot-copy guard flushes a running Workshop and holds autosave only while copying;
-  sleeping drafts are copied directly. The controller commits immutable files and advances the branch atomically
-  without closing entry or restarting. Repeated commits retain the copy's original provenance while appending
-  to its branch; another copy advancing that branch makes the old copy stale. An unchanged tree is refused with
-  `no changes since the last branch commit`; JSON formatting/key order alone is not a change.
+  `{schema:1,id,maps,startedAt,startedBy,selectionDigest}`; the digest binds the immutable ID and maps.
+  Pre-linear archives may also carry `branches`, which is validated for shape and ignored. Reading/listing never
+  deletes history or recreates a missing working copy.
+- `commit {mapId, workingCopyId, expectedHead, note}` saves a linear commit from the exact selected
+  ready editor session. The commit parents the exact current head (CAS): a nonempty 1–200-character message and
+  the explicit current head are required, and the working copy must be based on that head or the commit is
+  refused as stale (resume it first). The hot-copy guard flushes a running Workshop and holds autosave only
+  while copying; sleeping drafts are copied directly. The controller commits immutable files without closing
+  entry or restarting. An unchanged tree is refused; JSON formatting/key order alone is not a change.
 - `compare {mapId, before, after}` compares two immutable map digests and returns file additions/changes/deletions,
   Anvil region coordinate bounds and JSON field before/after values. It does not inspect mutable drafts.
-- `merge-preview {mapId, versionDigest, expectedHead, resolutions?}` compares a source commit to exact current main
-  through one verified common ancestor. Non-overlapping files and object fields combine; conflicting binary region
-  files and arrays require explicit choices. `resolutions` maps exact conflict paths to `ours` (target main) or
-  `theirs` (source review), e.g. `world/region/r.0.0.mca` or `map.json#/name` (JSON Pointer escaping `~0`/`~1`). Unknown
-  choices/paths are refused. The payload retains source/target/base digests and unresolved conflict paths.
-- `candidate {mapId, workingCopyId?, note?}` snapshots the legacy draft or the identified SSD working copy,
+- `snapshot-create {mapId, name, versionDigest}` / `snapshot-delete {mapId, name}` / `snapshots {mapId}`
+  manage named history pointers beside the head: each snapshot pins one immutable version (generation/author/time
+  preserved) and resolves through the same CAS blobs. Snapshots never move the head and are never merged.
+- `snapshot-copy {mapId, name, workingCopyId}` (admin) preserves a stale working-copy draft as a named
+  snapshot: the draft's world is recorded parented at the copy's base and pinned, the copy itself is untouched.
+  `checkout-fresh {mapId, workingCopyId}` materializes the current head into a new copy id (an existing id is
+  refused) and binds it to an archived session exactly like a session start, so the new copy is selectable
+  for editing through an archived resume. Both read the draft only after saves are held, like `candidate`.
+- `candidate {mapId, workingCopyId?, expectedHead?, note?}` snapshots the legacy draft or the identified SSD working copy,
   producing only CAS blobs, an immutable version manifest and metadata (`native:true`, `sha256:null`, `size:null`).
   `baseVersion` tracks the actual head/template or checkout's
   pinned origin; an accepted-but-inactive candidate never becomes another draft's base.
-  Adding `branch` and `expectedBranchHead` reviews the **existing committed** branch head: the branch must match
-  the selected ready session/copy, and the immutable candidate freezes `versionDigest`, `sourceBranch` and `targetHead`.
-  It never saves uncommitted edits, advances the branch or stops Workshop. Commit changes first; a branch equal to
-  main has nothing to review. Later branch commits do not change reviewed bytes or stop continued editing. An omitted
-  branch keeps the legacy snapshot contract.
-- `candidate {mapId, branch, workingCopyId, expectedBranchHead, commit:true, note}` is the tablet's one-press
-  commit-and-review: hot-snapshot the current draft (or read sleeping drafts), advance its branch, then freeze that
-  **new** digest and current main into a pending review under the same controller lock. A nonempty 1–200-character
-  note is required. `commit` must be a boolean. Unchanged drafts, stale heads, wrong session/copy/branch, denied ACL,
+  `expectedHead` pins the exact current head the commit parents; a moved head, or a
+  working copy whose base is not the current head, refuses the snapshot as stale instead
+  of rebasing it ("the map has a newer version; save your draft as a snapshot and start
+  from the current version"). The way out is `snapshot-copy` plus `checkout-fresh` below.
+  The immutable candidate freezes `versionDigest` and `targetHead`.
+- `candidate {mapId, workingCopyId, expectedHead, commit:true, note}` is the tablet's one-press
+  commit-and-review: hot-snapshot the current draft (or read sleeping drafts) onto the current head, then freeze that
+  **new** digest and current head into a pending review under the same controller lock. A nonempty 1–200-character
+  note is required. `commit` must be a boolean. Unchanged drafts, stale heads, wrong session/copy, denied ACL,
   invalid note and failed saves/copies produce `ok:false,error:<precise reason>` in `admin/results/<request UUID>.json`.
   Neither command changes phase/gate or stops/starts Workshop. Concurrent requests cannot overlap save guards:
   a busy controller lock leaves the inbox request queued for the next pass, which rechecks its expected head.
-  Commit manifests retain actor/note/source/parents; review metadata pins author, source branch and target head;
+  Commit manifests retain actor/note/source/parent; review metadata pins author and target head;
   inbox completion logs record request/kind/actor/outcome. The process journal has no snapshot lifecycle events.
   If review validation or metadata export fails after a successful commit, that commit remains retained; the result
-  reports failure. Submit a branch-aware `candidate` without `commit:true` to review the retained commit again.
-- `publish {candidateId, expectedHead, resolutions?, force?}` accepts and activates. `expectedHead` is the current version digest,
-  or explicit `null` if no head exists. Missing `expectedHead` preserves branchless legacy acceptance-only behaviour;
-  branch-aware reviews require the explicit field.
+  reports failure. Submit a `candidate` without `commit:true` to snapshot again and review the retained commit.
+- `publish {candidateId, expectedHead, force?}` accepts and activates fast-forward only: the frozen review must
+  parent the explicit `expectedHead`, which must still be the current head — a stale head is an error, never a
+  merge. `resolutions` and `force` are refused for native reviews (force stays for legacy template-base
+  overwrites only). Missing `expectedHead` is refused; explicit `null` publishes the initial head.
   Stale heads, stale bases, corrupt blobs and insufficient staging space fail before head mutation.
   Acceptance and activation are distinct: if the final head write fails after acceptance, the accepted candidate
-  can be retried with the same explicit expectedHead.
-  Git reviews use a safe three-way merge and require the frozen `targetHead`; a changed target needs a fresh review.
-  They reject `force`, including acceptance-only requests. Only an admin can publish or restore main.
+  can be retried with the same explicit expectedHead. The working-copy advance after activation is best
+  effort: a failing advance is logged and leaves the copy stale, and the result reports the publish plus
+  `copyAdvanced:false`. The final metadata rewrite after activation is best effort too: if it fails, the
+  result still reports the publish plus `metaSynced:false`. The committed state always derives from the
+  head itself, so retrying an already committed publication with the same explicit expectedHead reports
+  the committed publish instead of a stale head (a forced retry still refuses a stale head, since
+  force waives only the template-base guard).
+  Reviews require the frozen `targetHead`; a changed target needs a fresh review.
+  They reject `force`. Only an admin can publish or restore main.
 - `rollback {mapId, versionDigest, expectedHead}` restores that archived tree through a **new** commit parented to
   current main. It preserves all later history and never rewinds the ref to the old digest. Missing target/expectedHead,
   a version from another map or a stale head is refused.
@@ -434,10 +453,9 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   request. For the legacy release script, pass the generated `exports/<id>.zip` explicitly rather than assume a
   native candidate has a permanent ZIP beside its metadata.
 
-`admin/maps.json` is `{schema:1, maps:[{mapId,kind,mapJson,head,versions,branches}],sessions,sessionsTotal,sessionsNext}`;
+`admin/maps.json` is `{schema:1, maps:[{mapId,kind,mapJson,head,versions,snapshots}],sessions,sessionsTotal,sessionsNext}`;
 the catalog includes the latest 100 sessions and the paginated inbox exposes all older copies. History entries omit the full file
-table but retain version/parent/parents/author/time/changed/deleted and fileCount. Old manifests keep their original
-single-parent bytes. The catalog derives IDs from available
+table but retain version/parent/author/time/changed/deleted and fileCount. The catalog derives IDs from available
 templates and stored version manifests, including lobby/limbo; the controller validates session/map ACL scopes
 against that catalog. With no map store (standalone controller tests), map_ids.json remains the legacy fallback.
 Runtime adapters read SSD head/bundle manifests; only host history operations read HDD blobs. The site should
@@ -460,10 +478,10 @@ draft storage; immutable history, active bundles and controller metadata retain 
 The existing site mode API remains `mode {profile:"workshop",expectedRevision,session:"new"|"resume",maps?:[id...]}`.
 The controller exports `admin/session.json {schema:1,id,maps,...}`. For native submit/create requests the site must
 take `workingCopyId` from this export, match `status.json.desired.session` in phase `workshop` or the confirmed
-`sleeping` session, check map membership and actor ACL, and forward the selected `branch`, `expectedBranchHead`,
+`sleeping` session, check map membership and actor ACL, and forward `expectedHead`,
 `commit:true` and a nonempty `note` with `candidate {mapId,workingCopyId,...}`. The controller repeats these checks
 before any save commands. A Java tablet submit already carries this exact ID; never replace it with a fresh or
-client-selected UUID. Ordinary branch review without `commit:true` still reviews only the existing commit.
+client-selected UUID. Ordinary review without `commit:true` snapshots the draft and reviews the new commit.
 `admin/maps.json` is the catalog/history API described above; it includes `arena`, `lobby` and `limbo` through one schema.
 
 Workshop container configuration required before enabling canonical sessions:

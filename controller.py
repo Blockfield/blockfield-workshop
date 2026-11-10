@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace, asdict, dataclass
+import errno
 import fcntl
 import json
 import hashlib
@@ -24,6 +25,7 @@ from typing import Callable, Protocol
 import unicodedata
 from uuid import UUID, uuid4
 
+import candidates
 import desired as desired_state
 import map_package
 import releases as release_catalog
@@ -149,6 +151,389 @@ LIVE_ONLY_KINDS = {
 AI_KEY_PATTERN = re.compile(r"[\x21-\x7e]{20,2048}")
 AI_KEY_UID = 1000
 AI_KEY_GID = 1000
+# Workshop AI sidecar key (server#321): <workshop data>/blockfield-workshop/ai-sidecar.key,
+# 0600 1000:1000. The controller writes it once; the sidecar reads it as its Bearer secret
+# and the game container mounts a read-only copy. Base64url keeps it a valid single-token
+# Bearer value; it never appears in logs, results or exports.
+AI_SIDECAR_KEY_NAME = "ai-sidecar.key"
+AI_SIDECAR_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,2048}")
+
+
+def _require_owned_ai_key_dir(dir_fd: int, *, kind: str, display: str) -> None:
+    """Fail closed unless this process and the pinned key dir are the key owner's.
+
+    AI keys are 0600 and read by the sidecar and the game, which run as
+    AI_KEY_UID. So only that user may create or change them, in a directory
+    it owns that nobody else can write. The controller never repairs
+    ownership or mode: anything else is refused with what was found.
+    """
+    info = os.fstat(dir_fd)
+    euid = os.geteuid()
+    mode = stat.S_IMODE(info.st_mode)
+    if euid == AI_KEY_UID and info.st_uid == AI_KEY_UID and not mode & 0o022:
+        return
+    raise ValueError(
+        f"unsafe {kind} directory: {display} is owned by "
+        f"uid={info.st_uid} gid={info.st_gid} mode={mode:04o} and the controller "
+        f"runs as uid={euid}; expected owner uid={AI_KEY_UID}, no group/other "
+        f"write, and the controller running as the workshop user (uid {AI_KEY_UID})"
+    )
+
+
+def _open_pinned_ai_key_dir(base: Path, *, kind: str) -> tuple[int, int]:
+    """Open <base>/blockfield-workshop once and pin it: (base_fd, dir_fd).
+
+    The directory's mode is never changed afterwards: mkdir's 0755 can only
+    be narrowed by the umask, and a directory someone else created first is
+    judged by _require_owned_ai_key_dir, not repaired.
+
+    Both opens use O_DIRECTORY|O_NOFOLLOW, so a symlink planted in the
+    attacker-writable data dir fails closed (ELOOP/ENOTDIR -> ValueError)
+    instead of redirecting later operations into another directory.
+    Everything after must use dir_fd (dir_fd=), never a path. The caller
+    closes both fds. Only failures to translate are ELOOP/ENOTDIR; anything
+    else (EACCES, ENOSPC, ...) propagates exactly as a path open would.
+    """
+    try:
+        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        # Nothing privileged follows on base itself, so creating it by path
+        # before any fd exists is safe; the opens below still pin everything.
+        Path(base).mkdir(parents=True, exist_ok=True)
+        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError(f"unsafe {kind} directory") from error
+        raise
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        try:
+            dir_fd = os.open("blockfield-workshop", flags, dir_fd=base_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir("blockfield-workshop", 0o755, dir_fd=base_fd)
+            except FileExistsError:
+                pass  # a concurrent creator won the race; open the winner
+            dir_fd = os.open("blockfield-workshop", flags, dir_fd=base_fd)
+    except OSError as error:
+        os.close(base_fd)
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError(f"unsafe {kind} directory") from error
+        raise
+    return base_fd, dir_fd
+
+
+# The validated key is at most 2048 chars; anything larger is invalid. The cap
+# also bounds the read: a sparse/huge regular file cannot stall startup.
+_SIDECAR_KEY_MAX_BYTES = 65536
+
+
+def _read_ai_sidecar_key_fd(fd: int, *, display: str) -> str:
+    """Adopt and read an open sidecar key through its descriptor, never its path.
+
+    The caller opens with O_NOFOLLOW, so a symlink swapped in mid-harden can
+    never redirect the fchmod/read onto another file. The key must already be
+    owned by this user (the controller never re-owns it); a mode wider than
+    0600 is narrowed on the descriptor, which is not privileged.
+    """
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("invalid ai-sidecar key file")
+    if info.st_uid != AI_KEY_UID:
+        raise ValueError(
+            f"unsafe ai-sidecar key file: {display} is owned by "
+            f"uid={info.st_uid}; expected owner uid={AI_KEY_UID}"
+        )
+    os.fchmod(fd, 0o600)
+    chunks = []
+    total = 0
+    while True:
+        block = os.read(fd, 65536)
+        if not block:
+            break
+        chunks.append(block)
+        total += len(block)
+        if total > _SIDECAR_KEY_MAX_BYTES:
+            raise ValueError("invalid ai-sidecar key file")
+    try:
+        text = b"".join(chunks).decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise ValueError("invalid ai-sidecar key file") from None
+    if AI_SIDECAR_KEY_PATTERN.fullmatch(text) is None:
+        raise ValueError("invalid ai-sidecar key file")
+    return text
+
+
+def _stage_ai_key_tmpfile(dir_fd: int, data: bytes, *, kind: str) -> int:
+    """Write data to an unnamed 0600 file in the pinned key dir; return its fd.
+
+    O_TMPFILE means the secret never has a directory name while staged: no
+    path in the attacker-writable directory can be pre-planted or swapped
+    under it. The caller publishes it with os.link(/proc/self/fd/N, ...)
+    and closes the fd; an unpublished tmp vanishes on close, so a failed
+    write leaves nothing behind. Filesystems without O_TMPFILE fail closed:
+    there is no named-tmp fallback.
+    """
+    try:
+        # The name is resolved against dir_fd and must name the directory
+        # itself; '.' cannot be a planted symlink.
+        fd = os.open(".", os.O_TMPFILE | os.O_WRONLY, 0o600, dir_fd=dir_fd)
+    except OSError as error:
+        if error.errno in (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL):
+            raise ValueError(
+                f"cannot stage {kind} key: filesystem lacks O_TMPFILE support"
+            ) from error
+        raise
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _commit_ai_sidecar_key(dir_fd: int, data: bytes) -> bool:
+    """Link a fresh secret onto the key name without ever replacing it.
+
+    The staged inode is linked by descriptor (linkat AT_SYMLINK_FOLLOW,
+    no-replace), so no name window exists between staging and publication.
+    Returns True when this call won the creation race; False when another
+    process linked its key first (read the winner instead of rotating it).
+    """
+    fd = _stage_ai_key_tmpfile(dir_fd, data, kind="ai-sidecar-key")
+    try:
+        try:
+            os.link(
+                f"/proc/self/fd/{fd}",
+                AI_SIDECAR_KEY_NAME,
+                dst_dir_fd=dir_fd,
+                follow_symlinks=True,
+            )
+        except FileExistsError:
+            return False
+        os.fsync(dir_fd)
+        return True
+    finally:
+        os.close(fd)
+
+
+def _replace_ai_key(dir_fd: int, filename: str, data: bytes, *, kind: str) -> None:
+    """Write data onto filename inside the pinned key dir, replacing any prior file.
+
+    The secret is staged unnamed (O_TMPFILE), then linked to a random
+    unguessable name and renamed over the destination: rename replaces a
+    planted symlink at the destination instead of following it, and the
+    random name cannot be pre-planted. The remaining window (an attacker
+    listing the random name and swapping it in the microseconds between
+    link and rename) has no privileged consequence — nothing after this
+    point touches the destination by path with ownership or mode changes —
+    and at worst leaves a symlink the next operation's ELOOP probe refuses.
+    A symlink already at the destination is refused outright (fail closed).
+    """
+    try:
+        probe = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=dir_fd,
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        if error.errno != errno.ELOOP:
+            raise
+        raise ValueError(f"unsafe {kind} path") from None
+    else:
+        os.close(probe)
+    fd = _stage_ai_key_tmpfile(dir_fd, data, kind=kind)
+    tmp = f".{filename}-{secrets.token_hex(8)}"
+    try:
+        os.link(f"/proc/self/fd/{fd}", tmp, dst_dir_fd=dir_fd, follow_symlinks=True)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(tmp, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    finally:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _write_ai_key(base, filename: str, kind: str, key: str | None) -> dict:
+    """Set (or with None remove) one provider key; runs as the key owner.
+
+    Returns the public summary only; the key never reaches the result,
+    logs or exceptions.
+    """
+    base_fd, dir_fd = _open_pinned_ai_key_dir(Path(base), kind=kind)
+    try:
+        _require_owned_ai_key_dir(
+            dir_fd, kind=kind, display=f"{base}/blockfield-workshop"
+        )
+        if key is None:
+            try:
+                os.unlink(filename, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+            return {"set": False, "last4": "", "sha256Prefix": ""}
+        data = key.encode()
+        _replace_ai_key(dir_fd, filename, data, kind=kind)
+        return {
+            "set": True,
+            "last4": key[-4:],
+            "sha256Prefix": hashlib.sha256(data).hexdigest()[:8],
+        }
+    finally:
+        os.close(dir_fd)
+        os.close(base_fd)
+
+
+# Child for a root controller: the key work runs as the key owner, so root
+# never touches the directory the workshop user can write. The key arrives on
+# stdin, never in argv; only the summary or a ValueError message comes back.
+_AI_KEY_CHILD = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import controller
+request = json.load(sys.stdin)
+try:
+    stored = controller._write_ai_key(
+        request["base"], request["filename"], request["kind"], request["key"]
+    )
+except ValueError as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(2)
+print(json.dumps(stored))
+"""
+
+
+def _provision_ai_key_dir_as_root(base) -> None:
+    """Fresh install under a root controller: create the key dir for its owner.
+
+    Only when `base` is root-owned and nobody else can write it: then no
+    other user can have planted or can swap the entry, so root's mkdir and
+    the fchown of that very directory (by descriptor) are not a confused
+    deputy. Anything else is left for the owner-side checks to judge.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        base_fd = os.open(base, flags)
+    except OSError:
+        return
+    try:
+        info = os.fstat(base_fd)
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            return
+        try:
+            os.mkdir("blockfield-workshop", 0o755, dir_fd=base_fd)
+        except FileExistsError:
+            return
+        dir_fd = os.open("blockfield-workshop", flags, dir_fd=base_fd)
+        try:
+            os.fchown(dir_fd, AI_KEY_UID, AI_KEY_GID)
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(base_fd)
+
+
+def _write_ai_key_as_owner(base, filename: str, kind: str, key: str | None) -> dict:
+    """Run _write_ai_key as AI_KEY_UID: in-process when we are that user,
+    in a child that drops to it when we are root, refused otherwise."""
+    if os.geteuid() != 0:
+        return _write_ai_key(base, filename, kind, key)
+    _provision_ai_key_dir_as_root(base)
+    import subprocess
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _AI_KEY_CHILD,
+            str(Path(__file__).resolve().parent),
+        ],
+        input=json.dumps(
+            {"base": str(base), "filename": filename, "kind": kind, "key": key}
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        user=AI_KEY_UID,
+        group=AI_KEY_GID,
+        extra_groups=[],
+    )
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        reason = lines[-1][:300] if lines else f"exit {result.returncode}"
+        raise ValueError(f"{kind} as uid {AI_KEY_UID} failed: {reason}")
+    return json.loads(result.stdout)
+
+
+def ensure_ai_sidecar_key(base: Path) -> Path:
+    """Create the AI sidecar Bearer secret once; never rotate or overwrite here.
+
+    Returns the key path. An existing regular file is hardened in place
+    (0600, validated) and never rotated: rotation is an explicit operator
+    action, not a controller step. Creation is exclusive with no replace, so
+    concurrent starters converge on the winner's key. Anything else fails closed.
+    """
+    path = Path(base) / f"blockfield-workshop/{AI_SIDECAR_KEY_NAME}"
+    if os.geteuid() != AI_KEY_UID:
+        # Only the key's owner establishes it. Any other user constructing a
+        # controller (a root operator running one command) performs no file
+        # operation in that directory at all: nothing to exploit, and the
+        # command is not blocked by a key it does not use.
+        print(
+            f"controller: ai-sidecar key left untouched (uid {os.geteuid()} "
+            f"is not the key owner uid {AI_KEY_UID})",
+            file=sys.stderr,
+        )
+        return path
+    base_fd, dir_fd = _open_pinned_ai_key_dir(base, kind="ai-sidecar-key")
+    try:
+        _require_owned_ai_key_dir(dir_fd, kind="ai-sidecar-key", display=str(path))
+        # Pinned from here: the key file is only ever touched through dir_fd,
+        # opened with O_NOFOLLOW|O_NONBLOCK (ELOOP fails closed, a FIFO can
+        # never block startup: fstat must show a regular file before any
+        # read), and creation commits with os.link, which never replaces —
+        # the loser of a startup race reads the winner's key instead of
+        # rotating it.
+        for _ in range(3):
+            try:
+                fd = os.open(
+                    AI_SIDECAR_KEY_NAME,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=dir_fd,
+                )
+            except FileNotFoundError:
+                pass  # absent: create below, then converge on the winner
+            except OSError as error:
+                if error.errno != errno.ELOOP:
+                    raise
+                raise ValueError("unsafe ai-sidecar-key path") from None
+            else:
+                try:
+                    _read_ai_sidecar_key_fd(fd, display=str(path))
+                finally:
+                    os.close(fd)
+                return path
+            data = secrets.token_urlsafe(32).encode()
+            assert AI_SIDECAR_KEY_PATTERN.fullmatch(data.decode())
+            if _commit_ai_sidecar_key(dir_fd, data):
+                return path
+        raise ValueError("cannot establish ai-sidecar key file")
+    finally:
+        os.close(dir_fd)
+        os.close(base_fd)
+
+
 # Provider registry ids (contract with the site): presets keep their historic key
 # file and status names; a custom id uses <id>.key and <id>-key.json. The shape
 # excludes dots and slashes, so a custom file name can never escape its directory.
@@ -159,6 +544,8 @@ AI_PROVIDER_KEY_PRESETS = {
 }
 # Custom ids that would reuse a preset key file or status name stay reserved,
 # so a custom key can never overwrite (or satisfy) another provider's key.
+# The sidecar Bearer secret lives in the same directory under its own name,
+# so its id stays reserved too: no provider key may address that file.
 AI_PROVIDER_RESERVED_IDS = frozenset(
     {
         *AI_PROVIDER_KEY_PRESETS,
@@ -171,6 +558,7 @@ AI_PROVIDER_RESERVED_IDS = frozenset(
             for _, status, _ in AI_PROVIDER_KEY_PRESETS.values()
             if status.endswith("-key.json")
         ),
+        AI_SIDECAR_KEY_NAME.removesuffix(".key"),
     }
 )
 
@@ -274,6 +662,22 @@ def atomic_write(
         Path(temporary).unlink(missing_ok=True)
 
 
+#: Marker for a gate record file that exists but cannot be read or validated.
+#: Pending reads return it (fail closed: hold ACKs, let the next stage heal);
+#: only a missing file reads as absent.
+_UNREADABLE_GATE_RECORD = object()
+
+
+class CommitIncompleteError(OSError):
+    """A durable commit (state.json, members.json, message.json) is live but
+    a later derived write failed. An OSError subclass: callers that do not
+    know this class treat it as the local I/O failure it is. Callers that do
+    (sync, commit sites) must not report the op rejected — the commit stands
+    and the retry must be safe: commit sites ERROR-drive or are naturally
+    idempotent, so a retry lands on a vacuous path instead of re-applying a
+    non-idempotent op."""
+
+
 class Controller:
     def __init__(
         self,
@@ -346,6 +750,19 @@ class Controller:
                 os.chmod(path, 0o755)
             ensure_workshop_key(self.admin_dir / "workshop.key")
         self.backend = backend
+        base = self._workshop_data_base()
+        if base is not None:
+            ensure_ai_sidecar_key(base)
+        # Gate-report delivery state (unit CPP3-R4): files are the only
+        # truth. gate_pending.json = {seq, leg} desired-but-undelivered;
+        # gate_delivered.json = {seq, leg} last confirmed on CP. No
+        # process-local caches: every read-modify-write of both files runs
+        # under gate_state.lock (local file ops only, never HTTPS).
+        # gate_report.lock serializes delivery across processes.
+        self._gate_pending_file = self.directory / "gate_pending.json"
+        self._gate_delivered_file = self.directory / "gate_delivered.json"
+        self._gate_state_lock_file = self.directory / "gate_state.lock"
+        self._gate_report_lock_file = self.directory / "gate_report.lock"
 
     def _now_ms(self) -> int:
         return int(self._now() * 1000)
@@ -404,6 +821,13 @@ class Controller:
             yield
         finally:
             os.close(fd)
+        # After the file lock is released: deliver any staged gate leg. The
+        # report is blocking HTTPS and must never run under the lock, or a
+        # stalled CP stalls request/cancel/step with BUSY.
+        try:
+            self._flush_gate_report()
+        except Exception as error:
+            print(f"controller: gate flush failed: {error!r}", file=sys.stderr)
 
     def _read(self) -> dict:
         # Every state observation sees catalog updates: the long-running loop
@@ -422,6 +846,7 @@ class Controller:
                 "operation": None,
                 "desired": None,
                 "revision": 0,
+                "cancelOperation": None,
             }
         with os.fdopen(fd, "rb") as handle:
             info = os.fstat(handle.fileno())
@@ -500,6 +925,10 @@ class Controller:
         state.setdefault("since", 0)
         state.setdefault("errorMessage", None)
         state.setdefault("rollback", None)
+        # Op id of the cancel that journaled this state (None when the journal
+        # is not cancel-owned): a same-op retry is a no-op, never a re-apply.
+        # A new switch (_request_locked) builds a fresh dict without this key.
+        state.setdefault("cancelOperation", None)
         # Cold Workshop idle timer: epoch ms of continuous idleness, None while active.
         state.setdefault("idleSince", None)
         if type(state["since"]) is not int or not (
@@ -636,13 +1065,26 @@ class Controller:
         if len(data) > STATE_MAX_BYTES:
             raise ValueError("controller state exceeds its bounded reader")
         atomic_write(self.file, data)
-        self._project_target(state)
-        self._project_desired(state)
-        # processes reuses the step's observation: every export of a step shares
-        # one observation, so a nested export can never be newer than the step's
-        # trailing export (stale data must not overwrite fresh gate decisions).
-        # Omit it whenever the backend may have changed since the observation.
-        self._export(state, processes=processes)
+        # Commit point: state.json above is durable. Every failure below is
+        # commit-then-fail: never a rejection (the commit stands), never a
+        # silent ghost. Local-write failures already forced the local gate
+        # closed best effort inside _export; ERROR-driving is the op sites'
+        # job (_rollback, set_members, set_message), which own their state.
+        try:
+            self._project_target(state)
+            self._project_desired(state)
+            # processes reuses the step's observation: every export of a step shares
+            # one observation, so a nested export can never be newer than the step's
+            # trailing export (stale data must not overwrite fresh gate decisions).
+            # Omit it whenever the backend may have changed since the observation.
+            self._export(state, processes=processes)
+        except CommitIncompleteError:
+            raise
+        except OSError as error:
+            raise CommitIncompleteError(
+                f"committed state r{state.get('revision')} but a derived write"
+                f" failed: {error}"
+            ) from error
 
     def members(self) -> list[dict]:
         """Missing or invalid ACL admits nobody."""
@@ -663,17 +1105,56 @@ class Controller:
                 self.members_file, json.dumps(members, sort_keys=True).encode()
             )
             try:
-                self._export(self._read())
-            except Exception as error:
-                # The write above is the commit point: the new ACL is live
-                # even if the derived export fails. Report applied (the next
-                # state change re-exports and heals this) instead of escaping,
-                # which would tell CP the change failed while it is live.
+                state = self._read()
+            except Exception as read_error:
+                # state.json unreadable or invalid: the members commit above
+                # is live but the desired leg is unknown. Fail closed: narrow
+                # the local gate first (a removed member must stop being
+                # admitted even before the closed leg is delivered), then
+                # stage a closed leg so the pending marker holds any
+                # effective ACK until it is delivered. A staging failure is
+                # commit-then-fail (hold and converge on retry, never
+                # rejected or effective).
+                self._narrow_unreadable_gate_best_effort()
+                try:
+                    self._stage_closed_gate_report()
+                except OSError as stage_error:
+                    raise CommitIncompleteError(
+                        "members commit is live but no leg could be staged: "
+                        f"{stage_error}"
+                    ) from stage_error
+                print(
+                    f"controller: members export failed after commit ({read_error!r});"
+                    " staged closed gate leg",
+                    file=sys.stderr,
+                )
+                return members
+            try:
+                self._export(state)
+            except CommitIncompleteError:
+                raise
+            except OSError as error:
+                # The members commit above is live even if a derived export
+                # fails. A staging failure leaves this op unstaged (tracked
+                # per op, not inferred from any older pending record): hold,
+                # never effective, and converge on retry (members re-apply is
+                # idempotent). A local-write failure never narrowed the gate:
+                # the closed best effort already ran, so park ERROR visibly.
+                if (
+                    getattr(self, "gate_reporter", None) is not None
+                    and getattr(self, "_export_staged_gate_seq", None) is None
+                ):
+                    if getattr(self, "_export_local_failed", False):
+                        self._drive_error_after_commit(state, error)
+                    raise CommitIncompleteError(
+                        f"members commit is live but its gate leg was not"
+                        f" staged: {error}"
+                    ) from error
                 print(
                     f"controller: members export failed after commit: {error!r}",
                     file=sys.stderr,
                 )
-        return members
+            return members
 
     @property
     def message(self) -> str:
@@ -695,7 +1176,41 @@ class Controller:
                 )
             else:
                 self.message_file.unlink(missing_ok=True)
-            self._export(self._read())
+            # Commit point: the message file above is live. An export failure
+            # is commit-then-fail (message re-apply is idempotent, so the op
+            # holds and converges on retry, never rejected or effective); a
+            # local-write failure parks ERROR visibly.
+            try:
+                state = self._read()
+            except Exception as read_error:
+                # The message commit above is live but the desired leg is
+                # unknown. A message carries no admission, so there is
+                # nothing to narrow and no leg to deliver (I6): warn and
+                # return normally so the queue — including a members
+                # removal queued behind this op — proceeds. The next op
+                # re-reads; unreadable state still fails closed there.
+                print(
+                    "controller: message commit is live but state could not"
+                    f" be read ({read_error!r}); continuing without a gate leg",
+                    file=sys.stderr,
+                )
+                return self.message
+            try:
+                self._export(state)
+            except CommitIncompleteError:
+                raise
+            except OSError as error:
+                if (
+                    getattr(self, "gate_reporter", None) is not None
+                    and getattr(self, "_export_staged_gate_seq", None) is None
+                ):
+                    if getattr(self, "_export_local_failed", False):
+                        self._drive_error_after_commit(state, error)
+                    raise CommitIncompleteError(
+                        "message commit is live but its gate leg was not"
+                        f" staged: {error}"
+                    ) from error
+                raise
         return self.message
 
     def status(self) -> dict:
@@ -751,12 +1266,13 @@ class Controller:
             if (
                 choice != "resume"
                 or "maps" in document
-                or "branches" in document
                 or getattr(self.maps, "canonical_sessions", False) is not True
             ):
                 raise ValueError(
-                    "archived resume requires sessionId without map/branch overrides"
+                    "archived resume requires sessionId without map overrides"
                 )
+            # Pre-linear compat: a stale client may still send branches; the
+            # linear store tracks maps only, so the selection is ignored.
             archived = self.maps.session(document["sessionId"])
             if archived is None:
                 raise ValueError("archived session not found")
@@ -793,15 +1309,16 @@ class Controller:
                 "startedBy": actor,
             }
         )
-        if "branches" in document:
-            if getattr(self.maps, "canonical_sessions", False) is not True:
-                raise ValueError("named branches require canonical sessions")
-            result["branches"] = document["branches"]
-        elif isinstance(maps, list) and "branches" in result:
-            result["branches"] = {
-                map_id: result["branches"].get(map_id, "work-" + result["id"])
-                for map_id in maps
-            }
+        # Pre-linear compat: named branch selections are accepted for shape
+        # and then ignored — one head per map. Live sessions keep working
+        # against their session-UUID working copies.
+        if "branches" in document and document["branches"] is not None:
+            branches = document["branches"]
+            if not isinstance(branches, dict) or any(
+                not isinstance(name, str) for name in branches.values()
+            ):
+                raise ValueError("invalid session branches")
+        result.pop("branches", None)
         return result
 
     def _save_session(self, session: dict) -> None:
@@ -836,33 +1353,15 @@ class Controller:
             or set(maps) - self._map_ids()
         ):
             raise ValueError("invalid selected session maps")
-        from candidates import MapVersions
-
-        branches = session.get(
-            "branches",
-            previous.get("branches")
-            if resuming and "branches" in previous
-            else {map_id: "work-" + goal.session for map_id in maps},
-        )
-        if not isinstance(branches, dict) or set(branches) != set(maps):
-            raise ValueError("session branches must match selected maps")
-        for name in branches.values():
-            if MapVersions._branch_name(name) == "main":
-                raise ValueError("main is protected; select a work branch")
-        if resuming:
-            prior = previous.get(
-                "branches",
-                {
-                    map_id: "work-" + goal.session
-                    for map_id in previous.get("maps") or maps
-                },
-            )
-            if not isinstance(prior, dict) or any(
-                map_id in prior and prior[map_id] != name
-                for map_id, name in branches.items()
-            ):
-                raise ValueError("switching branches requires a new isolated session")
-        return {**session, "maps": maps, "branches": branches}
+        # Linear sessions track maps only. A pre-linear session (or document)
+        # may still carry branches; they are validated for shape and ignored.
+        branches = session.get("branches")
+        if branches is not None:
+            if not isinstance(branches, dict):
+                raise ValueError("invalid session branches")
+        result = {**session, "maps": maps}
+        result.pop("branches", None)
+        return result
 
     def _selected_session(
         self, goal: Goal, session: dict | None = None, *, resume_only=False
@@ -872,7 +1371,6 @@ class Controller:
             goal.session,
             selected["maps"],
             resume_only=resume_only,
-            branches=selected["branches"],
             actor=selected.get("startedBy") or {"draslId": "host", "name": "host"},
         )
         return selected
@@ -1045,6 +1543,13 @@ class Controller:
         processes reuses one step's observation so a step probes the backend only once;
         omit it whenever the backend may have changed since the observation.
         """
+        # This export's staging outcome for set_members (None = not staged):
+        # reset here so a stale seq can never mask a failed write. The
+        # local-failure flag tells post-commit handlers whether the local
+        # gate narrowed (staging-only failure: hold and converge) or not
+        # (local write failure: ERROR-drive, never silently effective).
+        self._export_staged_gate_seq = None
+        self._export_local_failed = False
         gate = (
             state["gate"]
             if state["gate"] in {"public", "draining", "builders", "testers"}
@@ -1093,6 +1598,9 @@ class Controller:
                 "message": self.message,
                 "allowed": self.members() if members_gate else [],
             }
+        # Local gate first: gate.json/public.json narrow (or close) before any
+        # pending staging or CP report. A staging failure below must never
+        # leave the wider local gate behind it.
         game_gate = {
             "gate": game_status["gate"],
             "message": "" if game_status["gate"] == "public" else self.default_message,
@@ -1125,7 +1633,6 @@ class Controller:
             "backend": "game",
             "backends": {"game": game_gate, "workshop": workshop_gate},
         }
-        self._replace_if_changed(self.gate_file, gate_doc, keep=())
         public = {
             "mode": mode,
             "message": "" if mode == "game" else self.default_message,
@@ -1139,40 +1646,416 @@ class Controller:
                 "message": self.message,
             },
         }
-        self._replace_if_changed(self.public_file, public, keep=("since",))
-        if self.admin_dir:
-            self._replace_if_changed(
-                self.admin_dir / "members.json", self.members(), keep=()
-            )
-            session = self.session()
-            if session is not None:
+        try:
+            self._replace_if_changed(self.gate_file, gate_doc, keep=())
+            self._replace_if_changed(self.public_file, public, keep=("since",))
+            if self.admin_dir:
                 self._replace_if_changed(
-                    self.admin_dir / "session.json", session, keep=()
+                    self.admin_dir / "members.json", self.members(), keep=()
                 )
-            status = {
-                "schema": 1,
-                "revision": state["revision"],
-                "operation": state.get("operation"),
-                "phase": state["phase"],
-                "gate": workshop_gate["gate"],
-                "error": state.get("error"),
-                "errorMessage": state.get("errorMessage"),
-                "since": state.get("since"),
-                "deadline": deadline,
-                "desired": state.get("desired"),
-                "selection": {
-                    key: state["selection"][key]
-                    for key in ("operation", "revision", "deferred")
+                session = self.session()
+                if session is not None:
+                    self._replace_if_changed(
+                        self.admin_dir / "session.json", session, keep=()
+                    )
+                status = {
+                    "schema": 1,
+                    "revision": state["revision"],
+                    "operation": state.get("operation"),
+                    "phase": state["phase"],
+                    "gate": workshop_gate["gate"],
+                    "error": state.get("error"),
+                    "errorMessage": state.get("errorMessage"),
+                    "since": state.get("since"),
+                    "deadline": deadline,
+                    "desired": state.get("desired"),
+                    "selection": {
+                        key: state["selection"][key]
+                        for key in ("operation", "revision", "deferred")
+                    }
+                    if state.get("selection")
+                    else None,
+                    "game": game_status,
+                    "message": self.message,
+                    "updatedAt": int(time.time() * 1000),
                 }
-                if state.get("selection")
-                else None,
-                "game": game_status,
-                "message": self.message,
-                "updatedAt": int(time.time() * 1000),
+                self._replace_if_changed(
+                    self.admin_dir / "status.json", status, keep=("updatedAt",)
+                )
+        except OSError:
+            # The local gate never narrows: force it closed best effort (the
+            # Game entry is preserved) so a narrowing change never waits on
+            # a dead disk, then let post-commit handlers ERROR-drive + raise.
+            self._export_local_failed = True
+            self._write_closed_gate_best_effort(gate_doc, public)
+            raise
+        # Stage last, after every local derivative narrowed: a staging
+        # failure raises with the local gate already narrowed, so the op is
+        # held (never effective) but never leaves the wider gate behind.
+        # Delivery itself happens only via the flush, after the lock.
+        self._stage_gate_report(workshop_gate)
+
+    def _write_closed_gate_best_effort(self, gate_doc: dict, public: dict) -> None:
+        """Narrow the local gate after a failed export write. Best effort:
+        never raises. Preserves the Game entry (only the workshop backend is
+        forced closed) so a transient export failure cannot close the Game
+        site; the proxy denies until the next export heals."""
+        try:
+            backends = gate_doc.get("backends", {})
+            closed_gate_doc = {
+                **gate_doc,
+                "backends": {
+                    **backends,
+                    "workshop": {
+                        **backends.get("workshop", {}),
+                        "gate": "closed",
+                        "allowed": [],
+                    },
+                },
             }
-            self._replace_if_changed(
-                self.admin_dir / "status.json", status, keep=("updatedAt",)
+            self._replace_if_changed(self.gate_file, closed_gate_doc, keep=())
+        except Exception:
+            pass
+        try:
+            closed_public = {
+                **public,
+                "workshop": {"mode": "maintenance", "message": self.message},
+            }
+            self._replace_if_changed(self.public_file, closed_public, keep=("since",))
+        except Exception:
+            pass
+
+    def _narrow_unreadable_gate_best_effort(self) -> None:
+        """Narrow the on-disk gate for the unreadable-state path. Best
+        effort: never raises. Forces the workshop entry closed (Game entry
+        preserved) so a just-removed member stops being admitted locally.
+        Each file narrows independently: a missing or corrupt public.json
+        must not keep gate.json admitting a removed member, and vice versa
+        (the per-file writes below already tolerate the other side being
+        absent or invalid)."""
+        try:
+            gate_doc = json.loads(self.gate_file.read_bytes()[:65536])
+        except Exception:
+            gate_doc = None
+        try:
+            public = json.loads(self.public_file.read_bytes()[:65536])
+        except Exception:
+            public = None
+        if not isinstance(gate_doc, dict) and not isinstance(public, dict):
+            return
+        self._write_closed_gate_best_effort(gate_doc, public)
+
+    def _drive_error_after_commit(self, state: dict, error: Exception) -> None:
+        """Persist ERROR after a post-commit derivative failure. Best effort:
+        never raises. Writes state.json directly: routing through _write
+        would re-export (recursion) and the derivatives just failed."""
+        try:
+            state.update(
+                phase="ERROR",
+                gate="closed",
+                error=type(error).__name__,
+                errorMessage=str(error)[:500],
+                since=self._now_ms(),
             )
+            data = json.dumps(
+                state, ensure_ascii=False, sort_keys=True, allow_nan=False
+            ).encode()
+            if len(data) > STATE_MAX_BYTES:
+                return
+            atomic_write(self.file, data)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _project_gate_leg(workshop_gate: dict) -> dict:
+        """CP-projected leg (state/message/plain members, no roles or maps)."""
+        return {
+            "state": workshop_gate["gate"],
+            "message": workshop_gate["message"],
+            "allowed": [
+                {"draslId": entry["draslId"], "name": entry["name"]}
+                for entry in workshop_gate["allowed"]
+            ],
+        }
+
+    def _stage_gate_report(self, workshop_gate: dict) -> None:
+        """Stage the desired leg under the lock; delivery happens after unlock.
+
+        Runs inside _export (under controller.lock) before any other file
+        write. Raises OSError when the marker cannot be written: _export
+        fails and the op must not be ACKed effective. No in-memory fallback.
+        """
+        if getattr(self, "gate_reporter", None) is None:
+            return
+        self._stage_gate_leg(self._project_gate_leg(workshop_gate))
+
+    def _stage_closed_gate_report(self) -> None:
+        """Fail-closed staging when state.json cannot be read: the desired
+        leg is unknown, so hold the most restrictive (closed, nobody
+        admitted) leg until delivery. Raises like _stage_gate_report."""
+        if getattr(self, "gate_reporter", None) is None:
+            return
+        self._stage_gate_leg(
+            {"state": "closed", "message": self.message, "allowed": []}
+        )
+
+    def _stage_gate_leg(self, leg: dict) -> None:
+        """Write pending {seq, nonce, leg}; skip only when CP holds the leg.
+
+        Caller holds controller.lock (staging); gate_state.lock guards the
+        read-modify-write of both files. The seq is one past the highest
+        readable seq; when the previous pending record is unreadable its seq
+        is unknown, so the bump may reuse a seq still in flight — the fresh
+        nonce keeps the record identity unique anyway, and the drain unlinks
+        only on an exact (seq, nonce) match, so the reused number can never
+        delete the newer record. A stage of the already-staged leg is a
+        no-op (lets duplicate requests re-export without churning seqs).
+        Records the covering seq in self._export_staged_gate_seq so set_members
+        can tell this op's staging from an older pending record.
+        """
+        with self._gate_state_locked():
+            delivered = self._read_gate_record_locked(self._gate_delivered_file)
+            pending = self._read_gate_record_locked(
+                self._gate_pending_file, fail_closed=True
+            )
+            if pending is None and delivered is not None and delivered[2] == leg:
+                self._export_staged_gate_seq = delivered[0]
+                return
+            if (
+                pending is not None
+                and pending is not _UNREADABLE_GATE_RECORD
+                and pending[2] == leg
+            ):
+                self._export_staged_gate_seq = pending[0]
+                return
+            if pending is _UNREADABLE_GATE_RECORD:
+                # Unreadable seq: bump past delivered only. Delivery advances
+                # delivered solely on exact-identity sends, so the reused
+                # number resolves via the fresh nonce below, never by unlink.
+                seq = (delivered[0] if delivered is not None else 0) + 1
+            else:
+                seq = (
+                    max(
+                        [0]
+                        + [
+                            record[0]
+                            for record in (delivered, pending)
+                            if record is not None
+                        ]
+                    )
+                    + 1
+                )
+            nonce = uuid4().hex
+            atomic_write(
+                self._gate_pending_file,
+                json.dumps(
+                    {"seq": seq, "nonce": nonce, "leg": leg}, ensure_ascii=False
+                ).encode(),
+            )
+            self._export_staged_gate_seq = seq
+
+    @contextmanager
+    def _gate_state_locked(self):
+        """Serialize local gate-file ops across processes (never HTTPS)."""
+        fd = os.open(
+            self._gate_state_lock_file,
+            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _valid_gate_leg(leg) -> bool:
+        return (
+            isinstance(leg, dict)
+            and type(leg.get("state")) is str
+            and type(leg.get("message")) is str
+            and isinstance(leg.get("allowed"), list)
+            and all(
+                isinstance(entry, dict)
+                and type(entry.get("draslId")) is str
+                and type(entry.get("name")) is str
+                for entry in leg["allowed"]
+            )
+        )
+
+    def _read_gate_record_locked(
+        self, path: Path, *, fail_closed: bool = False
+    ) -> tuple[int, str, dict] | object | None:
+        """(seq, nonce, leg) from a gate record file; None only when absent.
+
+        The (seq, nonce) pair is the record identity: every stage mints a
+        fresh nonce, and the drain unlinks only on an exact identity match,
+        so a seq reused after an unreadable read can never delete the newer
+        record. A nonce-less (pre-upgrade) record is invalid: pending reads
+        return _UNREADABLE_GATE_RECORD (fail closed, healed by next stage).
+
+        The caller holds gate_state.lock. With fail_closed=False (the
+        delivered file) an unreadable or invalid record is unlinked so the
+        next stage heals it, and None is returned. With fail_closed=True
+        invalid record returns _UNREADABLE_GATE_RECORD instead of None and
+        is never unlinked: a leg that cannot be read must keep holding ACKs,
+        and the next stage overwrites it. Delivered-identity reads also use
+        fail_closed=True: a pure read must never mutate the file.
+        """
+        try:
+            document = json.loads(path.read_bytes()[:65536])
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            if not fail_closed:
+                return None
+            return _UNREADABLE_GATE_RECORD
+        if (
+            not isinstance(document, dict)
+            or type(document.get("seq")) is not int
+            or document["seq"] < 1
+            or type(document.get("nonce")) is not str
+            or not document["nonce"]
+            or not self._valid_gate_leg(document.get("leg"))
+        ):
+            if not fail_closed:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                return None
+            return _UNREADABLE_GATE_RECORD
+        leg = document["leg"]
+        return (
+            document["seq"],
+            document["nonce"],
+            {
+                "state": leg["state"],
+                "message": leg["message"],
+                "allowed": [
+                    {"draslId": entry["draslId"], "name": entry["name"]}
+                    for entry in leg["allowed"]
+                ],
+            },
+        )
+
+    def gate_report_pending(self) -> bool:
+        """True while a desired leg is staged but not yet delivered to CP.
+
+        Always reads the file, even without a reporter: a process that cannot
+        deliver must still hold while another process's leg is undelivered.
+        An unreadable record counts as pending (fail closed); only a missing
+        file reads as clear.
+        """
+        with self._gate_state_locked():
+            return (
+                self._read_gate_record_locked(self._gate_pending_file, fail_closed=True)
+                is not None
+            )
+
+    def gate_pending_identity(self) -> dict | None:
+        """{seq, nonce} of the staged-but-undelivered leg; None when absent
+        or unreadable. A pure read: never mutates the files."""
+        with self._gate_state_locked():
+            record = self._read_gate_record_locked(
+                self._gate_pending_file, fail_closed=True
+            )
+            if record is None or record is _UNREADABLE_GATE_RECORD:
+                return None
+            return {"seq": record[0], "nonce": record[1]}
+
+    def gate_delivered_identity(self) -> dict | None:
+        """{seq, nonce} of the last leg confirmed on CP; None when absent or
+        unreadable. A pure read: never mutates the files."""
+        with self._gate_state_locked():
+            record = self._read_gate_record_locked(
+                self._gate_delivered_file, fail_closed=True
+            )
+            if record is None or record is _UNREADABLE_GATE_RECORD:
+                return None
+            return {"seq": record[0], "nonce": record[1]}
+
+    def _flush_gate_report(self) -> None:
+        """Deliver the staged leg. Callers must not hold the controller lock.
+
+        Serialized across processes by gate_report.lock (never the
+        controller lock): one report in flight at a time. A busy lock skips
+        instead of waiting, so a stalled report never stalls request/step;
+        the pending marker is retried by the next flush. Files are the only
+        truth: the pending record is re-read under gate_state.lock, and a
+        stage landing mid-report is delivered by the drain loop last, so the
+        server converges on the newest seq.
+        """
+        try:
+            fd = os.open(
+                self._gate_report_lock_file,
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError as error:
+            print(f"controller: gate flush failed: {error!r}", file=sys.stderr)
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # Another process is delivering; the marker stays for retry.
+                return
+            try:
+                self._flush_gate_report_locked()
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _flush_gate_report_locked(self) -> None:
+        """One drain pass; the caller holds gate_report.lock."""
+        while True:
+            with self._gate_state_locked():
+                record = self._read_gate_record_locked(
+                    self._gate_pending_file, fail_closed=True
+                )
+                if record is None:
+                    return
+                if record is _UNREADABLE_GATE_RECORD:
+                    # Staged but unparseable: keep it (the next stage
+                    # overwrites it) and stop; never deliver what was not read.
+                    return
+                seq, nonce, leg = record
+            reporter = getattr(self, "gate_reporter", None)
+            if reporter is None:
+                # Nothing can be delivered from here: keep the marker for a
+                # process holding the gate credential. Never unlink another
+                # owner's leg, never treat it as delivered.
+                return
+            try:
+                reporter.report(leg)
+            except Exception as error:
+                print(f"controller: gate report failed: {error!r}", file=sys.stderr)
+                return
+            with self._gate_state_locked():
+                atomic_write(
+                    self._gate_delivered_file,
+                    json.dumps(
+                        {"seq": seq, "nonce": nonce, "leg": leg}, ensure_ascii=False
+                    ).encode(),
+                )
+                current = self._read_gate_record_locked(
+                    self._gate_pending_file, fail_closed=True
+                )
+                if current is None or current is _UNREADABLE_GATE_RECORD:
+                    # Gone (impossible under the report lock) or unreadable
+                    # mid-flight: stay fail-closed, the next stage heals it.
+                    return
+                if current[0] == seq and current[1] == nonce:
+                    # Still the exact record just sent: delivered, drop it. A
+                    # newer stage landing mid-report has a different identity:
+                    # loop and deliver it last so CP converges on it.
+                    try:
+                        self._gate_pending_file.unlink()
+                    except OSError:
+                        pass
+                    return
 
     @staticmethod
     def _replace_if_changed(path: Path, document, keep: tuple) -> None:
@@ -1265,6 +2148,24 @@ class Controller:
                 raise ValueError(
                     "operation ID reused with different intent or release evidence"
                 )
+            if getattr(self, "gate_reporter", None) is not None:
+                # Same op retried (at-least-once delivery, or a retry after a
+                # commit-then-fail): the first attempt may have committed
+                # without staging. Re-export so the retry stages instead of
+                # ACKing an undelivered leg; the stage dedups an identical
+                # already-staged leg, so this never churns seqs. A staging
+                # failure is commit-then-fail (the committed selection
+                # stands): hold, never a bare OSError that sync would store
+                # as terminal rejected.
+                try:
+                    self._export(state)
+                except CommitIncompleteError:
+                    raise
+                except OSError as error:
+                    raise CommitIncompleteError(
+                        f"committed {operation!r} selection already stored"
+                        f" but its gate leg was not staged: {error}"
+                    ) from error
             return state
         if type(expected_revision) is not int or expected_revision != state["revision"]:
             raise ValueError("stale state revision")
@@ -1397,6 +2298,7 @@ class Controller:
             "rollbackSession": previous_session
             if previous_stable and previous_stable["profile"] in {"workshop", "test"}
             else None,
+            "cancelOperation": None,
             "idleSince": None,
         }
         if (
@@ -1446,6 +2348,11 @@ class Controller:
         STARTING has a deadline and may restore a previous Workshop/test goal. A missing
         process after a durable start never proves that the accepted start was cancelled.
         """
+        # Retry an undelivered gate leg before anything else, outside the lock.
+        try:
+            self._flush_gate_report()
+        except Exception as error:
+            print(f"controller: gate flush failed: {error!r}", file=sys.stderr)
         with self._locked():
             try:
                 state = self._read()
@@ -1749,11 +2656,15 @@ class Controller:
         )
         return state
 
-    def _rollback(self, state: dict, goal: Goal, reason: str) -> dict:
+    def _rollback(
+        self, state: dict, goal: Goal, reason: str, operation_id: str | None = None
+    ) -> dict:
         """Abandon the in-flight switch and reopen the gate of the previously stable profile.
 
         STARTING already stopped it, so bring it back up before declaring the profile stable again;
         if that itself fails there is no safe automatic move left, so it becomes an ERROR (root recovery).
+        operation_id keys the journal: a same-op retry of an already-committed
+        cancel is a no-op, never a second compensation run.
         """
         if state.get("rollback") is None:
             # An independently restarted backend has no switch to undo; keep waiting for readiness.
@@ -1785,6 +2696,9 @@ class Controller:
             errorMessage=reason,
             since=self._now_ms(),
             rollback=None,
+            # Key the journal on the owning cancel op (None for timeout
+            # rollbacks): a same-op retry must not compensate twice.
+            cancelOperation=operation_id,
         )
         if not pending:
             state["selection"] = {
@@ -1798,7 +2712,15 @@ class Controller:
                 "deferred": False,
             }
         # Journal the single compensation attempt before fencing/stopping/starting.
-        self._write(state)
+        # The journal is the commit point: a later derivative failure drives
+        # ERROR visibly (so a retry lands on the vacuous "nothing to cancel"
+        # path) and raises commit-then-fail (hold, never rejected) instead of
+        # letting a retry fence the restored backend a second time.
+        try:
+            self._write(state)
+        except CommitIncompleteError as error:
+            self._drive_error_after_commit(state, error)
+            raise
         if restarting:
             try:
                 self.backend.preflight(stable)
@@ -1819,14 +2741,36 @@ class Controller:
                 self._write(state)
         return state
 
-    def cancel(self) -> dict:
+    def cancel(self, operation_id: str | None = None) -> dict:
         """Unprivileged abort of a stuck switch (site -> inbox "cancel", no root): roll back now
         instead of waiting for the deadline. Only valid while a switch is actually in flight.
         With no previous stable profile (first-ever start, or a recover retry that never became
         ready) there is nothing to restore: fence anything half-started and park in ERROR so an
-        explicit request --recover can retry, instead of spinning with the gate closed."""
+        explicit request --recover can retry, instead of spinning with the gate closed.
+        operation_id keys the compensation: a same-op retry of an already
+        committed cancel returns the journaled state instead of fencing again."""
         with self._locked():
             state = self._read()
+            if (
+                operation_id is not None
+                and state.get("cancelOperation") == operation_id
+            ):
+                # The compensation for this op already committed (the receipt
+                # was lost after the commit): the retry must be a no-op, never
+                # a second fence — but it still must re-export so the retry
+                # stages the committed leg instead of ACKing it effective
+                # unstaged (I5). A staging failure holds, never a bare OSError.
+                if getattr(self, "gate_reporter", None) is not None:
+                    try:
+                        self._export(state)
+                    except CommitIncompleteError:
+                        raise
+                    except OSError as error:
+                        raise CommitIncompleteError(
+                            f"committed {operation_id!r} cancel already stored"
+                            f" but its gate leg was not staged: {error}"
+                        ) from error
+                return state
             if state.get("phase") not in {"STARTING"}:
                 raise ValueError("nothing to cancel: no switch is in progress")
             if not state.get("rollback"):
@@ -1841,11 +2785,19 @@ class Controller:
                     since=self._now_ms(),
                     rollback=None,
                     rollbackTarget=None,
+                    cancelOperation=operation_id,
                 )
-                self._write(state)
+                try:
+                    self._write(state)
+                except CommitIncompleteError as error:
+                    self._drive_error_after_commit(state, error)
+                    raise
                 return state
             return self._rollback(
-                state, Goal(**state["desired"]), "cancelled by admin request"
+                state,
+                Goal(**state["desired"]),
+                "cancelled by admin request",
+                operation_id=operation_id,
             )
 
     def wake(self, operation: str, actor: dict | None = None) -> dict:
@@ -1866,6 +2818,24 @@ class Controller:
                 self._member_actor(actor)
             state = self._read()
             if state.get("phase") != "sleeping":
+                if getattr(self, "gate_reporter", None) is not None and (
+                    state.get("operation") == operation
+                    or (state.get("selection") or {}).get("operation") == operation
+                ):
+                    # Same-op retry after a commit-then-fail: the first
+                    # attempt committed without staging, so re-export before
+                    # reporting started:False — otherwise sync ACKs the op
+                    # effective with its gate leg unstaged (I5). A staging
+                    # failure holds, never a bare OSError.
+                    try:
+                        self._export(state)
+                    except CommitIncompleteError:
+                        raise
+                    except OSError as error:
+                        raise CommitIncompleteError(
+                            f"committed {operation!r} wake already stored"
+                            f" but its gate leg was not staged: {error}"
+                        ) from error
                 return {
                     "kind": "wake",
                     "phase": state.get("phase"),
@@ -2012,7 +2982,18 @@ class Controller:
                 operation_id,
                 {"draslId": principal["draslId"], "name": principal["name"]},
             )
-        return {"kind": "cancel", "revision": self.cancel()["revision"]}
+        try:
+            return {
+                "kind": "cancel",
+                "revision": self.cancel(operation_id=operation_id)["revision"],
+            }
+        except ValueError as error:
+            if "nothing to cancel" not in str(error):
+                raise
+            # Idempotent retry: a previous pass already cancelled (its gate
+            # report may still be pending); a first-attempt no-op is a vacuous
+            # success, like a no-op wake.
+            return {"kind": "cancel", "revision": self._read()["revision"]}
 
     def process_inbox(self, now_ms: int | None = None) -> int:
         """Apply admin requests from the site, oldest first; each one gets exactly one result file.
@@ -2239,7 +3220,7 @@ class Controller:
         if len(data) > INBOX_MAX_BYTES and (
             not isinstance(document, dict)
             or not isinstance(document.get("kind"), str)
-            or document.get("kind") not in {"merge-preview", "publish"}
+            or document.get("kind") != "publish"
         ):
             return None, "request too large"
         if (
@@ -2275,18 +3256,30 @@ class Controller:
         note: str,
         *,
         working_copy_id=None,
-        branch=None,
-        expected_branch_head=None,
+        expected_head=candidates.EXPECTED_HEAD_ABSENT,
         commit=False,
         review=False,
         authorize=False,
+        branch=None,
+        expected_branch_head=None,
     ) -> dict:
+        # Pre-linear compat: branch/expected_branch_head are ignored; a branch
+        # tip is not a head, so it only ever feeds the head CAS (fail closed).
+        if expected_branch_head is not None and (
+            expected_head is candidates.EXPECTED_HEAD_ABSENT or expected_head is None
+        ):
+            expected_head = expected_branch_head
         # Refuse a missing draft before issuing any save commands.
         options = (
             {"working_copy_id": working_copy_id} if working_copy_id is not None else {}
         )
-        if branch is None or commit:
-            self.maps.check(map_id, **options)
+        if (
+            expected_head is not candidates.EXPECTED_HEAD_ABSENT
+            and expected_head is not None
+            and not isinstance(expected_head, str)
+        ):
+            raise ValueError("expectedHead must be a map version digest")
+        self.maps.check(map_id, **options)
         with self._locked():
             if authorize:
                 actor = self._map_actor(actor, map_id)
@@ -2307,24 +3300,10 @@ class Controller:
                         "snapshot requires the exact selected session and map"
                     )
                 self.maps.versions.validate_working_copy(map_id, working_copy_id)
-            if branch is not None or commit:
-                if getattr(self.maps, "canonical_sessions", False) is not True:
-                    raise ValueError("branch snapshots require canonical sessions")
-                if (
-                    not isinstance(note, str)
-                    or len(note) > 200
-                    or commit
-                    and not note.strip()
-                ):
-                    raise ValueError("commit message required (1–200 characters)")
-                if branch != selected.get("branches", {}).get(map_id):
-                    raise ValueError("snapshot requires the exact selected branch")
-                if (
-                    self.maps.versions.branch(map_id, branch)["versionDigest"]
-                    != expected_branch_head
-                ):
-                    raise ValueError("stale branch head: refresh before committing")
-                options.update(branch=branch, expected_branch_head=expected_branch_head)
+            if commit and (
+                not isinstance(note, str) or not note.strip() or len(note) > 200
+            ):
+                raise ValueError("commit message required (1–200 characters)")
             _, _, current = self._observe()
             if sleeping:
                 if current is not None:
@@ -2336,32 +3315,25 @@ class Controller:
             ):
                 raise RuntimeError("snapshot backend does not match controller state")
 
-            def take():
-                if commit:
-                    return self.maps.commit(
-                        map_id,
-                        actor,
-                        note,
-                        working_copy_id=working_copy_id,
-                        branch=branch,
-                        expected_head=expected_branch_head,
-                    )
-                return self.maps.create(map_id, actor, note, **options)
-
-            if branch is not None and not commit:
-                meta = self.maps.review(
+            # Asleep the drafts on disk are final; awake maps.hold_saves flushes the running editor
+            # and pauses autosave for the copy. Neither path restarts Workshop.
+            if commit:
+                meta = self.maps.commit(
                     map_id,
                     actor,
                     note,
                     working_copy_id=working_copy_id,
-                    branch=branch,
-                    expected_head=expected_branch_head,
+                    expected_head=expected_head,
                 )
-                self.export_maps()
-                return meta
-            # Asleep the drafts on disk are final; awake maps.hold_saves flushes the running editor
-            # and pauses autosave for the copy. Neither path restarts Workshop.
-            meta = take()
+            else:
+                meta = self.maps.create(
+                    map_id,
+                    actor,
+                    note,
+                    working_copy_id=working_copy_id,
+                    expected_head=expected_head,
+                    review=True,
+                )
             if review:
                 # The tablet's one button: commit what is built now, then review that commit.
                 meta = self.maps.review(
@@ -2369,7 +3341,6 @@ class Controller:
                     actor,
                     note,
                     working_copy_id=working_copy_id,
-                    branch=branch,
                     expected_head=meta["versionDigest"],
                 )
             self.export_maps()
@@ -2404,43 +3375,6 @@ class Controller:
         ):
             raise ValueError("map is outside the actor's scope")
         return {key: admitted[key] for key in ("draslId", "name")}
-
-    def _merge_preview(self, map_id, source, expected_head, resolutions=None) -> dict:
-        self.maps.versions.check_head(map_id, expected_head)
-        if expected_head is None:
-            if resolutions is not None and not isinstance(resolutions, dict):
-                raise ValueError("merge conflict choices must be an object")
-            if resolutions:
-                raise ValueError("initial publication has no merge conflict choices")
-            manifest = self.maps.versions.read(map_id, source)
-            config = self.maps.versions._config(manifest["files"])
-            changes = self.maps.versions._compare_files(
-                map_id, None, source, {}, manifest["files"], config
-            )
-            return {
-                "mapId": map_id,
-                "baseVersion": None,
-                "sourceVersion": source,
-                "targetVersion": None,
-                "conflicts": [],
-                "unresolved": [],
-                "changes": changes,
-            }
-        preview = self.maps.versions.merge_preview(
-            map_id, source, expected_head, resolutions
-        )
-        return {
-            key: preview[key]
-            for key in (
-                "mapId",
-                "baseVersion",
-                "sourceVersion",
-                "targetVersion",
-                "conflicts",
-                "unresolved",
-                "changes",
-            )
-        }
 
     def _map_change(self, request_id, document):
         if (
@@ -2604,39 +3538,7 @@ class Controller:
                     base = apps["workshop"].data
             if base is None:
                 raise ValueError("workshop data directory is not configured")
-            directory, path = (
-                Path(base) / "blockfield-workshop",
-                Path(base) / f"blockfield-workshop/{filename}",
-            )
-            for node in (path, *path.parents):
-                if node.is_symlink():
-                    raise ValueError(f"unsafe {kind} path")
-                if node == Path(base):
-                    break
-            try:
-                info = os.stat(directory)
-            except FileNotFoundError:
-                directory.mkdir(mode=0o755)
-                os.chmod(directory, 0o755)
-                os.chown(directory, AI_KEY_UID, AI_KEY_GID)
-            else:
-                if (
-                    not stat.S_ISDIR(info.st_mode)
-                    or info.st_uid != AI_KEY_UID
-                    or info.st_gid != AI_KEY_GID
-                ):
-                    raise ValueError(f"unsafe {kind} directory")
-            if key is None:
-                path.unlink(missing_ok=True)
-                stored = {"set": False, "last4": "", "sha256Prefix": ""}
-            else:
-                data = key.encode()
-                atomic_write(path, data, owner=(AI_KEY_UID, AI_KEY_GID))
-                stored = {
-                    "set": True,
-                    "last4": key[-4:],
-                    "sha256Prefix": hashlib.sha256(data).hexdigest()[:8],
-                }
+            stored = _write_ai_key_as_owner(base, filename, kind, key)
             applied_at = self._now_ms()
             atomic_write(
                 self.admin_dir / status_name,
@@ -2687,19 +3589,24 @@ class Controller:
             return None
         if kind == "cancel":
             # An admin cancels a stuck Workshop transition without root.
-            return self.cancel()["revision"]
+            # The inbox request id keys the compensation: a redelivered file
+            # after a committed cancel is a no-op, never a second fence.
+            return self.cancel(operation_id=request_id)["revision"]
         if kind in {
             "candidate",
             "publish",
             "reject",
             "rollback",
             "checkout",
+            "checkout-fresh",
             "export",
             "limbo-export",
-            "branch-create",
             "commit",
             "compare",
-            "merge-preview",
+            "snapshot-create",
+            "snapshot-copy",
+            "snapshot-delete",
+            "snapshots",
         }:
             force = document.get("force", False)
             if type(force) is not bool:
@@ -2728,30 +3635,55 @@ class Controller:
             actor = self._map_actor(
                 actor,
                 map_id,
-                admin=kind in {"publish", "reject", "rollback", "limbo-export"},
+                admin=kind
+                in {
+                    "publish",
+                    "reject",
+                    "rollback",
+                    "limbo-export",
+                    "snapshot-create",
+                    "snapshot-copy",
+                    "snapshot-delete",
+                },
             )
             result = None
             if kind in {"candidate", "commit"}:
                 if "commit" in document and type(document["commit"]) is not bool:
                     raise ValueError("commit must be a boolean")
+                head_options = (
+                    {"expected_head": document["expectedHead"]}
+                    if "expectedHead" in document
+                    else {}
+                )
                 result = self._snapshot(
                     document.get("mapId"),
                     actor,
                     document.get("note", ""),
                     working_copy_id=document.get("workingCopyId"),
-                    branch=document.get("branch"),
-                    expected_branch_head=document.get("expectedBranchHead"),
                     # candidate {commit: true} is the tablet's commit-and-review in one request.
                     commit=kind == "commit" or document.get("commit") is True,
                     review=kind == "candidate" and document.get("commit") is True,
                     authorize=True,
+                    branch=document.get("branch"),
+                    expected_branch_head=document.get("expectedBranchHead"),
+                    **head_options,
                 )
             elif kind == "limbo-export":
                 self.export_limbo(document.get("versionDigest"))
             else:
                 with self._locked():
                     actor = self._map_actor(
-                        actor, map_id, admin=kind in {"publish", "reject", "rollback"}
+                        actor,
+                        map_id,
+                        admin=kind
+                        in {
+                            "publish",
+                            "reject",
+                            "rollback",
+                            "snapshot-create",
+                            "snapshot-copy",
+                            "snapshot-delete",
+                        },
                     )
                     if kind == "publish":
                         options = (
@@ -2759,18 +3691,6 @@ class Controller:
                             if "expectedHead" in document
                             else {}
                         )
-                        if meta.get("sourceBranch"):
-                            if force:
-                                raise ValueError(
-                                    "force cannot bypass map merge conflicts"
-                                )
-                            if (
-                                "expectedHead" in document
-                                and meta.get("targetHead") != document["expectedHead"]
-                            ):
-                                raise ValueError(
-                                    "review target changed; submit a new review"
-                                )
                         result = self.maps.publish(
                             document.get("candidateId"),
                             actor,
@@ -2788,24 +3708,37 @@ class Controller:
                         )
                     elif kind == "export":
                         self.maps.archive_path(document.get("candidateId"))
-                    elif kind == "branch-create":
-                        result = self.maps.versions.create_branch(
-                            map_id,
-                            document.get("branch"),
-                            document.get("versionDigest"),
-                            actor,
-                        )
                     elif kind == "compare":
                         result = self.maps.versions.compare(
                             map_id, document.get("before"), document.get("after")
                         )
-                    elif kind == "merge-preview":
-                        result = self._merge_preview(
+                    elif kind == "snapshot-create":
+                        result = self.maps.versions.create_snapshot(
                             map_id,
+                            document.get("name"),
                             document.get("versionDigest"),
-                            document.get("expectedHead"),
-                            document.get("resolutions"),
+                            actor,
                         )
+                    elif kind == "snapshot-copy":
+                        result = self.maps.snapshot_working_copy(
+                            map_id,
+                            document.get("name"),
+                            document.get("workingCopyId"),
+                            actor,
+                        )
+                    elif kind == "checkout-fresh":
+                        result = self.maps.checkout_fresh_copy(
+                            map_id,
+                            document.get("workingCopyId"),
+                            actor,
+                        )
+                    elif kind == "snapshot-delete":
+                        self.maps.versions.delete_snapshot(map_id, document.get("name"))
+                    elif kind == "snapshots":
+                        result = {
+                            "mapId": map_id,
+                            "snapshots": self.maps.versions.snapshots(map_id),
+                        }
                     else:
                         if "expectedHead" not in document:
                             raise ValueError(

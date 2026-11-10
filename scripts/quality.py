@@ -8,7 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from toolchain import canonical_python, child_env, download, native, python_args, tool  # noqa: E402
+from toolchain import canonical_python, child_env, fetch, native, tool  # noqa: E402
+from toolchain_local import python_args  # noqa: E402
 
 
 def _git(root, *args):
@@ -196,11 +197,7 @@ def eol():
 def kotlin(files, format=False):
     if not files:
         return
-    jar = download(
-        "ktlint-1.8.0.jar",
-        "https://github.com/ktlint/ktlint/releases/download/1.8.0/ktlint",
-        "a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75",
-    )
+    jar = fetch("ktlint", "ktlint-1.8.0.jar")
     run(
         "java",
         "-Xmx512m",
@@ -240,11 +237,7 @@ def formatting(files, write=False):
     )
     java = [f for f in files if f.endswith(".java")]
     if java:
-        jar = download(
-            "google-java-format-1.36.1-all-deps.jar",
-            "https://repo.maven.apache.org/maven2/com/google/googlejavaformat/google-java-format/1.36.1/google-java-format-1.36.1-all-deps.jar",
-            "25b400f003089d23cc5320cdaf1a16cabee19b8aa3434d0ff021b3d9f42154b4",
-        )
+        jar = fetch("gjf", "google-java-format-1.36.1-all-deps.jar")
         each(
             [
                 "java",
@@ -343,11 +336,7 @@ def format_staged():
     )
     java = [f for f in files if f.endswith(".java")]
     if java:
-        jar = download(
-            "google-java-format-1.36.1-all-deps.jar",
-            "https://repo.maven.apache.org/maven2/com/google/googlejavaformat/google-java-format/1.36.1/google-java-format-1.36.1-all-deps.jar",
-            "25b400f003089d23cc5320cdaf1a16cabee19b8aa3434d0ff021b3d9f42154b4",
-        )
+        jar = fetch("gjf", "google-java-format-1.36.1-all-deps.jar")
         each(
             ["java", "-jar", jar, "--aosp", "--replace"],
             java,
@@ -410,16 +399,8 @@ def compile_check(files):
             )
     elif "scripts/PatchLrTactical.java" in files:
         jars = [
-            download(
-                "asm-9.8.jar",
-                "https://repo.maven.apache.org/maven2/org/ow2/asm/asm/9.8/asm-9.8.jar",
-                "876eab6a83daecad5ca67eb9fcabb063c97b5aeb8cf1fca7a989ecde17522051",
-            ),
-            download(
-                "asm-tree-9.8.jar",
-                "https://repo.maven.apache.org/maven2/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar",
-                "14b7880cb7c85eed101e2710432fc3ffb83275532a6a894dc4c4095d49ad59f1",
-            ),
+            fetch("asm", "asm-9.8.jar"),
+            fetch("asm-tree", "asm-tree-9.8.jar"),
         ]
         with tempfile.TemporaryDirectory() as output:
             run(
@@ -510,7 +491,8 @@ def main():
             with Path(os.environ["GITHUB_PATH"]).open(
                 "a", encoding="utf-8", newline="\n"
             ) as output:
-                output.write(str(ROOT / ".cache/quality/npm/node_modules/.bin") + "\n")
+                for name in ("prettier", "pnpm"):
+                    output.write(str(Path(tool(name)).parent) + "\n")
         return
     if mode in ("dev", "start", "test-postgres"):
         if (ROOT / "package.json").is_file():
