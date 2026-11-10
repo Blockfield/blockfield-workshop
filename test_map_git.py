@@ -789,7 +789,13 @@ class MapLinearTests(unittest.TestCase):
         again = self.store.migrate_branches_to_snapshots()
         self.assertEqual(
             again,
-            {"migrated": [], "atHead": [], "draftSnapshots": [], "draftSkipped": []},
+            {
+                "migrated": [],
+                "atHead": [],
+                "candidatesSuperseded": [],
+                "draftSnapshots": [],
+                "draftSkipped": [],
+            },
         )
 
     def test_migration_hold_failure_leaves_draft_for_explicit_path(self):
@@ -975,6 +981,132 @@ class MapLinearTests(unittest.TestCase):
         self.assertEqual(again["status"], "accepted")
         self.assertEqual(again["versionDigest"], first)
         self.assertEqual(self.versions.head("konstaxa")["versionDigest"], first)
+
+    # -- round 5: pre-upgrade pending reviews are not carried into the linear model --
+
+    def _write_legacy_review(self, version, shape="branched", working_copy_id=None):
+        # A genuine pending review converted to a pre-upgrade shape, so every
+        # other field (base, regions, digests) stays valid. The reviewer may
+        # be a real copy that did not produce the version: pre-upgrade, two
+        # sessions could select the same branch.
+        review = self.store.review(
+            "konstaxa",
+            ACTOR,
+            "pre-upgrade review",
+            working_copy_id=working_copy_id or str(uuid4()),
+            expected_head=version,
+        )
+        path = self.store.candidates / f"{review['id']}.json"
+        meta = json.loads(path.read_text())
+        if shape == "branched":
+            # Branch-era record: both fields exist but under shared-branch
+            # semantics (two sessions could select the same branch).
+            meta["sourceBranch"] = "work-old"
+        else:
+            # Ancient/non-native record without the linear-model creation
+            # record at all.
+            del meta["targetHead"]
+            del meta["workingCopyId"]
+        path.write_text(json.dumps(meta))
+        return meta
+
+    def test_migration_supersedes_legacy_reviews_sharing_a_version(self):
+        # r4524516867: two pre-upgrade reviews can point at the same version;
+        # migration supersedes both, keeping their versions and files.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"shared tip")
+        version = self.commit(copy_id, self.base)
+        first_reviewer, _ = self.draft()
+        second_reviewer, _ = self.draft()
+        first = self._write_legacy_review(version, "branched", first_reviewer)
+        second = self._write_legacy_review(version, "fieldless", second_reviewer)
+        summary = self.store.migrate_branches_to_snapshots()
+        self.assertEqual(
+            sorted(entry["id"] for entry in summary["candidatesSuperseded"]),
+            sorted([first["id"], second["id"]]),
+        )
+        for meta in (first, second):
+            current = next(
+                item for item in self.store.list() if item["id"] == meta["id"]
+            )
+            self.assertEqual(current["status"], "superseded")
+            self.assertIn("submit again", current["supersedeReason"])
+        for meta in (first, second):
+            with self.assertRaisesRegex(ValueError, "not pending"):
+                self.store.publish(meta["id"], ACTOR, expected_head=self.base)
+        # The shared version and its files stay in the archive, untouched.
+        self.assertEqual(self.versions.read("konstaxa", version)["parent"], self.base)
+        again = self.store.migrate_branches_to_snapshots()
+        self.assertEqual(again["candidatesSuperseded"], [])
+
+    def test_duplicate_pending_review_is_never_treated_as_published(self):
+        # r4524516867: after one pre-upgrade review of a shared version
+        # publishes, publishing the duplicate must fail, not report success
+        # while leaving it pending.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"shared tip")
+        version = self.commit(copy_id, self.base)
+        first_reviewer, _ = self.draft()
+        second_reviewer, _ = self.draft()
+        first = self._write_legacy_review(version, "branched", first_reviewer)
+        second = self._write_legacy_review(version, "branched", second_reviewer)
+        self.store.publish(first["id"], ACTOR, expected_head=self.base)
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], version)
+        with self.assertRaisesRegex(ValueError, "review target|stale"):
+            self.store.publish(second["id"], ACTOR, expected_head=version)
+        current = next(item for item in self.store.list() if item["id"] == second["id"])
+        self.assertEqual(current["status"], "pending")
+
+    def test_only_the_creating_copy_advances_on_publish(self):
+        # r4524516857: a review of a version committed from another copy must
+        # not advance the reviewer's unrelated copy onto the new head.
+        author_id, author_bundle = self.draft()
+        other_id, _other_bundle = self.draft()
+        (author_bundle / "world/region/r.0.0.mca").write_bytes(b"author edit")
+        version = self.commit(author_id, self.base)
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=other_id, expected_head=version
+        )
+        published = self.store.publish(review["id"], ACTOR, expected_head=self.base)
+        self.assertFalse(published["copyAdvanced"])
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", other_id)["versionDigest"],
+            self.base,
+        )
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", author_id)["versionDigest"],
+            self.base,
+        )
+
+    def test_interrupted_publish_retries_to_converge(self):
+        # r4524516857/r4524516867: the retry settles only this candidate's own
+        # committed publication (marker written before activation), and the
+        # interrupted copy advance still converges on retry.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"first edit")
+        first = self.commit(copy_id, self.base)
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=first
+        )
+        with mock.patch.object(
+            self.versions,
+            "advance_working_copy",
+            side_effect=OSError("disk full"),
+        ):
+            with redirect_stderr(io.StringIO()):
+                published = self.store.publish(
+                    review["id"], ACTOR, expected_head=self.base
+                )
+        self.assertFalse(published["copyAdvanced"])
+        self.assertEqual(published.get("committedVersion"), first)
+        again = self.store.publish(review["id"], ACTOR, expected_head=self.base)
+        self.assertEqual(again["status"], "accepted")
+        self.assertTrue(again["copyAdvanced"])
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], first)
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", copy_id)["versionDigest"],
+            first,
+        )
 
     def test_checkout_fresh_copy_binds_session(self):
         # r4524380287: the fresh copy goes through the normal session path, so

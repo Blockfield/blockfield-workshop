@@ -320,7 +320,11 @@ At startup `migrate_branches_to_snapshots()` first preserves every stale edited 
 a map that had branch refs as a `migrated-draft-<hex>` snapshot (unedited drafts need none:
 their content is already immutable history), and only then converts every pre-linear named
 branch tip that differs from the map head into a named snapshot and removes the branch ref;
-tips already at the head need no snapshot. Each draft is read after saves are held; a draft
+tips already at the head need no snapshot. Pending pre-upgrade reviews are not carried
+into the linear model: every pending candidate without the linear creation record
+(`targetHead` + `workingCopyId`, or any pre-linear `sourceBranch` review) becomes
+`superseded` ("submit again after the upgrade") while its version and files stay in the
+archive. Each draft is read after saves are held; a draft
 that cannot be paused is logged and left for the explicit `snapshot-copy` path.
 The migration runs under the controller lock, so concurrent CLI invocations cannot race on the refs.
 There is no automatic history/ZIP deletion or binary patch chain. Existing ZIPs/releases/schematics remain intact;

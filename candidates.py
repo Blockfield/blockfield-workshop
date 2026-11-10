@@ -41,6 +41,9 @@ STALE_COPY_MESSAGE = (
     "stale working copy: the map has a newer version; "
     "save your draft as a snapshot and start from the current version"
 )
+# Pre-upgrade pending reviews are not carried into the linear model: their
+# versions and files stay in the archive, but the review itself is closed.
+CANDIDATE_SUPERSEDE_REASON = "pre-upgrade review; submit again after the upgrade"
 OWNER = (
     1000,
     1000,
@@ -352,6 +355,9 @@ class MapStore:
                 world, json.dumps(config, ensure_ascii=False, indent=2).encode()
             )
         # Publish refs only after autosave restoration has succeeded.
+        # The version records its origin: a review candidate points back at
+        # the candidate, a plain commit at the copy that made it — so publish
+        # can verify the copy it is about to advance actually produced it.
         version = self.versions.commit_head(
             map_id,
             files,
@@ -361,7 +367,7 @@ class MapStore:
             working_copy_id,
             base_version,
             source="candidate" if review else "commit",
-            source_id=candidate_id,
+            source_id=candidate_id if review else None,
         )
         if not review:
             return {
@@ -477,12 +483,21 @@ class MapStore:
                 expected_head is not None
                 and not force
                 and head is not None
+                and meta.get("status") == "accepted"
+                and meta.get("committedVersion") == meta.get("versionDigest")
                 and head["versionDigest"] == meta.get("versionDigest")
+                and (
+                    meta.get("targetHead") is None
+                    or meta["targetHead"] == expected_head
+                )
             ):
-                # A retry of an already committed publication: the head itself
-                # proves the publish, so only best-effort work remains. A
-                # forced retry still refuses a stale head: force waives only
-                # the template-base guard, never the head CAS.
+                # A retry of this candidate's own committed publication: the
+                # accepted status plus the marker written before activation
+                # prove the publish, so only best-effort work remains. A
+                # pending duplicate that merely shares the version never
+                # enters here; it falls through to the target/parent checks
+                # and fails. A forced retry still refuses a stale head: force
+                # waives only the template-base guard, never the head CAS.
                 self._settle_publish(meta)
                 return meta
             self.versions.check_head(map_id, expected_head)
@@ -525,6 +540,7 @@ class MapStore:
                 decidedBy=actor,
                 decidedAt=int(self._now() * 1000),
                 forced=force,
+                committedVersion=meta["versionDigest"],
             )
             meta.pop("sourceBranch", None)
             self._write_meta(meta)
@@ -604,6 +620,7 @@ class MapStore:
             decidedAt=int(self._now() * 1000),
             forced=force,
             versionDigest=version,
+            committedVersion=version,
         )
         self._write_meta(meta)
         if expected_head is not ACCEPT_ONLY:
@@ -621,10 +638,22 @@ class MapStore:
         head, never from this metadata.
         """
         copy_advanced = True
-        if meta.get("workingCopyId") is not None:
+        copy_id = meta.get("workingCopyId")
+        if copy_id is not None and not self._version_from_copy(meta):
+            # The published version was not snapshotted from this candidate's
+            # copy (e.g. a pre-upgrade review of another session's tip):
+            # advancing it would strand the copy on foreign content, so it
+            # stays stale for the explicit path instead.
+            copy_advanced = False
+            print(
+                "candidate: published version is not from this working copy; "
+                "leaving the copy stale",
+                file=sys.stderr,
+            )
+        elif copy_id is not None:
             try:
                 copy_advanced = self.versions.advance_working_copy(
-                    meta["mapId"], meta["workingCopyId"], meta["versionDigest"]
+                    meta["mapId"], copy_id, meta["versionDigest"]
                 )
             except Exception as error:
                 copy_advanced = False
@@ -641,6 +670,23 @@ class MapStore:
                 f"candidate: publish metadata sync failed after activation: {error!r}",
                 file=sys.stderr,
             )
+
+    def _version_from_copy(self, meta) -> bool:
+        """The published version must have been snapshotted from this candidate's copy.
+
+        The version manifest points back at its origin: a candidate-created
+        version carries this candidate's id, a plain commit carries the
+        committing copy's id. Anything else (another candidate's version,
+        another copy's commit, a restore) must never advance this copy.
+        """
+        try:
+            manifest = self.versions.read(meta["mapId"], meta["versionDigest"])
+        except (OSError, ValueError):
+            return False
+        return manifest.get("sourceId") in (
+            meta.get("id"),
+            meta.get("workingCopyId"),
+        )
 
     def reject(self, candidate_id: str, actor: dict) -> dict:
         meta = self._pending(candidate_id)
@@ -760,22 +806,63 @@ class MapStore:
         with self.hold_saves():
             return self.prepare_session(working_copy_id, [map_id], actor=actor)[0]
 
-    def migrate_branches_to_snapshots(self) -> dict:
-        """Store-level linearization: branch refs plus stale legacy drafts.
+    @staticmethod
+    def _is_legacy_pending(meta: dict) -> bool:
+        """A pending review the linear model cannot honor.
 
-        Drafts are preserved first (each snapshot written and fsynced before
-        the next), and the branch refs are removed only afterwards by the
-        archive migration — a stop between the steps keeps the refs, so the
-        rerun still finds and preserves every draft. Each step is idempotent
-        on rerun: an already preserved draft reuses its snapshot, and removed
-        refs stay removed. Every stale edited draft on a map that had legacy
-        branch refs is preserved as a migrated-draft-<hex> snapshot (the draft's content can no longer be
+        Post-upgrade candidates record targetHead + workingCopyId at
+        creation; branch-era reviews recorded those fields under
+        shared-branch semantics (two sessions could select the same branch,
+        two reviews could share one version), which the linear publish path
+        cannot verify. Either shape stays out of the linear model.
+        """
+        return meta.get("status") == "pending" and (
+            "targetHead" not in meta
+            or "workingCopyId" not in meta
+            or meta.get("sourceBranch") is not None
+        )
+
+    def legacy_pending_candidates(self) -> list[dict]:
+        """Pending reviews migration would supersede (lock-free read)."""
+        return [m for m in self.list() if self._is_legacy_pending(m)]
+
+    def migrate_branches_to_snapshots(self) -> dict:
+        """Store-level linearization: pending pre-upgrade reviews, stale legacy
+        drafts, then branch refs.
+
+        Pre-upgrade pending reviews become `superseded` first (their versions
+        and files stay in the archive, nothing is deleted): the linear model
+        cannot verify their copy/version binding. Then drafts are preserved
+        (each snapshot written and fsynced before the next), and the branch
+        refs are removed only afterwards by the archive migration — a stop
+        between the steps keeps the refs, so the rerun still finds and
+        preserves every draft. Each step is idempotent on rerun: superseded
+        reviews stay superseded, an already preserved draft reuses its
+        snapshot, and removed refs stay removed. Every stale edited draft on
+        a map that had legacy branch refs is preserved as a migrated-draft-<hex> snapshot (the draft's content can no longer be
         committed, so without this it would be silently lost). Each draft is
         read after hold_saves(); when the editor cannot be paused the draft
         is logged and left for the explicit snapshot_working_copy path.
         Unedited drafts need no snapshot: their content is already immutable
         history. Assumes the controller lock, like every other map mutation.
         """
+        superseded = []
+        for meta in self.list():
+            if not self._is_legacy_pending(meta):
+                continue
+            meta.update(
+                status="superseded",
+                supersedeReason=CANDIDATE_SUPERSEDE_REASON,
+                supersededAt=int(self._now() * 1000),
+            )
+            self._write_meta(meta)
+            superseded.append(
+                {
+                    "id": meta["id"],
+                    "mapId": meta.get("mapId"),
+                    "versionDigest": meta.get("versionDigest"),
+                }
+            )
         branch_authors: dict[str, dict] = {}
         ref_maps: set[str] = set()
         root = self.versions.archive / "branches"
@@ -928,6 +1015,7 @@ class MapStore:
         # inside, and only then is each ref removed — so every draft above is
         # already preserved before the first ref disappears.
         summary = self.versions.migrate_branches_to_snapshots()
+        summary["candidatesSuperseded"] = superseded
         summary["draftSnapshots"] = draft_snapshots
         summary["draftSkipped"] = draft_skipped
         return summary
