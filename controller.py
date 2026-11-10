@@ -159,31 +159,23 @@ AI_SIDECAR_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,2048}")
 
 
 def _require_owned_ai_key_dir(dir_fd: int, *, kind: str, display: str) -> None:
-    """Fail closed unless the pinned key dir is owned by this user and quiet.
+    """Fail closed unless this process and the pinned key dir are the key owner's.
 
-    The controller never repairs ownership or mode: a foreign-owned or
-    group/world-writable directory is refused with the path, the found
-    owner/mode and the expectation. A root controller is refused outright:
-    a foreign directory is the confused-deputy case, and in a root-owned one
-    the 0600 key would be unreadable to its readers (the sidecar and the
-    game run as the workshop user).
+    AI keys are 0600 and read by the sidecar and the game, which run as
+    AI_KEY_UID. So only that user may create or change them, in a directory
+    it owns that nobody else can write. The controller never repairs
+    ownership or mode: anything else is refused with what was found.
     """
     info = os.fstat(dir_fd)
     euid = os.geteuid()
     mode = stat.S_IMODE(info.st_mode)
-    if euid != 0 and info.st_uid == euid and not mode & 0o022:
+    if euid == AI_KEY_UID and info.st_uid == AI_KEY_UID and not mode & 0o022:
         return
-    if euid == 0:
-        remedy = "run the controller as the workshop user instead of root"
-    else:
-        remedy = (
-            f"run the controller as uid {info.st_uid} "
-            "or fix the ownership/mode outside the controller"
-        )
     raise ValueError(
         f"unsafe {kind} directory: {display} is owned by "
-        f"uid={info.st_uid} gid={info.st_gid} mode={mode:04o}; "
-        f"expected owner uid={euid} and no group/other write — {remedy}"
+        f"uid={info.st_uid} gid={info.st_gid} mode={mode:04o} and the controller "
+        f"runs as uid={euid}; expected owner uid={AI_KEY_UID}, no group/other "
+        f"write, and the controller running as the workshop user (uid {AI_KEY_UID})"
     )
 
 
@@ -246,11 +238,10 @@ def _read_ai_sidecar_key_fd(fd: int, *, display: str) -> str:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         raise ValueError("invalid ai-sidecar key file")
-    if info.st_uid != os.geteuid():
+    if info.st_uid != AI_KEY_UID:
         raise ValueError(
             f"unsafe ai-sidecar key file: {display} is owned by "
-            f"uid={info.st_uid}; expected owner uid={os.geteuid()} — "
-            "run the controller as the key owner instead"
+            f"uid={info.st_uid}; expected owner uid={AI_KEY_UID}"
         )
     os.fchmod(fd, 0o600)
     chunks = []
@@ -382,6 +373,17 @@ def ensure_ai_sidecar_key(base: Path) -> Path:
     concurrent starters converge on the winner's key. Anything else fails closed.
     """
     path = Path(base) / f"blockfield-workshop/{AI_SIDECAR_KEY_NAME}"
+    if os.geteuid() != AI_KEY_UID:
+        # Only the key's owner establishes it. Any other user constructing a
+        # controller (a root operator running one command) performs no file
+        # operation in that directory at all: nothing to exploit, and the
+        # command is not blocked by a key it does not use.
+        print(
+            f"controller: ai-sidecar key left untouched (uid {os.geteuid()} "
+            f"is not the key owner uid {AI_KEY_UID})",
+            file=sys.stderr,
+        )
+        return path
     base_fd, dir_fd = _open_pinned_ai_key_dir(base, kind="ai-sidecar-key")
     try:
         _require_owned_ai_key_dir(dir_fd, kind="ai-sidecar-key", display=str(path))

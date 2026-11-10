@@ -24,6 +24,10 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.dir = Path(self.temp.name)
         self.base = self.dir / "workshop-data"
+        # Production pins the key owner to uid 1000; tests run as whoever.
+        owner = mock.patch("controller.AI_KEY_UID", os.getuid())
+        owner.start()
+        self.addCleanup(owner.stop)
 
     def key_path(self):
         return self.base / "blockfield-workshop" / AI_SIDECAR_KEY_NAME
@@ -101,13 +105,31 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         with mock.patch("controller.os.geteuid", return_value=os.getuid()):
             ensure_ai_sidecar_key(self.base)  # must not raise for the caller-owned dir
 
-    def test_privileged_run_still_fails_closed_on_foreign_directory(self):
+    def test_other_user_touches_nothing_and_is_not_blocked(self):
+        """r4521776267: a controller built by a user who is not the key owner
+        (a root operator running one command) must not fail on the key and
+        must not perform any file operation in the key directory."""
         directory = self.base / "blockfield-workshop"
         directory.mkdir(parents=True)
-        with mock.patch("controller.os.geteuid", return_value=0):
-            with self.assertRaises(ValueError) as caught:
-                ensure_ai_sidecar_key(self.base)
-        self.assertIn("workshop user", str(caught.exception))
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("no file operation for a non-owner")
+
+        for euid in (0, os.getuid() + 1):
+            with (
+                mock.patch("controller.os.geteuid", return_value=euid),
+                mock.patch("controller._open_pinned_ai_key_dir", side_effect=forbidden),
+            ):
+                path = ensure_ai_sidecar_key(self.base)
+            self.assertEqual(path, self.key_path())
+        self.assertEqual(list(directory.iterdir()), [])
+
+    def test_key_is_only_created_by_its_owner_uid(self):
+        """r4521776261: a non-root controller whose uid is not the readers'
+        uid used to create a 0600 key the sidecar cannot open."""
+        with mock.patch("controller.AI_KEY_UID", os.getuid() + 1):
+            ensure_ai_sidecar_key(self.base)
+        self.assertFalse(self.key_path().exists())
 
     def test_rejects_symlinked_directory(self):
         """A dir-writer replacing blockfield-workshop with a symlink must not
@@ -287,54 +309,6 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         self.assertIn("unsafe ai-sidecar-key directory", message)
         self.assertIn("4242", message)  # found owner is reported
         self.assertIn(str(self.base / "blockfield-workshop"), message)
-
-    def test_root_refuses_non_root_directory(self):
-        """A root controller adopts nothing owned by another user
-        (D3: confused-deputy case); the message names the remedy."""
-        directory = self.base / "blockfield-workshop"
-        directory.mkdir(parents=True)
-
-        def no_privileged_repair(*args, **kwargs):
-            raise AssertionError("controller must not change ownership")
-
-        with (
-            mock.patch("controller.os.geteuid", return_value=0),
-            mock.patch("os.chown", side_effect=no_privileged_repair),
-            mock.patch("os.fchown", side_effect=no_privileged_repair),
-        ):
-            with self.assertRaises(ValueError) as caught:
-                ensure_ai_sidecar_key(self.base)
-        self.assertIn("workshop user", str(caught.exception))
-
-    def test_root_refuses_even_a_root_owned_directory(self):
-        """r4521707958: a root controller in a root-owned dir would stage a
-        root-owned 0600 key its readers (uid 1000) cannot open. Refused."""
-        directory = self.base / "blockfield-workshop"
-        directory.mkdir(parents=True)
-        real_fstat = os.fstat
-
-        class FakeStat:
-            def __init__(self, values):
-                self.st_mode, self.st_uid, self.st_gid, self.st_ino = values
-
-        def patched(fd, *args, **kwargs):
-            info = real_fstat(fd, *args, **kwargs)
-            try:
-                resolved = os.readlink(f"/proc/self/fd/{fd}")
-            except OSError:
-                return info
-            if Path(resolved) == directory:
-                return FakeStat((info.st_mode, 0, 0, info.st_ino))
-            return info
-
-        with (
-            mock.patch("controller.os.geteuid", return_value=0),
-            mock.patch("os.fstat", side_effect=patched),
-        ):
-            with self.assertRaises(ValueError) as caught:
-                ensure_ai_sidecar_key(self.base)
-        self.assertIn("workshop user", str(caught.exception))
-        self.assertEqual(list(directory.iterdir()), [])
 
     def test_directory_mode_is_never_changed(self):
         """r4521707966: the dir's mode was fchmod-ed before the ownership
