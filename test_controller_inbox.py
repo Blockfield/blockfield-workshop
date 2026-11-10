@@ -671,8 +671,8 @@ class AiKeyInboxTests(unittest.TestCase):
         with unittest.mock.patch("os.fstat", side_effect=patched):
             request_id = self.put(key=self.key)
             self.process()
-            self.assertEqual(
-                self.result(request_id)["error"], "unsafe ai-key directory"
+            self.assertTrue(
+                self.result(request_id)["error"].startswith("unsafe ai-key directory")
             )
         (directory / "marker.txt").write_text("x")
         for child in directory.iterdir():
@@ -685,25 +685,34 @@ class AiKeyInboxTests(unittest.TestCase):
         self.assertFalse((self.admin / "ai-key.json").exists())
 
     def test_key_file_gets_exact_owner_and_mode(self):
-        with unittest.mock.patch("os.fchown") as fchown:
+        # No privileged repair: the controller never changes ownership, so
+        # any chown attempt fails the test; the caller-owned file is 0600.
+        def no_privileged_repair(*args, **kwargs):
+            raise AssertionError("controller must not change ownership")
+
+        with (
+            unittest.mock.patch("os.chown", side_effect=no_privileged_repair),
+            unittest.mock.patch("os.fchown", side_effect=no_privileged_repair),
+        ):
             request_id = self.put(key=self.key)
             self.process()
             self.assertTrue(self.result(request_id)["ok"])
-        owner_calls = [
-            call
-            for call in fchown.call_args_list
-            if call[0][1:] == (os.getuid(), os.getgid())
-        ]
-        # The pinned directory and the staged tmp are both owned through fds.
-        self.assertEqual(len(owner_calls), 2)
         self.assertEqual((PRODUCTION_KEY_UID, PRODUCTION_KEY_GID), (1000, 1000))
+        info = self.key_file().stat()
+        self.assertEqual(
+            (stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid),
+            (0o600, os.getuid(), os.getgid()),
+        )
         self.assertEqual(self.key_file().read_text(), self.key)
 
     def test_failed_key_write_leaves_no_partial_key(self):
         real_fsync = os.fsync
 
         def full_disk(fd):
-            if "openrouter.key" in os.readlink(f"/proc/self/fd/{fd}"):
+            # The secret is staged unnamed (O_TMPFILE): its /proc/self/fd
+            # link carries "(deleted)" until linked. Failing fsync there must
+            # leave no published key and no staged remnant behind.
+            if "(deleted)" in os.readlink(f"/proc/self/fd/{fd}"):
                 raise OSError(28, "No space left on device")
             return real_fsync(fd)
 

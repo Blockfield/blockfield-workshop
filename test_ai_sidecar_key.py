@@ -77,8 +77,17 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ensure_ai_sidecar_key(self.base)
 
-    def test_tolerates_unprivileged_chown(self):
-        with mock.patch("controller.os.fchown", side_effect=PermissionError):
+    def test_never_changes_ownership(self):
+        """No privileged repair anywhere in the AI key code: any chown/fchown
+        attempt fails the test. Create and adopt run caller-owned, 0600."""
+
+        def no_privileged_repair(*args, **kwargs):
+            raise AssertionError("controller must not change ownership")
+
+        with (
+            mock.patch("os.chown", side_effect=no_privileged_repair),
+            mock.patch("os.fchown", side_effect=no_privileged_repair),
+        ):
             first = ensure_ai_sidecar_key(self.base)
             self.assertTrue(AI_SIDECAR_KEY_PATTERN.fullmatch(first.read_text()))
             self.assertEqual(first.stat().st_mode & 0o777, 0o600)
@@ -88,23 +97,16 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
     def test_unprivileged_run_keeps_caller_owned_directory(self):
         directory = self.base / "blockfield-workshop"
         directory.mkdir(parents=True)
-        with (
-            mock.patch("controller.AI_KEY_UID", 1999),
-            mock.patch("controller.AI_KEY_GID", 1999),
-            mock.patch("controller.os.geteuid", return_value=1000),
-        ):
+        with mock.patch("controller.os.geteuid", return_value=os.getuid()):
             ensure_ai_sidecar_key(self.base)  # must not raise for the caller-owned dir
 
     def test_privileged_run_still_fails_closed_on_foreign_directory(self):
         directory = self.base / "blockfield-workshop"
         directory.mkdir(parents=True)
-        with (
-            mock.patch("controller.AI_KEY_UID", 1999),
-            mock.patch("controller.AI_KEY_GID", 1999),
-            mock.patch("controller.os.geteuid", return_value=0),
-        ):
-            with self.assertRaises(ValueError):
+        with mock.patch("controller.os.geteuid", return_value=0):
+            with self.assertRaises(ValueError) as caught:
                 ensure_ai_sidecar_key(self.base)
+        self.assertIn("workshop user", str(caught.exception))
 
     def test_rejects_symlinked_directory(self):
         """A dir-writer replacing blockfield-workshop with a symlink must not
@@ -163,8 +165,10 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         """A dir-writer swapping the directory for a symlink mid-harden must
         not move ownership/mode changes onto the target (r4520336542, r3).
 
-        The directory fd is pinned before any chown, so the swap lands on a
-        path nothing else uses; the victim keeps content and 0644.
+        The directory fd is pinned before any harden, so the swap lands on a
+        path nothing else uses; the victim keeps content and 0644. The swap
+        now fires inside os.fchmod (the only fd-based harden left: no chown
+        exists anymore to hook).
         """
         path = self.key_path()
         path.parent.mkdir(parents=True)
@@ -172,19 +176,20 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         victim = self.dir / "victim.txt"
         victim.write_text("victim-content-here-0123456789ABCD")
         os.chmod(victim, 0o644)
-        real_fchown = os.fchown
+        real_fchmod = os.fchmod
         swapped: list = []
 
-        def swapping_fchown(fd, *args):
+        def swapping_fchmod(fd, *args, **kwargs):
             if not swapped:
                 swapped.append(True)
                 directory = path.parent
                 directory.rename(self.dir / "stashed-workshop-dir")
                 directory.symlink_to(victim)
-            return real_fchown(fd, *args)
+            return real_fchmod(fd, *args, **kwargs)
 
-        with mock.patch("controller.os.fchown", side_effect=swapping_fchown):
+        with mock.patch("controller.os.fchmod", side_effect=swapping_fchmod):
             ensure_ai_sidecar_key(self.base)
+        self.assertTrue(swapped)
         self.assertEqual(victim.read_text(), "victim-content-here-0123456789ABCD")
         self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
 
@@ -212,21 +217,9 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
             real_link(source, destination, *args, **kwargs)
             if Path(destination).name != AI_SIDECAR_KEY_NAME:
                 return
-            src_fd = kwargs.get("src_dir_fd")
-            if src_fd is not None and not os.path.isabs(source):
-                fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=src_fd)
-                try:
-                    payload = []
-                    while True:
-                        block = os.read(fd, 65536)
-                        if not block:
-                            break
-                        payload.append(block)
-                finally:
-                    os.close(fd)
-                data = b"".join(payload)
-            else:
-                data = Path(source).read_bytes()
+            # The winner is linked by descriptor (/proc/self/fd/N), still
+            # open at link time, so the payload is read straight through it.
+            data = Path(str(source)).read_bytes()
             with commit_lock:
                 committed.append(data)
 
@@ -256,6 +249,97 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         )
         for text in seen:
             self.assertIsNotNone(AI_SIDECAR_KEY_PATTERN.fullmatch(text))
+
+    def test_foreign_owned_directory_fails_closed_without_chown(self):
+        """A dir owned by another uid is refused WITHOUT any chown attempt
+        (r4521621942): the old code fchown-ed first and checked after. The
+        fake fstat seam simulates foreign ownership; no real root needed."""
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        real_fstat = os.fstat
+
+        class FakeStat:
+            def __init__(self, values):
+                self.st_mode, self.st_uid, self.st_gid, self.st_ino = values
+
+        def patched(fd, *args, **kwargs):
+            info = real_fstat(fd, *args, **kwargs)
+            try:
+                resolved = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                return info
+            if Path(resolved) == directory:
+                return FakeStat((info.st_mode, 4242, 4242, info.st_ino))
+            return info
+
+        def no_privileged_repair(*args, **kwargs):
+            raise AssertionError("controller must not change ownership")
+
+        with (
+            mock.patch("os.fstat", side_effect=patched),
+            mock.patch("os.chown", side_effect=no_privileged_repair),
+            mock.patch("os.fchown", side_effect=no_privileged_repair),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                ensure_ai_sidecar_key(self.base)
+        message = str(caught.exception)
+        self.assertIn("unsafe ai-sidecar-key directory", message)
+        self.assertIn("4242", message)  # found owner is reported
+        self.assertIn(str(self.base / "blockfield-workshop"), message)
+
+    def test_root_refuses_non_root_directory(self):
+        """A root controller adopts nothing owned by another user
+        (D3: confused-deputy case); the message names the remedy."""
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+
+        def no_privileged_repair(*args, **kwargs):
+            raise AssertionError("controller must not change ownership")
+
+        with (
+            mock.patch("controller.os.geteuid", return_value=0),
+            mock.patch("os.chown", side_effect=no_privileged_repair),
+            mock.patch("os.fchown", side_effect=no_privileged_repair),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                ensure_ai_sidecar_key(self.base)
+        self.assertIn("workshop user", str(caught.exception))
+
+    def test_group_writable_directory_fails_closed(self):
+        """Group/other write on the key dir is refused even when owned by us:
+        a writable dir lets another local user swap the key under us."""
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        os.chmod(directory, 0o775)
+        with self.assertRaises(ValueError) as caught:
+            ensure_ai_sidecar_key(self.base)
+        self.assertIn("unsafe ai-sidecar-key directory", str(caught.exception))
+
+    def test_create_publishes_no_named_tmp(self):
+        """The secret is staged unnamed (O_TMPFILE) and linked by descriptor:
+        at link time the directory holds no attacker-swappable tmp name
+        (r4521621949). The hook lists the pinned dir from inside os.link."""
+        (self.base / "blockfield-workshop").mkdir(parents=True)
+        real_link = os.link
+        observations: list = []
+
+        def observing_link(source, destination, *args, **kwargs):
+            observations.append((source, destination, kwargs.get("dst_dir_fd")))
+            dst_fd = kwargs.get("dst_dir_fd")
+            entries = os.listdir(dst_fd) if dst_fd is not None else []
+            self.assertEqual(entries, [], f"named tmp visible: {entries}")
+            self.assertTrue(
+                str(source).startswith("/proc/self/fd/"),
+                f"key staged by name, not descriptor: {source}",
+            )
+            return real_link(source, destination, *args, **kwargs)
+
+        with mock.patch("controller.os.link", side_effect=observing_link):
+            ensure_ai_sidecar_key(self.base)
+        self.assertTrue(observations)
+        self.assertIsNotNone(
+            AI_SIDECAR_KEY_PATTERN.fullmatch(self.key_path().read_text())
+        )
 
     def test_controller_init_ensures_key(self):
         inbox = self.dir / "inbox"

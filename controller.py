@@ -158,12 +158,32 @@ AI_SIDECAR_KEY_NAME = "ai-sidecar.key"
 AI_SIDECAR_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,2048}")
 
 
-def _fchown_ai_key(fd: int) -> None:
-    """Best-effort fchown to 1000:1000; unprivileged runs keep caller ownership."""
-    try:
-        os.fchown(fd, AI_KEY_UID, AI_KEY_GID)
-    except PermissionError:
-        pass  # tests and non-root runs: the key stays with the caller's ownership
+def _require_owned_ai_key_dir(dir_fd: int, *, kind: str, display: str) -> None:
+    """Fail closed unless the pinned key dir is owned by this user and quiet.
+
+    The controller never repairs ownership or mode: a foreign-owned or
+    group/world-writable directory is refused with the path, the found
+    owner/mode and the expectation. A root controller only adopts a
+    root-owned directory (the confused-deputy case); anything else tells
+    the operator to run as the workshop user instead.
+    """
+    info = os.fstat(dir_fd)
+    euid = os.geteuid()
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid == euid and not mode & 0o022:
+        return
+    if euid == 0:
+        remedy = "run the controller as the workshop user instead of root"
+    else:
+        remedy = (
+            f"run the controller as uid {info.st_uid} "
+            "or fix the ownership/mode outside the controller"
+        )
+    raise ValueError(
+        f"unsafe {kind} directory: {display} is owned by "
+        f"uid={info.st_uid} gid={info.st_gid} mode={mode:04o}; "
+        f"expected owner uid={euid} and no group/other write — {remedy}"
+    )
 
 
 def _open_pinned_ai_key_dir(base: Path, *, kind: str) -> tuple[int, int, bool]:
@@ -171,7 +191,7 @@ def _open_pinned_ai_key_dir(base: Path, *, kind: str) -> tuple[int, int, bool]:
 
     Both opens use O_DIRECTORY|O_NOFOLLOW, so a symlink planted in the
     attacker-writable data dir fails closed (ELOOP/ENOTDIR -> ValueError)
-    instead of redirecting a later root chown into another directory.
+    instead of redirecting later operations into another directory.
     Everything after must use dir_fd (dir_fd=), never a path. The caller
     closes both fds. Only failures to translate are ELOOP/ENOTDIR; anything
     else (EACCES, ENOSPC, ...) propagates exactly as a path open would.
@@ -212,18 +232,23 @@ def _open_pinned_ai_key_dir(base: Path, *, kind: str) -> tuple[int, int, bool]:
 _SIDECAR_KEY_MAX_BYTES = 65536
 
 
-def _read_ai_sidecar_key_fd(fd: int) -> str:
-    """Harden and read an open sidecar key through its descriptor, never its path.
+def _read_ai_sidecar_key_fd(fd: int, *, display: str) -> str:
+    """Adopt and read an open sidecar key through its descriptor, never its path.
 
     The caller opens with O_NOFOLLOW, so a symlink swapped in mid-harden can
-    never redirect the fchown/fchmod/read onto another file.
+    never redirect the fchmod/read onto another file. The key must already be
+    owned by this user (the controller never re-owns it); a mode wider than
+    0600 is narrowed on the descriptor, which is not privileged.
     """
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
         raise ValueError("invalid ai-sidecar key file")
-    try:
-        os.fchown(fd, AI_KEY_UID, AI_KEY_GID)
-    except PermissionError:
-        pass  # tests and non-root runs: the key stays with the caller's ownership
+    if info.st_uid != os.geteuid():
+        raise ValueError(
+            f"unsafe ai-sidecar key file: {display} is owned by "
+            f"uid={info.st_uid}; expected owner uid={os.geteuid()} — "
+            "run the controller as the key owner instead"
+        )
     os.fchmod(fd, 0o600)
     chunks = []
     total = 0
@@ -244,70 +269,75 @@ def _read_ai_sidecar_key_fd(fd: int) -> str:
     return text
 
 
-def _stage_ai_key_tmp(
-    dir_fd: int, filename: str, data: bytes, *, tolerate_chown: bool
-) -> str:
-    """Create a random 0600 tmp inside the pinned key dir and harden it via fd.
+def _stage_ai_key_tmpfile(dir_fd: int, data: bytes, *, kind: str) -> int:
+    """Write data to an unnamed 0600 file in the pinned key dir; return its fd.
 
-    O_EXCL|O_NOFOLLOW relative to dir_fd: the fixed destination name is the
-    only attacker-known name, and it is only ever reached by link/replace,
-    never by open. Returns the tmp name (relative to dir_fd).
+    O_TMPFILE means the secret never has a directory name while staged: no
+    path in the attacker-writable directory can be pre-planted or swapped
+    under it. The caller publishes it with os.link(/proc/self/fd/N, ...)
+    and closes the fd; an unpublished tmp vanishes on close, so a failed
+    write leaves nothing behind. Filesystems without O_TMPFILE fail closed:
+    there is no named-tmp fallback.
     """
-    tmp = f".{filename}-{secrets.token_hex(8)}"
-    fd = os.open(
-        tmp,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600,
-        dir_fd=dir_fd,
-    )
     try:
-        with os.fdopen(fd, "wb") as handle:
-            try:
-                os.fchown(handle.fileno(), AI_KEY_UID, AI_KEY_GID)
-            except PermissionError:
-                if not tolerate_chown:
-                    raise
-                # tests and non-root runs: the key stays with the caller's ownership
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        try:
-            os.unlink(tmp, dir_fd=dir_fd)
-        except FileNotFoundError:
-            pass
+        # The name is resolved against dir_fd and must name the directory
+        # itself; '.' cannot be a planted symlink.
+        fd = os.open(".", os.O_TMPFILE | os.O_WRONLY, 0o600, dir_fd=dir_fd)
+    except OSError as error:
+        if error.errno in (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL):
+            raise ValueError(
+                f"cannot stage {kind} key: filesystem lacks O_TMPFILE support"
+            ) from error
         raise
-    return tmp
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _commit_ai_sidecar_key(dir_fd: int, data: bytes) -> bool:
     """Link a fresh secret onto the key name without ever replacing it.
 
+    The staged inode is linked by descriptor (linkat AT_SYMLINK_FOLLOW,
+    no-replace), so no name window exists between staging and publication.
     Returns True when this call won the creation race; False when another
     process linked its key first (read the winner instead of rotating it).
     """
-    tmp = _stage_ai_key_tmp(dir_fd, AI_SIDECAR_KEY_NAME, data, tolerate_chown=True)
+    fd = _stage_ai_key_tmpfile(dir_fd, data, kind="ai-sidecar-key")
     try:
         try:
-            os.link(tmp, AI_SIDECAR_KEY_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.link(
+                f"/proc/self/fd/{fd}",
+                AI_SIDECAR_KEY_NAME,
+                dst_dir_fd=dir_fd,
+                follow_symlinks=True,
+            )
         except FileExistsError:
             return False
         os.fsync(dir_fd)
         return True
     finally:
-        try:
-            os.unlink(tmp, dir_fd=dir_fd)
-        except FileNotFoundError:
-            pass
+        os.close(fd)
 
 
 def _replace_ai_key(dir_fd: int, filename: str, data: bytes, *, kind: str) -> None:
     """Write data onto filename inside the pinned key dir, replacing any prior file.
 
-    The tmp is staged O_EXCL|O_NOFOLLOW via dir_fd and hardened through its
-    own fd; renameat replaces a planted symlink at the destination instead of
-    following it. Matches atomic_write(owner=...) semantics for this directory.
+    The secret is staged unnamed (O_TMPFILE), then linked to a random
+    unguessable name and renamed over the destination: rename replaces a
+    planted symlink at the destination instead of following it, and the
+    random name cannot be pre-planted. The remaining window (an attacker
+    listing the random name and swapping it in the microseconds between
+    link and rename) has no privileged consequence — nothing after this
+    point touches the destination by path with ownership or mode changes —
+    and at worst leaves a symlink the next operation's ELOOP probe refuses.
     A symlink already at the destination is refused outright (fail closed).
     """
     try:
@@ -324,7 +354,12 @@ def _replace_ai_key(dir_fd: int, filename: str, data: bytes, *, kind: str) -> No
         raise ValueError(f"unsafe {kind} path") from None
     else:
         os.close(probe)
-    tmp = _stage_ai_key_tmp(dir_fd, filename, data, tolerate_chown=False)
+    fd = _stage_ai_key_tmpfile(dir_fd, data, kind=kind)
+    tmp = f".{filename}-{secrets.token_hex(8)}"
+    try:
+        os.link(f"/proc/self/fd/{fd}", tmp, dst_dir_fd=dir_fd, follow_symlinks=True)
+    finally:
+        os.close(fd)
     try:
         os.replace(tmp, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         os.fsync(dir_fd)
@@ -347,13 +382,9 @@ def ensure_ai_sidecar_key(base: Path) -> Path:
     base_fd, dir_fd, created = _open_pinned_ai_key_dir(base, kind="ai-sidecar-key")
     try:
         if created:
+            # Our own directory (umask may have widened mkdir): fix via fd.
             os.fchmod(dir_fd, 0o755)
-        _fchown_ai_key(dir_fd)
-        info = os.fstat(dir_fd)
-        if os.geteuid() == 0 and (
-            info.st_uid != AI_KEY_UID or info.st_gid != AI_KEY_GID
-        ):
-            raise ValueError("unsafe ai-sidecar-key directory")
+        _require_owned_ai_key_dir(dir_fd, kind="ai-sidecar-key", display=str(path))
         # Pinned from here: the key file is only ever touched through dir_fd,
         # opened with O_NOFOLLOW|O_NONBLOCK (ELOOP fails closed, a FIFO can
         # never block startup: fstat must show a regular file before any
@@ -375,7 +406,7 @@ def ensure_ai_sidecar_key(base: Path) -> Path:
                 raise ValueError("unsafe ai-sidecar-key path") from None
             else:
                 try:
-                    _read_ai_sidecar_key_fd(fd)
+                    _read_ai_sidecar_key_fd(fd, display=str(path))
                 finally:
                     os.close(fd)
                 return path
@@ -3460,13 +3491,13 @@ class Controller:
             base_fd, dir_fd, created = _open_pinned_ai_key_dir(base, kind=kind)
             try:
                 if created:
-                    # Same hardening the old mkdir branch did, through the fd.
+                    # Our own directory (umask may have widened mkdir): fix via fd.
                     os.fchmod(dir_fd, 0o755)
-                    os.fchown(dir_fd, AI_KEY_UID, AI_KEY_GID)
-                else:
-                    info = os.fstat(dir_fd)
-                    if info.st_uid != AI_KEY_UID or info.st_gid != AI_KEY_GID:
-                        raise ValueError(f"unsafe {kind} directory")
+                _require_owned_ai_key_dir(
+                    dir_fd,
+                    kind=kind,
+                    display=f"{base}/blockfield-workshop",
+                )
                 if key is None:
                     try:
                         os.unlink(filename, dir_fd=dir_fd)
