@@ -1,10 +1,12 @@
 """Controller-written AI sidecar key (server#321 U-W1)."""
 
+import io
 import os
 import stat
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -325,14 +327,51 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
             ensure_ai_sidecar_key(self.base)
 
     def test_group_writable_directory_fails_closed(self):
-        """Group/other write on the key dir is refused even when owned by us:
-        a writable dir lets another local user swap the key under us."""
+        """Write by another group or by others on the key dir is refused even
+        when owned by us: it lets another local user swap the key under us."""
         directory = self.base / "blockfield-workshop"
         directory.mkdir(parents=True)
         os.chmod(directory, 0o775)
-        with self.assertRaises(ValueError) as caught:
-            ensure_ai_sidecar_key(self.base)
+        with mock.patch("controller.AI_KEY_GID", os.getgid() + 1):
+            with self.assertRaises(ValueError) as caught:
+                ensure_ai_sidecar_key(self.base)
         self.assertIn("unsafe ai-sidecar-key directory", str(caught.exception))
+        os.chmod(directory, 0o757)
+        with mock.patch("controller.AI_KEY_GID", os.getgid()):
+            with self.assertRaises(ValueError):
+                ensure_ai_sidecar_key(self.base)
+
+    def test_own_group_writable_directory_is_accepted(self):
+        """Prod's data dir is 0775 owned by the workshop uid and gid: group
+        write by the key owner's own group is not a foreign writer."""
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        os.chmod(directory, 0o775)
+        with mock.patch("controller.AI_KEY_GID", os.getgid()):
+            ensure_ai_sidecar_key(self.base)
+        self.assertTrue(self.key_path().is_file())
+
+    def test_controller_starts_when_the_key_directory_is_unusable(self):
+        """The sidecar key is optional: an unsafe key dir is logged, and the
+        controller (wake, inbox, gate) still starts."""
+        inbox = self.dir / "inbox"
+        inbox.mkdir()
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        os.chmod(directory, 0o777)
+        with redirect_stderr(io.StringIO()) as err:
+            Controller(
+                self.dir / "state",
+                FakeBackend(),
+                gate_file=self.dir / "gate.json",
+                public_file=self.dir / "public.json",
+                admin_dir=self.dir / "admin",
+                inbox_dir=inbox,
+                workshop_data_dir=self.base,
+                releases=catalog(),
+            )
+        self.assertIn("ai-sidecar key unavailable", err.getvalue())
+        self.assertFalse(self.key_path().exists())
 
     def test_create_publishes_no_named_tmp(self):
         """The secret is staged unnamed (O_TMPFILE) and linked by descriptor:
