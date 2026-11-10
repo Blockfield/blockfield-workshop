@@ -1,10 +1,12 @@
 """Controller-written AI sidecar key (server#321 U-W1)."""
 
+import io
 import os
 import stat
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -333,6 +335,28 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             ensure_ai_sidecar_key(self.base)
         self.assertIn("unsafe ai-sidecar-key directory", str(caught.exception))
+
+    def test_controller_starts_when_the_key_directory_is_unusable(self):
+        """The sidecar key is optional: an unsafe key dir is logged, and the
+        controller (wake, inbox, gate) still starts."""
+        inbox = self.dir / "inbox"
+        inbox.mkdir()
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        os.chmod(directory, 0o777)
+        with redirect_stderr(io.StringIO()) as err:
+            Controller(
+                self.dir / "state",
+                FakeBackend(),
+                gate_file=self.dir / "gate.json",
+                public_file=self.dir / "public.json",
+                admin_dir=self.dir / "admin",
+                inbox_dir=inbox,
+                workshop_data_dir=self.base,
+                releases=catalog(),
+            )
+        self.assertIn("ai-sidecar key unavailable", err.getvalue())
+        self.assertFalse(self.key_path().exists())
 
     def test_create_publishes_no_named_tmp(self):
         """The secret is staged unnamed (O_TMPFILE) and linked by descriptor:

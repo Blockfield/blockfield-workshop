@@ -752,7 +752,15 @@ class Controller:
         self.backend = backend
         base = self._workshop_data_base()
         if base is not None:
-            ensure_ai_sidecar_key(base)
+            # The AI sidecar is optional: an unusable key directory must not take
+            # the whole controller (wake, inbox, gate) down with it. Nothing is
+            # written then; the sidecar must not be deployed until this passes.
+            try:
+                ensure_ai_sidecar_key(base)
+            except (OSError, ValueError) as error:
+                print(
+                    f"controller: ai-sidecar key unavailable: {error}", file=sys.stderr
+                )
         # Gate-report delivery state (unit CPP3-R4): files are the only
         # truth. gate_pending.json = {seq, leg} desired-but-undelivered;
         # gate_delivered.json = {seq, leg} last confirmed on CP. No
