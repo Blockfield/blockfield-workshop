@@ -158,12 +158,58 @@ AI_SIDECAR_KEY_NAME = "ai-sidecar.key"
 AI_SIDECAR_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,2048}")
 
 
-def _chown_ai_key(path: Path) -> None:
-    """Best-effort chown to 1000:1000; unprivileged runs keep caller ownership."""
+def _fchown_ai_key(fd: int) -> None:
+    """Best-effort fchown to 1000:1000; unprivileged runs keep caller ownership."""
     try:
-        os.chown(path, AI_KEY_UID, AI_KEY_GID)
+        os.fchown(fd, AI_KEY_UID, AI_KEY_GID)
     except PermissionError:
         pass  # tests and non-root runs: the key stays with the caller's ownership
+
+
+def _open_pinned_ai_key_dir(base: Path, *, kind: str) -> tuple[int, int, bool]:
+    """Open <base>/blockfield-workshop once and pin it: (base_fd, dir_fd, created).
+
+    Both opens use O_DIRECTORY|O_NOFOLLOW, so a symlink planted in the
+    attacker-writable data dir fails closed (ELOOP/ENOTDIR -> ValueError)
+    instead of redirecting a later root chown into another directory.
+    Everything after must use dir_fd (dir_fd=), never a path. The caller
+    closes both fds. Only failures to translate are ELOOP/ENOTDIR; anything
+    else (EACCES, ENOSPC, ...) propagates exactly as a path open would.
+    """
+    try:
+        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        # Nothing privileged follows on base itself, so creating it by path
+        # before any fd exists is safe; the opens below still pin everything.
+        Path(base).mkdir(parents=True, exist_ok=True)
+        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError(f"unsafe {kind} directory") from error
+        raise
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        try:
+            dir_fd = os.open("blockfield-workshop", flags, dir_fd=base_fd)
+            created = False
+        except FileNotFoundError:
+            try:
+                os.mkdir("blockfield-workshop", 0o755, dir_fd=base_fd)
+            except FileExistsError:
+                pass  # a concurrent creator won the race; open the winner
+            dir_fd = os.open("blockfield-workshop", flags, dir_fd=base_fd)
+            created = True
+    except OSError as error:
+        os.close(base_fd)
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ValueError(f"unsafe {kind} directory") from error
+        raise
+    return base_fd, dir_fd, created
+
+
+# The validated key is at most 2048 chars; anything larger is invalid. The cap
+# also bounds the read: a sparse/huge regular file cannot stall startup.
+_SIDECAR_KEY_MAX_BYTES = 65536
 
 
 def _read_ai_sidecar_key_fd(fd: int) -> str:
@@ -180,11 +226,15 @@ def _read_ai_sidecar_key_fd(fd: int) -> str:
         pass  # tests and non-root runs: the key stays with the caller's ownership
     os.fchmod(fd, 0o600)
     chunks = []
+    total = 0
     while True:
         block = os.read(fd, 65536)
         if not block:
             break
         chunks.append(block)
+        total += len(block)
+        if total > _SIDECAR_KEY_MAX_BYTES:
+            raise ValueError("invalid ai-sidecar key file")
     try:
         text = b"".join(chunks).decode("utf-8").strip()
     except UnicodeDecodeError:
@@ -194,37 +244,95 @@ def _read_ai_sidecar_key_fd(fd: int) -> str:
     return text
 
 
-def _commit_ai_sidecar_key(directory: Path, path: Path, data: bytes) -> bool:
-    """Link a fresh secret onto the key path without ever replacing it.
+def _stage_ai_key_tmp(
+    dir_fd: int, filename: str, data: bytes, *, tolerate_chown: bool
+) -> str:
+    """Create a random 0600 tmp inside the pinned key dir and harden it via fd.
 
-    Returns True when this call won the creation race; False when another
-    process linked its key first (read the winner instead of rotating it).
+    O_EXCL|O_NOFOLLOW relative to dir_fd: the fixed destination name is the
+    only attacker-known name, and it is only ever reached by link/replace,
+    never by open. Returns the tmp name (relative to dir_fd).
     """
-    fd, temporary = tempfile.mkstemp(
-        prefix="." + AI_SIDECAR_KEY_NAME + "-", dir=directory
+    tmp = f".{filename}-{secrets.token_hex(8)}"
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=dir_fd,
     )
     try:
         with os.fdopen(fd, "wb") as handle:
             try:
                 os.fchown(handle.fileno(), AI_KEY_UID, AI_KEY_GID)
             except PermissionError:
-                pass  # tests and non-root runs: the key stays with the caller's ownership
+                if not tolerate_chown:
+                    raise
+                # tests and non-root runs: the key stays with the caller's ownership
             os.fchmod(handle.fileno(), 0o600)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+    except BaseException:
         try:
-            os.link(temporary, path)
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    return tmp
+
+
+def _commit_ai_sidecar_key(dir_fd: int, data: bytes) -> bool:
+    """Link a fresh secret onto the key name without ever replacing it.
+
+    Returns True when this call won the creation race; False when another
+    process linked its key first (read the winner instead of rotating it).
+    """
+    tmp = _stage_ai_key_tmp(dir_fd, AI_SIDECAR_KEY_NAME, data, tolerate_chown=True)
+    try:
+        try:
+            os.link(tmp, AI_SIDECAR_KEY_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except FileExistsError:
             return False
-        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.fsync(dir_fd)
         return True
     finally:
-        Path(temporary).unlink(missing_ok=True)
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _replace_ai_key(dir_fd: int, filename: str, data: bytes, *, kind: str) -> None:
+    """Write data onto filename inside the pinned key dir, replacing any prior file.
+
+    The tmp is staged O_EXCL|O_NOFOLLOW via dir_fd and hardened through its
+    own fd; renameat replaces a planted symlink at the destination instead of
+    following it. Matches atomic_write(owner=...) semantics for this directory.
+    A symlink already at the destination is refused outright (fail closed).
+    """
+    try:
+        probe = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=dir_fd,
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        if error.errno != errno.ELOOP:
+            raise
+        raise ValueError(f"unsafe {kind} path") from None
+    else:
+        os.close(probe)
+    tmp = _stage_ai_key_tmp(dir_fd, filename, data, tolerate_chown=False)
+    try:
+        os.replace(tmp, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    finally:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
 
 
 def ensure_ai_sidecar_key(base: Path) -> Path:
@@ -235,49 +343,50 @@ def ensure_ai_sidecar_key(base: Path) -> Path:
     action, not a controller step. Creation is exclusive with no replace, so
     concurrent starters converge on the winner's key. Anything else fails closed.
     """
-    directory, path = (
-        Path(base) / "blockfield-workshop",
-        Path(base) / f"blockfield-workshop/{AI_SIDECAR_KEY_NAME}",
-    )
+    path = Path(base) / f"blockfield-workshop/{AI_SIDECAR_KEY_NAME}"
+    base_fd, dir_fd, created = _open_pinned_ai_key_dir(base, kind="ai-sidecar-key")
     try:
-        info = os.stat(directory)
-    except FileNotFoundError:
-        directory.mkdir(mode=0o755, parents=True)
-        os.chmod(directory, 0o755)
-        _chown_ai_key(directory)
-    else:
-        if not stat.S_ISDIR(info.st_mode):
-            raise ValueError("unsafe ai-sidecar-key directory")
-        _chown_ai_key(directory)
-        info = os.stat(directory)
+        if created:
+            os.fchmod(dir_fd, 0o755)
+        _fchown_ai_key(dir_fd)
+        info = os.fstat(dir_fd)
         if os.geteuid() == 0 and (
             info.st_uid != AI_KEY_UID or info.st_gid != AI_KEY_GID
         ):
             raise ValueError("unsafe ai-sidecar-key directory")
-    # Check-free from here: the key file is only ever touched through an
-    # O_NOFOLLOW descriptor (ELOOP fails closed), and creation commits with
-    # os.link, which never replaces — the loser of a startup race reads the
-    # winner's key instead of rotating it.
-    for _ in range(3):
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            pass  # absent: create below, then converge on the winner
-        except OSError as error:
-            if error.errno != errno.ELOOP:
-                raise
-            raise ValueError("unsafe ai-sidecar-key path") from None
-        else:
+        # Pinned from here: the key file is only ever touched through dir_fd,
+        # opened with O_NOFOLLOW|O_NONBLOCK (ELOOP fails closed, a FIFO can
+        # never block startup: fstat must show a regular file before any
+        # read), and creation commits with os.link, which never replaces —
+        # the loser of a startup race reads the winner's key instead of
+        # rotating it.
+        for _ in range(3):
             try:
-                _read_ai_sidecar_key_fd(fd)
-            finally:
-                os.close(fd)
-            return path
-        data = secrets.token_urlsafe(32).encode()
-        assert AI_SIDECAR_KEY_PATTERN.fullmatch(data.decode())
-        if _commit_ai_sidecar_key(directory, path, data):
-            return path
-    raise ValueError("cannot establish ai-sidecar key file")
+                fd = os.open(
+                    AI_SIDECAR_KEY_NAME,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=dir_fd,
+                )
+            except FileNotFoundError:
+                pass  # absent: create below, then converge on the winner
+            except OSError as error:
+                if error.errno != errno.ELOOP:
+                    raise
+                raise ValueError("unsafe ai-sidecar-key path") from None
+            else:
+                try:
+                    _read_ai_sidecar_key_fd(fd)
+                finally:
+                    os.close(fd)
+                return path
+            data = secrets.token_urlsafe(32).encode()
+            assert AI_SIDECAR_KEY_PATTERN.fullmatch(data.decode())
+            if _commit_ai_sidecar_key(dir_fd, data):
+                return path
+        raise ValueError("cannot establish ai-sidecar key file")
+    finally:
+        os.close(dir_fd)
+        os.close(base_fd)
 
 
 # Provider registry ids (contract with the site): presets keep their historic key
@@ -3348,39 +3457,33 @@ class Controller:
                     base = apps["workshop"].data
             if base is None:
                 raise ValueError("workshop data directory is not configured")
-            directory, path = (
-                Path(base) / "blockfield-workshop",
-                Path(base) / f"blockfield-workshop/{filename}",
-            )
-            for node in (path, *path.parents):
-                if node.is_symlink():
-                    raise ValueError(f"unsafe {kind} path")
-                if node == Path(base):
-                    break
+            base_fd, dir_fd, created = _open_pinned_ai_key_dir(base, kind=kind)
             try:
-                info = os.stat(directory)
-            except FileNotFoundError:
-                directory.mkdir(mode=0o755)
-                os.chmod(directory, 0o755)
-                os.chown(directory, AI_KEY_UID, AI_KEY_GID)
-            else:
-                if (
-                    not stat.S_ISDIR(info.st_mode)
-                    or info.st_uid != AI_KEY_UID
-                    or info.st_gid != AI_KEY_GID
-                ):
-                    raise ValueError(f"unsafe {kind} directory")
-            if key is None:
-                path.unlink(missing_ok=True)
-                stored = {"set": False, "last4": "", "sha256Prefix": ""}
-            else:
-                data = key.encode()
-                atomic_write(path, data, owner=(AI_KEY_UID, AI_KEY_GID))
-                stored = {
-                    "set": True,
-                    "last4": key[-4:],
-                    "sha256Prefix": hashlib.sha256(data).hexdigest()[:8],
-                }
+                if created:
+                    # Same hardening the old mkdir branch did, through the fd.
+                    os.fchmod(dir_fd, 0o755)
+                    os.fchown(dir_fd, AI_KEY_UID, AI_KEY_GID)
+                else:
+                    info = os.fstat(dir_fd)
+                    if info.st_uid != AI_KEY_UID or info.st_gid != AI_KEY_GID:
+                        raise ValueError(f"unsafe {kind} directory")
+                if key is None:
+                    try:
+                        os.unlink(filename, dir_fd=dir_fd)
+                    except FileNotFoundError:
+                        pass
+                    stored = {"set": False, "last4": "", "sha256Prefix": ""}
+                else:
+                    data = key.encode()
+                    _replace_ai_key(dir_fd, filename, data, kind=kind)
+                    stored = {
+                        "set": True,
+                        "last4": key[-4:],
+                        "sha256Prefix": hashlib.sha256(data).hexdigest()[:8],
+                    }
+            finally:
+                os.close(dir_fd)
+                os.close(base_fd)
             applied_at = self._now_ms()
             atomic_write(
                 self.admin_dir / status_name,

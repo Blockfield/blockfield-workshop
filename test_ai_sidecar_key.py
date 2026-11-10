@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import controller
 from controller import (
     AI_SIDECAR_KEY_NAME,
     AI_SIDECAR_KEY_PATTERN,
@@ -79,7 +78,7 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
             ensure_ai_sidecar_key(self.base)
 
     def test_tolerates_unprivileged_chown(self):
-        with mock.patch("controller.os.chown", side_effect=PermissionError):
+        with mock.patch("controller.os.fchown", side_effect=PermissionError):
             first = ensure_ai_sidecar_key(self.base)
             self.assertTrue(AI_SIDECAR_KEY_PATTERN.fullmatch(first.read_text()))
             self.assertEqual(first.stat().st_mode & 0o777, 0o600)
@@ -107,24 +106,84 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ensure_ai_sidecar_key(self.base)
 
+    def test_rejects_symlinked_directory(self):
+        """A dir-writer replacing blockfield-workshop with a symlink must not
+        redirect the root chown into another directory (r4520435669)."""
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        victim = self.dir / "victim-dir"
+        victim.mkdir()
+        directory.rmdir()
+        directory.symlink_to(victim, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            ensure_ai_sidecar_key(self.base)
+        self.assertEqual(list(victim.iterdir()), [])
+
+    def test_fifo_key_fails_fast(self):
+        """A FIFO at the key name must fail closed, never block startup
+        (r4520435675): the workshop user can plant one in the key directory."""
+        path = self.key_path()
+        path.parent.mkdir(parents=True)
+        os.mkfifo(path)
+        outcome: list = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(self._ensure_outcome()),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive(), "key open blocked on a FIFO")
+        self.assertIsInstance(outcome[0], ValueError)
+
+    def _ensure_outcome(self):
+        try:
+            ensure_ai_sidecar_key(self.base)
+        except BaseException as error:  # collected, re-raised by the caller
+            return error
+        return None
+
+    def test_directory_key_fails_closed(self):
+        """A directory at the key name is not a key (guard: already rejected
+        before this round via the fstat regular-file check)."""
+        path = self.key_path()
+        path.parent.mkdir(parents=True)
+        path.mkdir()
+        with self.assertRaises(ValueError):
+            ensure_ai_sidecar_key(self.base)
+
+    def test_rejects_oversized_key(self):
+        """The read is bounded: a huge regular file is invalid, not loaded."""
+        path = self.key_path()
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"A" * 70000)
+        with self.assertRaises(ValueError):
+            ensure_ai_sidecar_key(self.base)
+
     def test_symlink_swap_during_harden_leaves_victim_alone(self):
-        """A dir-writer swapping the key for a symlink mid-harden must not
-        move ownership/mode changes onto the target (r4520336542)."""
+        """A dir-writer swapping the directory for a symlink mid-harden must
+        not move ownership/mode changes onto the target (r4520336542, r3).
+
+        The directory fd is pinned before any chown, so the swap lands on a
+        path nothing else uses; the victim keeps content and 0644.
+        """
         path = self.key_path()
         path.parent.mkdir(parents=True)
         path.write_text("operator-managed-secret-0123456789-_AB")
         victim = self.dir / "victim.txt"
         victim.write_text("victim-content-here-0123456789ABCD")
         os.chmod(victim, 0o644)
-        real_chown = os.chown
+        real_fchown = os.fchown
+        swapped: list = []
 
-        def swapping_chown(target, *args):
-            if Path(target) == path:
-                path.unlink()
-                path.symlink_to(victim)
-            return real_chown(target, *args)
+        def swapping_fchown(fd, *args):
+            if not swapped:
+                swapped.append(True)
+                directory = path.parent
+                directory.rename(self.dir / "stashed-workshop-dir")
+                directory.symlink_to(victim)
+            return real_fchown(fd, *args)
 
-        with mock.patch("controller.os.chown", side_effect=swapping_chown):
+        with mock.patch("controller.os.fchown", side_effect=swapping_fchown):
             ensure_ai_sidecar_key(self.base)
         self.assertEqual(victim.read_text(), "victim-content-here-0123456789ABCD")
         self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
@@ -147,20 +206,29 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         key = self.key_path()
         committed: list[bytes] = []
         commit_lock = threading.Lock()
-        real_atomic_write = controller.atomic_write
         real_link = os.link
-
-        def recording_atomic_write(target, data, *args, **kwargs):
-            if Path(target) == key:
-                with commit_lock:
-                    committed.append(bytes(data))
-            return real_atomic_write(target, data, *args, **kwargs)
 
         def recording_link(source, destination, *args, **kwargs):
             real_link(source, destination, *args, **kwargs)
-            if Path(destination) == key:
-                with commit_lock:
-                    committed.append(Path(source).read_bytes())
+            if Path(destination).name != AI_SIDECAR_KEY_NAME:
+                return
+            src_fd = kwargs.get("src_dir_fd")
+            if src_fd is not None and not os.path.isabs(source):
+                fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=src_fd)
+                try:
+                    payload = []
+                    while True:
+                        block = os.read(fd, 65536)
+                        if not block:
+                            break
+                        payload.append(block)
+                finally:
+                    os.close(fd)
+                data = b"".join(payload)
+            else:
+                data = Path(source).read_bytes()
+            with commit_lock:
+                committed.append(data)
 
         errors: list[BaseException] = []
         seen: list[str] = []
@@ -174,7 +242,6 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
 
         with (
             mock.patch("controller.secrets.token_urlsafe", side_effect=token_urlsafe),
-            mock.patch("controller.atomic_write", side_effect=recording_atomic_write),
             mock.patch("controller.os.link", side_effect=recording_link),
         ):
             threads = [threading.Thread(target=work) for _ in range(workers)]

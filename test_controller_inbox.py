@@ -643,7 +643,7 @@ class AiKeyInboxTests(unittest.TestCase):
         directory.symlink_to(linked, target_is_directory=True)
         cases.append(self.put(key=self.key))
         self.process()
-        self.assertEqual(self.result(cases[-1])["error"], "unsafe ai-key path")
+        self.assertEqual(self.result(cases[-1])["error"], "unsafe ai-key directory")
         self.assertEqual(target.read_text(), "untouched")
         self.assertEqual(list(linked.iterdir()), [])
         self.assertFalse(self.key_file().exists())
@@ -652,19 +652,23 @@ class AiKeyInboxTests(unittest.TestCase):
     def test_existing_directory_must_be_a_plain_owned_directory(self):
         directory = self.workshop_data / "blockfield-workshop"
         directory.mkdir()
-        real_stat = os.stat
+        real_fstat = os.fstat
 
         class FakeStat:
             def __init__(self, values):
                 self.st_mode, self.st_uid, self.st_gid, self.st_ino = values
 
-        def patched(path, *args, **kwargs):
-            info = real_stat(path, *args, **kwargs)
-            if Path(path) == directory:
+        def patched(fd, *args, **kwargs):
+            info = real_fstat(fd, *args, **kwargs)
+            try:
+                resolved = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                return info
+            if Path(resolved) == directory:
                 return FakeStat((info.st_mode, 4242, 4242, info.st_ino))
             return info
 
-        with unittest.mock.patch("os.stat", side_effect=patched):
+        with unittest.mock.patch("os.fstat", side_effect=patched):
             request_id = self.put(key=self.key)
             self.process()
             self.assertEqual(
@@ -681,16 +685,17 @@ class AiKeyInboxTests(unittest.TestCase):
         self.assertFalse((self.admin / "ai-key.json").exists())
 
     def test_key_file_gets_exact_owner_and_mode(self):
-        with (
-            unittest.mock.patch("os.chown") as chown,
-            unittest.mock.patch("os.fchown") as fchown,
-        ):
+        with unittest.mock.patch("os.fchown") as fchown:
             request_id = self.put(key=self.key)
             self.process()
             self.assertTrue(self.result(request_id)["ok"])
-        directory = self.workshop_data / "blockfield-workshop"
-        chown.assert_called_once_with(directory, os.getuid(), os.getgid())
-        self.assertEqual(fchown.call_args[0][1:], (os.getuid(), os.getgid()))
+        owner_calls = [
+            call
+            for call in fchown.call_args_list
+            if call[0][1:] == (os.getuid(), os.getgid())
+        ]
+        # The pinned directory and the staged tmp are both owned through fds.
+        self.assertEqual(len(owner_calls), 2)
         self.assertEqual((PRODUCTION_KEY_UID, PRODUCTION_KEY_GID), (1000, 1000))
         self.assertEqual(self.key_file().read_text(), self.key)
 
