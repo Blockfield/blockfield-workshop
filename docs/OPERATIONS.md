@@ -316,10 +316,11 @@ change both unit paths together with `BF_MAP_ARCHIVE_DIR`, `BF_CANDIDATES_DIR` a
 Changed files add blobs; unchanged files reuse hashes. A small full manifest contains `schema:1`, `mapId`,
 `kind`, `parent`, author/time/source, `worldDigest`, `files: {path: sha256}`, `changed` and `deleted`.
 Map history is linear: every manifest has exactly one parent (restores parent the restored-onto head).
-At startup `migrate_branches_to_snapshots()` converts every pre-linear named branch tip that differs from
-the map head into a named snapshot and then removes the branch ref; tips already at the head need no snapshot.
-Stale edited drafts on maps that had branch refs are preserved as `migrated-draft-<hex>` snapshots (unedited
-drafts need none: their content is already immutable history). Each draft is read after saves are held; a draft
+At startup `migrate_branches_to_snapshots()` first preserves every stale edited draft on
+a map that had branch refs as a `migrated-draft-<hex>` snapshot (unedited drafts need none:
+their content is already immutable history), and only then converts every pre-linear named
+branch tip that differs from the map head into a named snapshot and removes the branch ref;
+tips already at the head need no snapshot. Each draft is read after saves are held; a draft
 that cannot be paused is logged and left for the explicit `snapshot-copy` path.
 The migration runs under the controller lock, so concurrent CLI invocations cannot race on the refs.
 There is no automatic history/ZIP deletion or binary patch chain. Existing ZIPs/releases/schematics remain intact;
@@ -395,7 +396,8 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
 - `snapshot-copy {mapId, name, workingCopyId}` (admin) preserves a stale working-copy draft as a named
   snapshot: the draft's world is recorded parented at the copy's base and pinned, the copy itself is untouched.
   `checkout-fresh {mapId, workingCopyId}` materializes the current head into a new copy id (an existing id is
-  refused). Both read the draft only after saves are held, like `candidate`.
+  refused) and binds it to an archived session exactly like a session start, so the new copy is selectable
+  for editing through an archived resume. Both read the draft only after saves are held, like `candidate`.
 - `candidate {mapId, workingCopyId?, expectedHead?, note?}` snapshots the legacy draft or the identified SSD working copy,
   producing only CAS blobs, an immutable version manifest and metadata (`native:true`, `sha256:null`, `size:null`).
   `baseVersion` tracks the actual head/template or checkout's
@@ -424,7 +426,11 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   Acceptance and activation are distinct: if the final head write fails after acceptance, the accepted candidate
   can be retried with the same explicit expectedHead. The working-copy advance after activation is best
   effort: a failing advance is logged and leaves the copy stale, and the result reports the publish plus
-  `copyAdvanced:false`.
+  `copyAdvanced:false`. The final metadata rewrite after activation is best effort too: if it fails, the
+  result still reports the publish plus `metaSynced:false`. The committed state always derives from the
+  head itself, so retrying an already committed publication with the same explicit expectedHead reports
+  the committed publish instead of a stale head (a forced retry still refuses a stale head, since
+  force waives only the template-base guard).
   Reviews require the frozen `targetHead`; a changed target needs a fresh review.
   They reject `force`. Only an admin can publish or restore main.
 - `rollback {mapId, versionDigest, expectedHead}` restores that archived tree through a **new** commit parented to

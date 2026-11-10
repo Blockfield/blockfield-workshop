@@ -472,6 +472,19 @@ class MapStore:
             if resolutions is not None:
                 raise ValueError("linear map history accepts no conflict choices")
             map_id = meta["mapId"]
+            head = self.versions.head(map_id)
+            if (
+                expected_head is not None
+                and not force
+                and head is not None
+                and head["versionDigest"] == meta.get("versionDigest")
+            ):
+                # A retry of an already committed publication: the head itself
+                # proves the publish, so only best-effort work remains. A
+                # forced retry still refuses a stale head: force waives only
+                # the template-base guard, never the head CAS.
+                self._settle_publish(meta)
+                return meta
             self.versions.check_head(map_id, expected_head)
             # Pre-upgrade records carry baseVersion but no targetHead: their
             # target is derived from the immutable version's parent below.
@@ -520,21 +533,7 @@ class MapStore:
             # final at activation. A failing advance is logged and leaves the
             # copy stale (a stale copy is refused, never merged), and the
             # result reports the publish plus copyAdvanced False.
-            copy_advanced = True
-            if meta.get("workingCopyId") is not None:
-                try:
-                    copy_advanced = self.versions.advance_working_copy(
-                        map_id, meta["workingCopyId"], meta["versionDigest"]
-                    )
-                except Exception as error:
-                    copy_advanced = False
-                    print(
-                        "candidate: working copy advance failed after publish:"
-                        f" {error!r}",
-                        file=sys.stderr,
-                    )
-            meta["copyAdvanced"] = copy_advanced
-            self._write_meta(meta)
+            self._settle_publish(meta)
             return meta
         map_package.validate_playable(self._candidate_config(meta))
         if (
@@ -610,6 +609,38 @@ class MapStore:
         if expected_head is not ACCEPT_ONLY:
             self.activate(map_id, version, actor, expected_head)
         return meta
+
+    def _settle_publish(self, meta) -> None:
+        """Best-effort work after the activation commit point.
+
+        The publish is final at activation; only the working-copy advance and
+        the final metadata rewrite remain. Either may fail (e.g. disk full)
+        without unpublishing the head: the copy stays stale for the explicit
+        path, and the result reports the publish plus copyAdvanced False or
+        metaSynced False. The committed state itself always derives from the
+        head, never from this metadata.
+        """
+        copy_advanced = True
+        if meta.get("workingCopyId") is not None:
+            try:
+                copy_advanced = self.versions.advance_working_copy(
+                    meta["mapId"], meta["workingCopyId"], meta["versionDigest"]
+                )
+            except Exception as error:
+                copy_advanced = False
+                print(
+                    f"candidate: working copy advance failed after publish: {error!r}",
+                    file=sys.stderr,
+                )
+        meta["copyAdvanced"] = copy_advanced
+        try:
+            self._write_meta(meta)
+        except Exception as error:
+            meta["metaSynced"] = False
+            print(
+                f"candidate: publish metadata sync failed after activation: {error!r}",
+                file=sys.stderr,
+            )
 
     def reject(self, candidate_id: str, actor: dict) -> dict:
         meta = self._pending(candidate_id)
@@ -711,36 +742,42 @@ class MapStore:
             )
         return self.versions.create_snapshot(map_id, name, version, actor)
 
-    def checkout_fresh_copy(self, map_id: str, working_copy_id: str) -> dict:
+    def checkout_fresh_copy(
+        self, map_id: str, working_copy_id: str, actor: dict
+    ) -> dict:
         """Start from the current head: materialize it into a new copy id.
 
-        The draft is never read, but the copy lands on disk beside the live
+        The copy goes through the normal session path, so an archived session
+        record binds the new id exactly like a session start — an inbox
+        client can then select it for editing via an archived resume. The
+        draft is never read, but the copy lands on disk beside the live
         editor, so this also runs after hold_saves(). An existing id is
         refused rather than overwritten.
         """
+        target = self.versions.working_copy(map_id, working_copy_id)
+        if target.exists() or target.is_symlink():
+            raise ValueError("working copy already exists; resume it instead")
         with self.hold_saves():
-            head = self.versions.head(map_id)
-            if head is None:
-                raise ValueError(
-                    f"map {map_id} has no active head; import and activate it first"
-                )
-            return self.versions.checkout(
-                map_id, head["versionDigest"], working_copy_id
-            )
+            return self.prepare_session(working_copy_id, [map_id], actor=actor)[0]
 
     def migrate_branches_to_snapshots(self) -> dict:
         """Store-level linearization: branch refs plus stale legacy drafts.
 
-        Runs the archive migration, then preserves every stale edited draft on
-        a map that had legacy branch refs as a migrated-draft-<hex> snapshot
-        (the draft's content can no longer be committed, so without this it
-        would be silently lost). Each draft is read after hold_saves(); when
-        the editor cannot be paused the draft is logged and left for the
-        explicit snapshot_working_copy path. Unedited drafts need no snapshot:
-        their content is already immutable history. Assumes the controller
-        lock, like every other map mutation.
+        Drafts are preserved first (each snapshot written and fsynced before
+        the next), and the branch refs are removed only afterwards by the
+        archive migration — a stop between the steps keeps the refs, so the
+        rerun still finds and preserves every draft. Each step is idempotent
+        on rerun: an already preserved draft reuses its snapshot, and removed
+        refs stay removed. Every stale edited draft on a map that had legacy
+        branch refs is preserved as a migrated-draft-<hex> snapshot (the draft's content can no longer be
+        committed, so without this it would be silently lost). Each draft is
+        read after hold_saves(); when the editor cannot be paused the draft
+        is logged and left for the explicit snapshot_working_copy path.
+        Unedited drafts need no snapshot: their content is already immutable
+        history. Assumes the controller lock, like every other map mutation.
         """
         branch_authors: dict[str, dict] = {}
+        ref_maps: set[str] = set()
         root = self.versions.archive / "branches"
         if not root.is_symlink() and root.is_dir():
             for map_dir in sorted(root.iterdir()):
@@ -757,8 +794,7 @@ class MapStore:
                         and isinstance(value.get("createdBy"), dict)
                     ):
                         branch_authors.setdefault(map_dir.name, value["createdBy"])
-        summary = self.versions.migrate_branches_to_snapshots()
-        ref_maps = {entry["mapId"] for entry in summary["migrated"] + summary["atHead"]}
+                        ref_maps.add(map_dir.name)
         draft_snapshots, draft_skipped = [], []
         drafts = self.versions.active / "drafts"
         if ref_maps and not drafts.is_symlink() and drafts.is_dir():
@@ -848,16 +884,31 @@ class MapStore:
                         continue
                     if files == base_manifest["files"]:
                         continue
-                    version = self.versions._record(
-                        map_id,
-                        files,
-                        parent=base,
-                        author=actor,
-                        created_at=int(self._now() * 1000),
-                        source="snapshot",
-                        source_id=working_copy_id,
-                        note=f"Migrated stale draft of {map_id}",
-                    )
+                    version = None
+                    for already in self.versions.snapshots(map_id):
+                        if not already["name"].startswith("migrated-draft-"):
+                            continue
+                        if (
+                            self.versions.read(map_id, already["versionDigest"])[
+                                "files"
+                            ]
+                            == files
+                        ):
+                            # A rerun after a stop between the steps: the same
+                            # draft content already has a snapshot.
+                            version = already["versionDigest"]
+                            break
+                    if version is None:
+                        version = self.versions._record(
+                            map_id,
+                            files,
+                            parent=base,
+                            author=actor,
+                            created_at=int(self._now() * 1000),
+                            source="snapshot",
+                            source_id=working_copy_id,
+                            note=f"Migrated stale draft of {map_id}",
+                        )
                     name = f"migrated-draft-{version[:12]}"
                     try:
                         existing = self.versions.snapshot(map_id, name)
@@ -873,6 +924,10 @@ class MapStore:
                             "versionDigest": snap["versionDigest"],
                         }
                     )
+        # The branch refs go last: their snapshots are written and re-read
+        # inside, and only then is each ref removed — so every draft above is
+        # already preserved before the first ref disappears.
+        summary = self.versions.migrate_branches_to_snapshots()
         summary["draftSnapshots"] = draft_snapshots
         summary["draftSkipped"] = draft_skipped
         return summary

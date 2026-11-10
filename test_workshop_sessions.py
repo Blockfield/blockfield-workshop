@@ -443,6 +443,43 @@ class GitInboxTests(unittest.TestCase):
             self.assertIn("admin", result["error"])
         self.assertEqual(self.store.versions.head("arena"), self.heads["arena"])
 
+    def test_checkout_fresh_copy_is_bound_to_a_selectable_session(self):
+        # r4524380287 via the inbox: the fresh copy is selectable through an
+        # archived resume and editable through a later inbox commit.
+        fresh_id = str(uuid4())
+        fresh = self.send("checkout-fresh", mapId="arena", workingCopyId=fresh_id)
+        self.assertTrue(fresh["ok"], fresh["error"])
+        self.assertEqual(
+            fresh["payload"]["versionDigest"],
+            self.heads["arena"]["versionDigest"],
+        )
+        archived = self.store.session(fresh_id)
+        self.assertIsNotNone(archived)
+        self.assertEqual(archived["maps"], ["arena"])
+        resumed = self.send(
+            "mode",
+            actor=self.admin,
+            profile="workshop",
+            session="resume",
+            sessionId=fresh_id,
+            expectedRevision=self.controller.status()["revision"],
+        )
+        self.assertTrue(resumed["ok"], resumed["error"])
+        self.make_ready()
+        fresh_region = (
+            self.store.versions.working_copy("arena", fresh_id)
+            / "world/region/r.0.0.mca"
+        )
+        fresh_region.write_bytes(b"rebuilt on head")
+        committed = self.send(
+            "commit",
+            mapId="arena",
+            workingCopyId=fresh_id,
+            expectedHead=self.heads["arena"]["versionDigest"],
+            note="Rebuild on head",
+        )
+        self.assertTrue(committed["ok"], committed["error"])
+
     def test_snapshot_copy_and_checkout_fresh_recover_stale_copy(self):
         # Round 3 way out through the inbox: a stale session copy is refused,
         # snapshot-copy preserves its draft, checkout-fresh restarts from head.

@@ -721,11 +721,11 @@ class MapLinearTests(unittest.TestCase):
         # The way back in: a fresh copy from the current head, then publish.
         fresh_id = str(uuid4())
         with mock.patch.object(self.store, "hold_saves", hold):
-            fresh = self.store.checkout_fresh_copy("konstaxa", fresh_id)
+            fresh = self.store.checkout_fresh_copy("konstaxa", fresh_id, ACTOR)
             self.assertEqual(events[-2:], ["hold-enter", "hold-exit"])
         self.assertEqual(fresh["versionDigest"], first)
         with self.assertRaisesRegex(ValueError, "already exists"):
-            self.store.checkout_fresh_copy("konstaxa", second_id)
+            self.store.checkout_fresh_copy("konstaxa", second_id, ACTOR)
         fresh_bundle = Path(fresh["bundle"])
         (fresh_bundle / "world/region/r.0.0.mca").write_bytes(b"rebuilt on head")
         committed = self.commit(fresh_id, first)
@@ -855,6 +855,138 @@ class MapLinearTests(unittest.TestCase):
         self.assertEqual(
             (bundle / "world/region/r.0.0.mca").read_bytes(), b"second edit"
         )
+
+    def test_migration_preserves_drafts_before_removing_refs(self):
+        # r4524380270: every stale draft must be preserved before any branch
+        # ref is removed, so a stop between the steps loses nothing on rerun.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"branch work")
+        tip = self._publish_branch_tip(copy_id, bundle)
+        self._write_branch_ref("konstaxa", "work-old", tip, generation=2)
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"edit after publish")
+        real_migrate = self.versions.migrate_branches_to_snapshots
+        preserved_first = []
+
+        def spy():
+            preserved_first.append(
+                any(
+                    entry["name"].startswith("migrated-draft-")
+                    for entry in self.versions.snapshots("konstaxa")
+                )
+            )
+            return real_migrate()
+
+        with mock.patch.object(self.versions, "migrate_branches_to_snapshots", spy):
+            self.store.migrate_branches_to_snapshots()
+        self.assertEqual(preserved_first, [True])
+
+    def test_migration_crash_between_steps_reruns_cleanly(self):
+        # r4524380270: a crash after draft preservation but before ref removal
+        # keeps the refs; the rerun converges with no duplicate snapshots.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"branch work")
+        tip = self._publish_branch_tip(copy_id, bundle)
+        self._write_branch_ref("konstaxa", "work-old", tip, generation=2)
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"edit after publish")
+        ref_path = self.versions.archive / "branches" / "konstaxa" / "work-old.json"
+        with mock.patch.object(
+            self.versions,
+            "migrate_branches_to_snapshots",
+            side_effect=RuntimeError("crash between steps"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "crash between steps"):
+                self.store.migrate_branches_to_snapshots()
+        self.assertTrue(ref_path.is_file())
+        snaps = [
+            entry
+            for entry in self.versions.snapshots("konstaxa")
+            if entry["name"].startswith("migrated-draft-")
+        ]
+        self.assertEqual(len(snaps), 1)
+        preserved = self.versions.read("konstaxa", snaps[0]["versionDigest"])
+        self.assertEqual(
+            self.versions._verify_blob(
+                preserved["files"]["world/region/r.0.0.mca"]
+            ).read_bytes(),
+            b"edit after publish",
+        )
+        summary = self.store.migrate_branches_to_snapshots()
+        self.assertEqual(
+            summary["atHead"],
+            [{"mapId": "konstaxa", "name": "work-old", "versionDigest": tip}],
+        )
+        # Idempotent rerun: the preserved draft is reused, nothing new is
+        # recorded, and the refs are gone.
+        self.assertEqual(summary["draftSnapshots"], [])
+        self.assertFalse((self.versions.archive / "branches" / "konstaxa").exists())
+        self.assertEqual(
+            len(
+                [
+                    entry
+                    for entry in self.versions.snapshots("konstaxa")
+                    if entry["name"].startswith("migrated-draft-")
+                ]
+            ),
+            1,
+        )
+
+    def test_publish_meta_write_failure_after_activation_still_reports_success(
+        self,
+    ):
+        # r4524380282: everything after the activation commit point is best
+        # effort. A failed final metadata write reports success with a flag.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"first edit")
+        first = self.commit(copy_id, self.base)
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=first
+        )
+        real_write = self.store._write_meta
+        calls = []
+
+        def flaky(meta):
+            calls.append(True)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real_write(meta)
+
+        log = io.StringIO()
+        with mock.patch.object(self.store, "_write_meta", side_effect=flaky):
+            with redirect_stderr(log):
+                published = self.store.publish(
+                    review["id"], ACTOR, expected_head=self.base
+                )
+        self.assertEqual(published["status"], "accepted")
+        self.assertFalse(published.get("metaSynced", True))
+        self.assertIn("metadata", log.getvalue())
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], first)
+
+    def test_publish_retry_after_commit_reports_accepted(self):
+        # r4524380282: the committed state derives from the head itself, so
+        # retrying an already committed publication reports it as accepted.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"first edit")
+        first = self.commit(copy_id, self.base)
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=first
+        )
+        self.store.publish(review["id"], ACTOR, expected_head=self.base)
+        again = self.store.publish(review["id"], ACTOR, expected_head=self.base)
+        self.assertEqual(again["status"], "accepted")
+        self.assertEqual(again["versionDigest"], first)
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], first)
+
+    def test_checkout_fresh_copy_binds_session(self):
+        # r4524380287: the fresh copy goes through the normal session path, so
+        # an archived session record selects it for later inbox editing.
+        fresh_id = str(uuid4())
+        fresh = self.store.checkout_fresh_copy("konstaxa", fresh_id, ACTOR)
+        self.assertEqual(fresh["versionDigest"], self.base)
+        session = self.store.session(fresh_id)
+        self.assertIsNotNone(session)
+        self.assertEqual(session["maps"], ["konstaxa"])
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.store.checkout_fresh_copy("konstaxa", fresh_id, ACTOR)
 
     def test_forked_copy_is_not_rebased(self):
         # Same-function variant: a base outside the head's parent chain is a

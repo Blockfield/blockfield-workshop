@@ -3730,6 +3730,7 @@ class Controller:
                         result = self.maps.checkout_fresh_copy(
                             map_id,
                             document.get("workingCopyId"),
+                            actor,
                         )
                     elif kind == "snapshot-delete":
                         self.maps.versions.delete_snapshot(map_id, document.get("name"))
