@@ -287,8 +287,14 @@ class ZeroMapTests(unittest.TestCase):
             self.store.versions.head("new_map")["versionDigest"],
             committed["versionDigest"],
         )
-        with self.assertRaisesRegex(ValueError, "stale map head"):
-            self.store.publish(review["id"], ACTOR, expected_head=None)
+        # A retry of this candidate's own committed first publish is
+        # idempotent (same as for a non-null expectedHead), never "stale".
+        again = self.store.publish(review["id"], ACTOR, expected_head=None)
+        self.assertEqual(again["status"], "accepted")
+        self.assertEqual(
+            self.store.versions.head("new_map")["versionDigest"],
+            committed["versionDigest"],
+        )
 
     def test_archive_sync_failure_retains_complete_private_map_for_same_uuid_retry(
         self,
