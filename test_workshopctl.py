@@ -286,20 +286,20 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual(self.backend.events, ["start"])
         self.assertEqual(self.backend.processes[0].goal.profile, "game")
 
-    def test_named_branch_session_commit_compare_and_preview(self):
+    def test_linear_session_commit_compare_and_snapshot(self):
         store = workshopctl._map_store(os.environ, self.backend)
         before = store.versions.head("konstaxa")["versionDigest"]
-        code, branch = self.ctl(
-            "branch-create",
+        code, snap = self.ctl(
+            "snapshot-create",
             "--map-id",
             "konstaxa",
-            "--branch",
-            "editing",
+            "--name",
+            "milestone",
             "--version-digest",
             before,
         )
-        self.assertEqual(code, 0, branch)
-        self.assertEqual(branch["name"], "editing")
+        self.assertEqual(code, 0, snap)
+        self.assertEqual(snap["versionDigest"], before)
         copy_id = str(uuid4())
         code, state = self.ctl(
             "request",
@@ -310,12 +310,11 @@ class WorkshopctlTests(unittest.TestCase):
             copy_id,
             "--maps",
             "konstaxa",
-            "--branches",
-            "konstaxa=editing",
         )
         self.assertEqual(code, 0, state)
         selected = json.loads((self.root / "controller/session.json").read_text())
-        self.assertEqual(selected["branches"], {"konstaxa": "editing"})
+        self.assertEqual(selected["maps"], ["konstaxa"])
+        self.assertNotIn("branches", selected)
         self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
@@ -328,8 +327,6 @@ class WorkshopctlTests(unittest.TestCase):
             "commit",
             "--map-id",
             "konstaxa",
-            "--branch",
-            "editing",
             "--working-copy-id",
             copy_id,
             "--expected-head",
@@ -353,46 +350,31 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertIn(
             "world/region/r.0.0.mca", [entry["path"] for entry in diff["files"]]
         )
-        code, preview = self.ctl(
-            "merge-preview",
+        code, listed = self.ctl(
+            "snapshots",
             "--map-id",
             "konstaxa",
-            "--version-digest",
-            committed["versionDigest"],
-            "--expected-head",
-            before,
         )
-        self.assertEqual(code, 0, preview)
-        self.assertEqual(preview["unresolved"], [])
-        self.assertEqual(preview["targetVersion"], before)
+        self.assertEqual(code, 0, listed)
+        self.assertEqual([snap["name"] for snap in listed["snapshots"]], ["milestone"])
 
-    def test_branch_selection_validation_preserves_existing_editor(self):
+    def test_unknown_map_selection_preserves_existing_editor(self):
         self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()
         previous = (self.root / "controller/session.json").read_bytes()
         events = list(self.backend.events)
-        for branches in (
-            "konstaxa=main",
-            "konstaxa=../bad",
-            "konstaxa",
-            "konstaxa=missing",
-        ):
-            code, error = self.ctl(
-                "request",
-                "workshop",
-                "--session",
-                str(uuid4()),
-                "--maps",
-                "konstaxa",
-                "--branches",
-                branches,
-            )
-            self.assertEqual(code, 1, error)
-            self.assertEqual(
-                (self.root / "controller/session.json").read_bytes(), previous
-            )
-            self.assertEqual(self.backend.events, events)
+        code, error = self.ctl(
+            "request",
+            "workshop",
+            "--session",
+            str(uuid4()),
+            "--maps",
+            "missing",
+        )
+        self.assertEqual(code, 1, error)
+        self.assertEqual((self.root / "controller/session.json").read_bytes(), previous)
+        self.assertEqual(self.backend.events, events)
 
     def test_request_old_session_uuid_resumes_its_frozen_selection(self):
         self.ctl("request", "game", "--release", "v1.0.0")
@@ -414,7 +396,7 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual(code, 0, state)
         selected = json.loads((self.root / "controller/session.json").read_text())
         self.assertEqual(selected["maps"], original["maps"])
-        self.assertEqual(selected["branches"], original["branches"])
+        self.assertNotIn("branches", selected)
         self.ctl("request", "game", "--release", "v1.0.0")
         self.ctl("step")
         self.ready_editor()

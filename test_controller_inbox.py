@@ -290,15 +290,14 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(os.listdir(self.inbox), [])
         self.assertEqual(self.controller.message, "first")
 
-    def test_only_merge_requests_accept_large_exact_conflict_choices(self):
+    def test_only_publish_accepts_large_payloads(self):
         choices = {f"world/region/r.{index}.0.mca": "ours" for index in range(10000)}
-        for kind in ("merge-preview", "publish"):
-            request_id = self.put(kind, resolutions=choices)
-            path = self.inbox / f"{request_id}.json"
-            self.assertGreater(path.stat().st_size, 65536)
-            document, error = self.controller._load_request(path.name)
-            self.assertIsNone(error)
-            self.assertEqual(document["resolutions"], choices)
+        request_id = self.put("publish", resolutions=choices)
+        path = self.inbox / f"{request_id}.json"
+        self.assertGreater(path.stat().st_size, 65536)
+        document, error = self.controller._load_request(path.name)
+        self.assertIsNone(error)
+        self.assertEqual(document["resolutions"], choices)
         for kind in (
             "candidate",
             "commit",
@@ -314,12 +313,11 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(error, "request too large")
         self.assertEqual(self.backend.events, ["start"])
 
-    def test_extended_merge_limit_and_duplicate_json_keys_fail_closed(self):
-        for kind in ("merge-preview", "publish"):
-            request_id = self.put(kind, padding="x" * INBOX_MERGE_MAX_BYTES)
-            document, error = self.controller._load_request(f"{request_id}.json")
-            self.assertIsNone(document)
-            self.assertEqual(error, "request too large")
+    def test_extended_publish_limit_and_duplicate_json_keys_fail_closed(self):
+        request_id = self.put("publish", padding="x" * INBOX_MERGE_MAX_BYTES)
+        document, error = self.controller._load_request(f"{request_id}.json")
+        self.assertIsNone(document)
+        self.assertEqual(error, "request too large")
         request_id = str(uuid4())
         (self.inbox / f"{request_id}.json").write_bytes(
             b'{"schema":1,"kind":"message","kind":"publish"}'

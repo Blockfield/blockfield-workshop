@@ -1265,12 +1265,13 @@ class Controller:
             if (
                 choice != "resume"
                 or "maps" in document
-                or "branches" in document
                 or getattr(self.maps, "canonical_sessions", False) is not True
             ):
                 raise ValueError(
-                    "archived resume requires sessionId without map/branch overrides"
+                    "archived resume requires sessionId without map overrides"
                 )
+            # Pre-linear compat: a stale client may still send branches; the
+            # linear store tracks maps only, so the selection is ignored.
             archived = self.maps.session(document["sessionId"])
             if archived is None:
                 raise ValueError("archived session not found")
@@ -1307,15 +1308,16 @@ class Controller:
                 "startedBy": actor,
             }
         )
-        if "branches" in document:
-            if getattr(self.maps, "canonical_sessions", False) is not True:
-                raise ValueError("named branches require canonical sessions")
-            result["branches"] = document["branches"]
-        elif isinstance(maps, list) and "branches" in result:
-            result["branches"] = {
-                map_id: result["branches"].get(map_id, "work-" + result["id"])
-                for map_id in maps
-            }
+        # Pre-linear compat: named branch selections are accepted for shape
+        # and then ignored — one head per map. Live sessions keep working
+        # against their session-UUID working copies.
+        if "branches" in document and document["branches"] is not None:
+            branches = document["branches"]
+            if not isinstance(branches, dict) or any(
+                not isinstance(name, str) for name in branches.values()
+            ):
+                raise ValueError("invalid session branches")
+        result.pop("branches", None)
         return result
 
     def _save_session(self, session: dict) -> None:
@@ -1350,33 +1352,15 @@ class Controller:
             or set(maps) - self._map_ids()
         ):
             raise ValueError("invalid selected session maps")
-        from candidates import MapVersions
-
-        branches = session.get(
-            "branches",
-            previous.get("branches")
-            if resuming and "branches" in previous
-            else {map_id: "work-" + goal.session for map_id in maps},
-        )
-        if not isinstance(branches, dict) or set(branches) != set(maps):
-            raise ValueError("session branches must match selected maps")
-        for name in branches.values():
-            if MapVersions._branch_name(name) == "main":
-                raise ValueError("main is protected; select a work branch")
-        if resuming:
-            prior = previous.get(
-                "branches",
-                {
-                    map_id: "work-" + goal.session
-                    for map_id in previous.get("maps") or maps
-                },
-            )
-            if not isinstance(prior, dict) or any(
-                map_id in prior and prior[map_id] != name
-                for map_id, name in branches.items()
-            ):
-                raise ValueError("switching branches requires a new isolated session")
-        return {**session, "maps": maps, "branches": branches}
+        # Linear sessions track maps only. A pre-linear session (or document)
+        # may still carry branches; they are validated for shape and ignored.
+        branches = session.get("branches")
+        if branches is not None:
+            if not isinstance(branches, dict):
+                raise ValueError("invalid session branches")
+        result = {**session, "maps": maps}
+        result.pop("branches", None)
+        return result
 
     def _selected_session(
         self, goal: Goal, session: dict | None = None, *, resume_only=False
@@ -1386,7 +1370,6 @@ class Controller:
             goal.session,
             selected["maps"],
             resume_only=resume_only,
-            branches=selected["branches"],
             actor=selected.get("startedBy") or {"draslId": "host", "name": "host"},
         )
         return selected
@@ -3236,7 +3219,7 @@ class Controller:
         if len(data) > INBOX_MAX_BYTES and (
             not isinstance(document, dict)
             or not isinstance(document.get("kind"), str)
-            or document.get("kind") not in {"merge-preview", "publish"}
+            or document.get("kind") != "publish"
         ):
             return None, "request too large"
         if (
@@ -3272,18 +3255,24 @@ class Controller:
         note: str,
         *,
         working_copy_id=None,
-        branch=None,
-        expected_branch_head=None,
+        expected_head=None,
         commit=False,
         review=False,
         authorize=False,
+        branch=None,
+        expected_branch_head=None,
     ) -> dict:
+        # Pre-linear compat: branch/expected_branch_head are ignored; a branch
+        # tip is not a head, so it only ever feeds the head CAS (fail closed).
+        if expected_head is None and expected_branch_head is not None:
+            expected_head = expected_branch_head
         # Refuse a missing draft before issuing any save commands.
         options = (
             {"working_copy_id": working_copy_id} if working_copy_id is not None else {}
         )
-        if branch is None or commit:
-            self.maps.check(map_id, **options)
+        if expected_head is not None and not isinstance(expected_head, str):
+            raise ValueError("expectedHead must be a map version digest")
+        self.maps.check(map_id, **options)
         with self._locked():
             if authorize:
                 actor = self._map_actor(actor, map_id)
@@ -3304,24 +3293,10 @@ class Controller:
                         "snapshot requires the exact selected session and map"
                     )
                 self.maps.versions.validate_working_copy(map_id, working_copy_id)
-            if branch is not None or commit:
-                if getattr(self.maps, "canonical_sessions", False) is not True:
-                    raise ValueError("branch snapshots require canonical sessions")
-                if (
-                    not isinstance(note, str)
-                    or len(note) > 200
-                    or commit
-                    and not note.strip()
-                ):
-                    raise ValueError("commit message required (1–200 characters)")
-                if branch != selected.get("branches", {}).get(map_id):
-                    raise ValueError("snapshot requires the exact selected branch")
-                if (
-                    self.maps.versions.branch(map_id, branch)["versionDigest"]
-                    != expected_branch_head
-                ):
-                    raise ValueError("stale branch head: refresh before committing")
-                options.update(branch=branch, expected_branch_head=expected_branch_head)
+            if commit and (
+                not isinstance(note, str) or not note.strip() or len(note) > 200
+            ):
+                raise ValueError("commit message required (1–200 characters)")
             _, _, current = self._observe()
             if sleeping:
                 if current is not None:
@@ -3333,32 +3308,25 @@ class Controller:
             ):
                 raise RuntimeError("snapshot backend does not match controller state")
 
-            def take():
-                if commit:
-                    return self.maps.commit(
-                        map_id,
-                        actor,
-                        note,
-                        working_copy_id=working_copy_id,
-                        branch=branch,
-                        expected_head=expected_branch_head,
-                    )
-                return self.maps.create(map_id, actor, note, **options)
-
-            if branch is not None and not commit:
-                meta = self.maps.review(
+            # Asleep the drafts on disk are final; awake maps.hold_saves flushes the running editor
+            # and pauses autosave for the copy. Neither path restarts Workshop.
+            if commit:
+                meta = self.maps.commit(
                     map_id,
                     actor,
                     note,
                     working_copy_id=working_copy_id,
-                    branch=branch,
-                    expected_head=expected_branch_head,
+                    expected_head=expected_head,
                 )
-                self.export_maps()
-                return meta
-            # Asleep the drafts on disk are final; awake maps.hold_saves flushes the running editor
-            # and pauses autosave for the copy. Neither path restarts Workshop.
-            meta = take()
+            else:
+                meta = self.maps.create(
+                    map_id,
+                    actor,
+                    note,
+                    working_copy_id=working_copy_id,
+                    expected_head=expected_head,
+                    review=True,
+                )
             if review:
                 # The tablet's one button: commit what is built now, then review that commit.
                 meta = self.maps.review(
@@ -3366,7 +3334,6 @@ class Controller:
                     actor,
                     note,
                     working_copy_id=working_copy_id,
-                    branch=branch,
                     expected_head=meta["versionDigest"],
                 )
             self.export_maps()
@@ -3401,43 +3368,6 @@ class Controller:
         ):
             raise ValueError("map is outside the actor's scope")
         return {key: admitted[key] for key in ("draslId", "name")}
-
-    def _merge_preview(self, map_id, source, expected_head, resolutions=None) -> dict:
-        self.maps.versions.check_head(map_id, expected_head)
-        if expected_head is None:
-            if resolutions is not None and not isinstance(resolutions, dict):
-                raise ValueError("merge conflict choices must be an object")
-            if resolutions:
-                raise ValueError("initial publication has no merge conflict choices")
-            manifest = self.maps.versions.read(map_id, source)
-            config = self.maps.versions._config(manifest["files"])
-            changes = self.maps.versions._compare_files(
-                map_id, None, source, {}, manifest["files"], config
-            )
-            return {
-                "mapId": map_id,
-                "baseVersion": None,
-                "sourceVersion": source,
-                "targetVersion": None,
-                "conflicts": [],
-                "unresolved": [],
-                "changes": changes,
-            }
-        preview = self.maps.versions.merge_preview(
-            map_id, source, expected_head, resolutions
-        )
-        return {
-            key: preview[key]
-            for key in (
-                "mapId",
-                "baseVersion",
-                "sourceVersion",
-                "targetVersion",
-                "conflicts",
-                "unresolved",
-                "changes",
-            )
-        }
 
     def _map_change(self, request_id, document):
         if (
@@ -3663,10 +3593,11 @@ class Controller:
             "checkout",
             "export",
             "limbo-export",
-            "branch-create",
             "commit",
             "compare",
-            "merge-preview",
+            "snapshot-create",
+            "snapshot-delete",
+            "snapshots",
         }:
             force = document.get("force", False)
             if type(force) is not bool:
@@ -3695,7 +3626,15 @@ class Controller:
             actor = self._map_actor(
                 actor,
                 map_id,
-                admin=kind in {"publish", "reject", "rollback", "limbo-export"},
+                admin=kind
+                in {
+                    "publish",
+                    "reject",
+                    "rollback",
+                    "limbo-export",
+                    "snapshot-create",
+                    "snapshot-delete",
+                },
             )
             result = None
             if kind in {"candidate", "commit"}:
@@ -3706,19 +3645,29 @@ class Controller:
                     actor,
                     document.get("note", ""),
                     working_copy_id=document.get("workingCopyId"),
-                    branch=document.get("branch"),
-                    expected_branch_head=document.get("expectedBranchHead"),
+                    expected_head=document.get("expectedHead"),
                     # candidate {commit: true} is the tablet's commit-and-review in one request.
                     commit=kind == "commit" or document.get("commit") is True,
                     review=kind == "candidate" and document.get("commit") is True,
                     authorize=True,
+                    branch=document.get("branch"),
+                    expected_branch_head=document.get("expectedBranchHead"),
                 )
             elif kind == "limbo-export":
                 self.export_limbo(document.get("versionDigest"))
             else:
                 with self._locked():
                     actor = self._map_actor(
-                        actor, map_id, admin=kind in {"publish", "reject", "rollback"}
+                        actor,
+                        map_id,
+                        admin=kind
+                        in {
+                            "publish",
+                            "reject",
+                            "rollback",
+                            "snapshot-create",
+                            "snapshot-delete",
+                        },
                     )
                     if kind == "publish":
                         options = (
@@ -3726,18 +3675,6 @@ class Controller:
                             if "expectedHead" in document
                             else {}
                         )
-                        if meta.get("sourceBranch"):
-                            if force:
-                                raise ValueError(
-                                    "force cannot bypass map merge conflicts"
-                                )
-                            if (
-                                "expectedHead" in document
-                                and meta.get("targetHead") != document["expectedHead"]
-                            ):
-                                raise ValueError(
-                                    "review target changed; submit a new review"
-                                )
                         result = self.maps.publish(
                             document.get("candidateId"),
                             actor,
@@ -3755,24 +3692,24 @@ class Controller:
                         )
                     elif kind == "export":
                         self.maps.archive_path(document.get("candidateId"))
-                    elif kind == "branch-create":
-                        result = self.maps.versions.create_branch(
-                            map_id,
-                            document.get("branch"),
-                            document.get("versionDigest"),
-                            actor,
-                        )
                     elif kind == "compare":
                         result = self.maps.versions.compare(
                             map_id, document.get("before"), document.get("after")
                         )
-                    elif kind == "merge-preview":
-                        result = self._merge_preview(
+                    elif kind == "snapshot-create":
+                        result = self.maps.versions.create_snapshot(
                             map_id,
+                            document.get("name"),
                             document.get("versionDigest"),
-                            document.get("expectedHead"),
-                            document.get("resolutions"),
+                            actor,
                         )
+                    elif kind == "snapshot-delete":
+                        self.maps.versions.delete_snapshot(map_id, document.get("name"))
+                    elif kind == "snapshots":
+                        result = {
+                            "mapId": map_id,
+                            "snapshots": self.maps.versions.snapshots(map_id),
+                        }
                     else:
                         if "expectedHead" not in document:
                             raise ValueError(

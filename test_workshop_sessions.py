@@ -192,13 +192,9 @@ class WorkshopSessionTests(unittest.TestCase):
         self.controller.export_maps()
         catalog = json.loads(catalog_path.read_bytes())
         self.assertIn(copy_id, {session["id"] for session in catalog["sessions"]})
-        refs = {
-            entry["mapId"]: {branch["name"] for branch in entry["branches"]}
-            for entry in catalog["maps"]
-        }
-        for session in catalog["sessions"]:
-            for map_id, branch in session["branches"].items():
-                self.assertIn(branch, refs[map_id])
+        for entry in catalog["maps"]:
+            self.assertIn("snapshots", entry)
+            self.assertNotIn("branches", entry)
 
     def test_removed_copy_is_refused_before_drain_or_start(self):
         copy_id = self.request(maps=["arena"])
@@ -238,25 +234,20 @@ class WorkshopSessionTests(unittest.TestCase):
         copy_id = self.request(maps=["arena"])
         self.make_ready()
         events = list(self.backend.events)
+        actor = {"draslId": "t" * 32, "name": "tester"}
         for selected in (None, str(uuid4())):
             with self.assertRaises((ValueError, FileNotFoundError)):
-                self.controller._snapshot(
-                    "arena", {"name": "tester"}, "", working_copy_id=selected
-                )
+                self.controller._snapshot("arena", actor, "", working_copy_id=selected)
             self.assertEqual(self.backend.events, events)
         self.store.prepare_session(copy_id, ["lobby"])
         with self.assertRaisesRegex(ValueError, "selected"):
-            self.controller._snapshot(
-                "lobby", {"name": "tester"}, "", working_copy_id=copy_id
-            )
+            self.controller._snapshot("lobby", actor, "", working_copy_id=copy_id)
         region = (
             self.store.versions.working_copy("arena", copy_id)
             / "world/region/r.0.0.mca"
         )
         region.write_bytes(b"saved draft")
-        result = self.controller._snapshot(
-            "arena", {"name": "tester"}, "", working_copy_id=copy_id
-        )
+        result = self.controller._snapshot("arena", actor, "", working_copy_id=copy_id)
         self.assertEqual(result["workingCopyId"], copy_id)
         self.assertEqual(result["baseVersion"], self.heads["arena"]["versionDigest"])
         self.assertEqual(self.backend.events[-3:], ["save", "stop", "start"])
@@ -299,7 +290,6 @@ class GitInboxTests(unittest.TestCase):
             ]
         )
         self.session = self.controller.session()
-        self.branch = self.session["branches"]["arena"]
         self.copy = self.store.versions.working_copy("arena", self.session["id"])
         self.region = self.copy / "world/region/r.0.0.mca"
         self.game = self.backend.processes[0]
@@ -322,15 +312,17 @@ class GitInboxTests(unittest.TestCase):
             (self.root / "admin/results" / f"{request_id}.json").read_text()
         )
 
+    def head(self):
+        return self.store.versions.head("arena")["versionDigest"]
+
     def commit(self, content, **options):
         self.region.write_bytes(content)
-        expected = self.store.versions.branch("arena", self.branch)["versionDigest"]
+        expected = self.head()
         result = self.send(
             "commit",
             mapId="arena",
-            branch=self.branch,
             workingCopyId=self.session["id"],
-            expectedBranchHead=expected,
+            expectedHead=expected,
             note="Update arena",
             **options,
         )
@@ -339,29 +331,31 @@ class GitInboxTests(unittest.TestCase):
         return result["payload"]
 
     def test_sequential_commits_and_frozen_review_keep_game_and_editable_copy(self):
-        first = self.commit(b"first edit")
-        reviewed = self.send(
+        self.region.write_bytes(b"first edit")
+        submitted = self.send(
             "candidate",
             mapId="arena",
-            branch=self.branch,
             workingCopyId=self.session["id"],
-            expectedBranchHead=first["versionDigest"],
+            expectedHead=self.heads["arena"]["versionDigest"],
             note="Review first edit",
+            commit=True,
         )
-        self.assertTrue(reviewed["ok"], reviewed["error"])
-        review = reviewed["payload"]
+        self.assertTrue(submitted["ok"], submitted["error"])
+        review = submitted["payload"]
+        first = review["versionDigest"]
         self.assertEqual(review["targetHead"], self.heads["arena"]["versionDigest"])
         self.make_ready()
         second = self.commit(b"second edit")
-        self.assertNotEqual(first["versionDigest"], second["versionDigest"])
+        self.assertNotEqual(first, second["versionDigest"])
+        # Linear history: every commit parents the head, which only publish moves.
         self.assertEqual(
             self.store.versions.read("arena", second["versionDigest"])["parent"],
-            first["versionDigest"],
+            self.heads["arena"]["versionDigest"],
         )
         persisted_review = next(
             item for item in self.store.list() if item["id"] == review["id"]
         )
-        self.assertEqual(persisted_review["versionDigest"], first["versionDigest"])
+        self.assertEqual(persisted_review["versionDigest"], first)
         accepted = self.send(
             "publish",
             actor=self.admin,
@@ -375,28 +369,22 @@ class GitInboxTests(unittest.TestCase):
             b"first edit",
         )
         self.assertEqual(self.region.read_bytes(), b"second edit")
-        self.assertEqual(
-            self.store.versions.branch("arena", self.branch)["versionDigest"],
-            second["versionDigest"],
-        )
+        self.assertEqual(head["versionDigest"], first)
         self.assertIn(self.game, self.backend.processes)
         self.assertEqual(self.backend.events, [])
 
-    def test_stale_head_wrong_copy_and_branch_fail_before_backend_mutation(self):
+    def test_stale_head_and_wrong_copy_fail_before_backend_mutation(self):
         first = self.commit(b"committed")
         events = list(self.backend.events)
         base = dict(
             mapId="arena",
-            branch=self.branch,
             workingCopyId=self.session["id"],
-            expectedBranchHead=first["versionDigest"],
+            expectedHead=first["versionDigest"],
             note="Update",
         )
         for change in (
-            {"expectedBranchHead": self.heads["arena"]["versionDigest"]},
+            {"expectedHead": "f" * 64},
             {"workingCopyId": str(uuid4())},
-            {"branch": "main"},
-            {"branch": "other"},
             {"note": ""},
         ):
             with self.subTest(change=change):
@@ -422,18 +410,19 @@ class GitInboxTests(unittest.TestCase):
         self.assertEqual(self.backend.events, [])
         self.assertIn(self.game, self.backend.processes)
 
-    def test_builder_cannot_merge_reject_or_restore_main(self):
-        first = self.commit(b"edit")
-        reviewed = self.send(
+    def test_builder_cannot_publish_reject_or_restore_main(self):
+        self.region.write_bytes(b"edit")
+        submitted = self.send(
             "candidate",
             mapId="arena",
-            branch=self.branch,
             workingCopyId=self.session["id"],
-            expectedBranchHead=first["versionDigest"],
+            expectedHead=self.heads["arena"]["versionDigest"],
+            note="Review",
+            commit=True,
         )
-        self.assertTrue(reviewed["ok"], reviewed["error"])
+        self.assertTrue(submitted["ok"], submitted["error"])
         self.make_ready()
-        review = reviewed["payload"]
+        review = submitted["payload"]
         for kind, fields in (
             (
                 "publish",
@@ -454,23 +443,26 @@ class GitInboxTests(unittest.TestCase):
             self.assertIn("admin", result["error"])
         self.assertEqual(self.store.versions.head("arena"), self.heads["arena"])
 
-    def test_review_uses_existing_commit_without_saving_uncommitted_world_edits(self):
+    def test_candidate_snapshots_current_draft_instead_of_reusing_commit(self):
         first = self.commit(b"committed bytes")
         self.region.write_bytes(b"uncommitted bytes")
         events = list(self.backend.events)
-        reviewed = self.send(
+        snapshotted = self.send(
             "candidate",
             mapId="arena",
-            branch=self.branch,
             workingCopyId=self.session["id"],
-            expectedBranchHead=first["versionDigest"],
+            expectedHead=self.heads["arena"]["versionDigest"],
         )
-        self.assertTrue(reviewed["ok"], reviewed["error"])
-        self.assertEqual(reviewed["payload"]["versionDigest"], first["versionDigest"])
-        self.assertEqual(
-            self.store.versions.branch("arena", self.branch)["versionDigest"],
-            first["versionDigest"],
+        self.assertTrue(snapshotted["ok"], snapshotted["error"])
+        # Linear candidates always snapshot the current draft; the earlier
+        # commit is superseded, not reused.
+        self.assertNotEqual(
+            snapshotted["payload"]["versionDigest"], first["versionDigest"]
         )
+        manifest = self.store.versions.read(
+            "arena", snapshotted["payload"]["versionDigest"]
+        )
+        self.assertEqual(manifest["parents"], [self.heads["arena"]["versionDigest"]])
         self.assertEqual(self.region.read_bytes(), b"uncommitted bytes")
         self.assertEqual(self.backend.events, events)
         self.assertEqual(self.controller.status()["phase"], "workshop")
@@ -483,18 +475,27 @@ class GitInboxTests(unittest.TestCase):
         self.controller._write(state)
         self.backend.events.clear()
         self.region.write_bytes(b"edited before sleep")
-        base = dict(mapId="arena", branch=self.branch, workingCopyId=self.session["id"])
+        base = dict(mapId="arena", workingCopyId=self.session["id"])
         committed = self.send(
             "commit",
             **base,
-            expectedBranchHead=self.heads["arena"]["versionDigest"],
+            expectedHead=self.heads["arena"]["versionDigest"],
             note="Update arena",
         )
         self.assertTrue(committed["ok"], committed["error"])
         digest = committed["payload"]["versionDigest"]
-        reviewed = self.send("candidate", **base, expectedBranchHead=digest)
+        reviewed = self.send(
+            "candidate",
+            **base,
+            expectedHead=self.heads["arena"]["versionDigest"],
+            commit=True,
+            note="Review",
+        )
         self.assertTrue(reviewed["ok"], reviewed["error"])
-        self.assertEqual(reviewed["payload"]["versionDigest"], digest)
+        self.assertNotEqual(reviewed["payload"]["versionDigest"], digest)
+        self.assertEqual(
+            reviewed["payload"]["targetHead"], self.heads["arena"]["versionDigest"]
+        )
         self.assertEqual(self.backend.events, [])
         self.assertEqual(self.backend.processes, [self.game])
         self.assertEqual(self.controller.status()["phase"], "sleeping")
@@ -502,7 +503,7 @@ class GitInboxTests(unittest.TestCase):
         self.backend.processes.append(
             Process(Goal(**self.controller.status()["desired"]), True)
         )
-        refused = self.send("commit", **base, expectedBranchHead=digest, note="Again")
+        refused = self.send("commit", **base, expectedHead=digest, note="Again")
         self.assertFalse(refused["ok"])
         self.assertEqual(self.backend.events, [])
 
@@ -511,21 +512,18 @@ class GitInboxTests(unittest.TestCase):
         self.backend.events.clear()
         base = dict(
             mapId="arena",
-            branch=self.branch,
             workingCopyId=self.session["id"],
-            expectedBranchHead=self.heads["arena"]["versionDigest"],
+            expectedHead=self.heads["arena"]["versionDigest"],
             note="Submitted from the tablet",
             commit=True,
         )
         unchanged = self.send("candidate", **base)
         self.assertFalse(unchanged["ok"])
-        self.assertEqual(unchanged["error"], "no changes since the last branch commit")
+        self.assertEqual(unchanged["error"], "no changes since the current map head")
         self.region.write_bytes(b"built in game")
         submitted = self.send("candidate", **base)
         self.assertTrue(submitted["ok"], submitted["error"])
         review = submitted["payload"]
-        branch = self.store.versions.branch("arena", self.branch)
-        self.assertEqual(review["versionDigest"], branch["versionDigest"])
         self.assertEqual(review["status"], "pending")
         self.assertEqual(review["targetHead"], self.heads["arena"]["versionDigest"])
         self.assertEqual(self.backend.events, [])
@@ -545,14 +543,20 @@ class GitInboxTests(unittest.TestCase):
             self.controller._write(state)
             for kind in ("commit", "candidate"):
                 with self.subTest(phase=phase, kind=kind):
-                    head = self.store.versions.branch("arena", self.branch)[
-                        "versionDigest"
-                    ]
+                    head = self.heads["arena"]["versionDigest"]
+                    # Reset the draft to the head so the refusal cases below
+                    # start from a clean copy.
+                    self.region.write_bytes(
+                        self.store.versions._verify_blob(
+                            self.store.versions.read("arena", head)["files"][
+                                "world/region/r.0.0.mca"
+                            ]
+                        ).read_bytes()
+                    )
                     base = dict(
                         mapId="arena",
-                        branch=self.branch,
                         workingCopyId=self.session["id"],
-                        expectedBranchHead=head,
+                        expectedHead=head,
                         note="Built arena",
                         commit=True,
                     )
@@ -565,9 +569,7 @@ class GitInboxTests(unittest.TestCase):
                         self.assertFalse(refused["ok"])
                         self.assertIn(error, refused["error"])
                         self.assertEqual(
-                            self.store.versions.branch("arena", self.branch)[
-                                "versionDigest"
-                            ],
+                            self.store.versions.head("arena")["versionDigest"],
                             head,
                         )
                     self.region.write_bytes(f"{phase}/{kind}".encode())
@@ -581,6 +583,7 @@ class GitInboxTests(unittest.TestCase):
                     self.assertNotEqual(digest, head)
                     manifest = self.store.versions.read("arena", digest)
                     self.assertEqual(manifest["author"], self.builder)
+                    # Both paths record through the linear commit step first.
                     self.assertEqual(manifest["source"], "commit")
                     self.assertEqual(manifest["note"], base["note"])
                     if kind == "candidate":
@@ -589,21 +592,22 @@ class GitInboxTests(unittest.TestCase):
                             result["payload"]["targetHead"],
                             self.heads["arena"]["versionDigest"],
                         )
-                    again = self.send(kind, **(base | {"expectedBranchHead": digest}))
-                    self.assertFalse(again["ok"])
-                    self.assertIn("no changes", again["error"])
+                    # The same draft commits again as a sibling: linear history
+                    # never silently drops a snapshot.
+                    again = self.send(kind, **base)
+                    self.assertTrue(again["ok"], again["error"])
+                    self.assertNotEqual(again["payload"]["versionDigest"], digest)
                     self.assertEqual(self.controller.status()["phase"], phase)
         self.assertEqual(self.backend.events, [])
 
-    def test_save_guard_failures_and_concurrent_snapshot_preserve_branch(self):
+    def test_save_guard_failures_and_concurrent_snapshot_preserve_head(self):
         self.make_ready()
         head = self.heads["arena"]["versionDigest"]
         self.region.write_bytes(b"built in game")
         base = dict(
             mapId="arena",
-            branch=self.branch,
             workingCopyId=self.session["id"],
-            expectedBranchHead=head,
+            expectedHead=head,
             note="Submit",
             commit=True,
         )
@@ -617,9 +621,7 @@ class GitInboxTests(unittest.TestCase):
             failed = self.send("candidate", **base)
         self.assertFalse(failed["ok"])
         self.assertIn("save-on", failed["error"])
-        self.assertEqual(
-            self.store.versions.branch("arena", self.branch)["versionDigest"], head
-        )
+        self.assertEqual(self.store.versions.head("arena")["versionDigest"], head)
         other = Controller(
             self.root / "state", self.backend, maps=self.store, releases=catalog()
         )
@@ -632,8 +634,7 @@ class GitInboxTests(unittest.TestCase):
                     self.builder,
                     "Concurrent",
                     working_copy_id=self.session["id"],
-                    branch=self.branch,
-                    expected_branch_head=head,
+                    expected_head=head,
                     commit=True,
                 )
             yield
@@ -645,8 +646,9 @@ class GitInboxTests(unittest.TestCase):
 
     def test_submit_review_failure_retains_commit_for_review_retry(self):
         self.make_ready()
+        head = self.heads["arena"]["versionDigest"]
         self.region.write_bytes(b"built in game")
-        base = dict(mapId="arena", branch=self.branch, workingCopyId=self.session["id"])
+        base = dict(mapId="arena", workingCopyId=self.session["id"])
         with mock.patch.object(
             self.store, "_write_meta", side_effect=OSError("disk full")
         ):
@@ -655,48 +657,75 @@ class GitInboxTests(unittest.TestCase):
                 **base,
                 commit=True,
                 note="Submit",
-                expectedBranchHead=self.heads["arena"]["versionDigest"],
+                expectedHead=head,
             )
         self.assertFalse(failed["ok"])
         self.assertIn("disk full", failed["error"])
-        digest = self.store.versions.branch("arena", self.branch)["versionDigest"]
-        self.assertNotEqual(digest, self.heads["arena"]["versionDigest"])
-        retry = self.send("candidate", **base, expectedBranchHead=digest)
+        # The commit is retained: files were recorded before the metadata write.
+        versions = [
+            version
+            for version in self.store.versions.history("arena")
+            if version["versionDigest"] != head
+        ]
+        self.assertEqual(len(versions), 1)
+        retry = self.send("candidate", **base, expectedHead=head)
         self.assertTrue(retry["ok"], retry["error"])
-        self.assertEqual(retry["payload"]["versionDigest"], digest)
+        self.assertEqual(retry["payload"]["baseVersion"], head)
         self.assertEqual(self.backend.events, [])
 
-    def test_review_noop_and_metadata_failure_leave_branch_and_backend_unchanged(self):
-        base = dict(mapId="arena", branch=self.branch, workingCopyId=self.session["id"])
+    def test_review_noop_and_metadata_failure_leave_head_and_backend_unchanged(self):
+        base = dict(mapId="arena", workingCopyId=self.session["id"])
         noop = self.send(
-            "candidate", **base, expectedBranchHead=self.heads["arena"]["versionDigest"]
+            "candidate", **base, expectedHead=self.heads["arena"]["versionDigest"]
         )
         self.assertFalse(noop["ok"])
+        self.assertIn("no changes", noop["error"])
         self.assertEqual(self.backend.events, [])
-        first = self.commit(b"edited")
+        self.commit(b"edited")
         events = list(self.backend.events)
-        branch = self.store.versions.branch("arena", self.branch)
+        head = self.heads["arena"]["versionDigest"]
         with mock.patch.object(
             self.store, "_write_meta", side_effect=OSError("disk full")
         ):
             failed = self.send(
-                "candidate", **base, expectedBranchHead=first["versionDigest"]
+                "candidate",
+                **base,
+                expectedHead=head,
+                commit=True,
+                note="Review",
             )
         self.assertFalse(failed["ok"])
         self.assertIn("disk full", failed["error"])
-        self.assertEqual(self.store.versions.branch("arena", self.branch), branch)
+        self.assertEqual(self.store.versions.head("arena")["versionDigest"], head)
         self.assertEqual(self.backend.events, events)
         self.assertEqual(self.controller.status()["phase"], "workshop")
 
-    def test_branch_create_compare_and_preview_return_pinned_payloads(self):
+    def test_snapshot_create_compare_and_list_return_pinned_payloads(self):
         first = self.commit(b"edit")
         before = self.heads["arena"]["versionDigest"]
         created = self.send(
-            "branch-create", mapId="arena", branch="alternative", versionDigest=before
+            "snapshot-create",
+            mapId="arena",
+            name="milestone",
+            versionDigest=before,
+            actor=self.admin,
         )
         self.assertTrue(created["ok"], created["error"])
         self.assertEqual(created["payload"]["versionDigest"], before)
-        self.assertEqual(created["payload"]["createdBy"], self.builder)
+        self.assertEqual(created["payload"]["createdBy"], self.admin)
+        clashing = self.send(
+            "snapshot-create",
+            mapId="arena",
+            name="milestone",
+            versionDigest=first["versionDigest"],
+            actor=self.admin,
+        )
+        self.assertFalse(clashing["ok"])
+        listed = self.send("snapshots", mapId="arena")
+        self.assertTrue(listed["ok"], listed["error"])
+        self.assertEqual(
+            [snap["name"] for snap in listed["payload"]["snapshots"]], ["milestone"]
+        )
         compared = self.send(
             "compare", mapId="arena", before=before, after=first["versionDigest"]
         )
@@ -710,48 +739,47 @@ class GitInboxTests(unittest.TestCase):
         self.assertEqual(
             change["area"], {"minX": 0, "minZ": 0, "maxX": 511, "maxZ": 511}
         )
-        preview = self.send(
-            "merge-preview",
-            mapId="arena",
-            versionDigest=first["versionDigest"],
-            expectedHead=before,
-        )
-        self.assertTrue(preview["ok"], preview["error"])
-        self.assertEqual(preview["payload"]["sourceVersion"], first["versionDigest"])
-        self.assertEqual(preview["payload"]["targetVersion"], before)
-        self.assertEqual(preview["payload"]["unresolved"], [])
-        self.assertIn("changes", preview["payload"])
-        self.assertNotIn("files", preview["payload"])
-        self.assertNotIn("config", preview["payload"])
+        for removed in (
+            {"kind": "branch-create"},
+            {"kind": "merge-preview"},
+        ):
+            result = self.send(**{"mapId": "arena", **removed})
+            self.assertFalse(result["ok"])
+            self.assertIn("unknown kind", result["error"])
 
     def test_review_target_and_force_cannot_be_replaced_on_publish(self):
-        first = self.commit(b"edit")
-        reviewed = self.send(
+        self.region.write_bytes(b"edit")
+        submitted = self.send(
             "candidate",
             mapId="arena",
-            branch=self.branch,
             workingCopyId=self.session["id"],
-            expectedBranchHead=first["versionDigest"],
+            expectedHead=self.heads["arena"]["versionDigest"],
+            note="Review",
+            commit=True,
         )
-        review = reviewed["payload"]
+        self.assertTrue(submitted["ok"], submitted["error"])
+        review = submitted["payload"]
+        first = review["versionDigest"]
         self.make_ready()
-        force = self.send(
+        # Force waives only the template-base guard: it publishes a fresh
+        # review fine and still records that the operator forced it.
+        forced = self.send(
             "publish",
             actor=self.admin,
             candidateId=review["id"],
             expectedHead=review["targetHead"],
             force=True,
         )
-        self.assertFalse(force["ok"])
-        self.assertIn("force", force["error"])
-        self.store.versions.activate(
-            "arena", first["versionDigest"], self.admin, review["targetHead"]
-        )
+        self.assertTrue(forced["ok"], forced["error"])
+        self.assertTrue(forced["payload"]["forced"])
+        self.assertEqual(self.store.versions.head("arena")["versionDigest"], first)
+        # A moved target still fails, force or not.
         stale = self.send(
             "publish",
             actor=self.admin,
             candidateId=review["id"],
-            expectedHead=first["versionDigest"],
+            expectedHead=first,
+            force=True,
         )
         self.assertFalse(stale["ok"])
         self.assertIn("review target changed", stale["error"])
@@ -759,27 +787,25 @@ class GitInboxTests(unittest.TestCase):
             next(item for item in self.store.list() if item["id"] == review["id"])[
                 "status"
             ],
-            "pending",
+            "accepted",
         )
 
-    def test_branch_switch_requires_new_session_and_keeps_dirty_old_copy(self):
-        version = self.heads["arena"]["versionDigest"]
-        self.send("branch-create", mapId="arena", branch="other", versionDigest=version)
-        self.region.write_bytes(b"unsaved old branch")
+    def test_map_switch_requires_new_session_and_keeps_old_draft(self):
+        self.region.write_bytes(b"unsaved old maps")
         state = self.controller.status()
-        with self.assertRaisesRegex(ValueError, "new isolated session"):
+        with self.assertRaisesRegex(ValueError, "already bound"):
             self.controller.request(
                 str(uuid4()),
                 Goal(**state["desired"]),
                 state["revision"],
                 session={
-                    **self.session,
-                    "branches": {**self.session["branches"], "arena": "other"},
+                    "schema": 1,
+                    "id": self.session["id"],
+                    "maps": ["lobby"],
                 },
             )
         selected = self.controller._session_for(
-            {"session": "new", "maps": ["arena"], "branches": {"arena": "other"}},
-            self.builder,
+            {"session": "new", "maps": ["arena"]}, self.builder
         )
         self.controller.request(
             str(uuid4()),
@@ -787,13 +813,14 @@ class GitInboxTests(unittest.TestCase):
             state["revision"],
             session=selected,
         )
-        self.assertEqual(self.region.read_bytes(), b"unsaved old branch")
+        self.assertEqual(self.region.read_bytes(), b"unsaved old maps")
         next_copy = self.store.versions.working_copy("arena", selected["id"])
         self.assertEqual((next_copy / "world/region/r.0.0.mca").read_bytes(), b"arena")
-        self.assertEqual(self.controller.session()["branches"], {"arena": "other"})
+        self.assertEqual(self.controller.session()["maps"], ["arena"])
+        self.assertNotIn("branches", self.controller.session())
 
-    def test_game_release_change_preserves_branches_and_draft_bytes(self):
-        # Game rollouts never retarget Workshop: branches and unsaved drafts
+    def test_game_release_change_preserves_maps_and_draft_bytes(self):
+        # Game rollouts never retarget Workshop: maps and unsaved drafts
         # survive; only an explicit operation selects another release.
         original = self.controller.session_file.read_bytes()
         self.region.write_bytes(b"preserved draft")
@@ -888,13 +915,27 @@ class GitInboxTests(unittest.TestCase):
         for changes in (
             {"session": "new"},
             {"maps": ["arena"]},
-            {"branches": {"arena": self.branch}},
             {"sessionId": str(uuid4())},
         ):
             result = self.send("mode", actor=self.admin, **(base | changes))
             self.assertFalse(result["ok"])
             self.assertEqual(self.backend.events, events)
             self.assertEqual(self.controller.status(), state)
+        # Pre-linear branches on a resume are ignored, not rejected: the live
+        # session keeps working against its session-UUID working copy.
+        ignored = self.send(
+            "mode",
+            actor=self.admin,
+            **(base | {"branches": {"arena": "work-legacy"}}),
+        )
+        self.assertTrue(ignored["ok"], ignored["error"])
+        self.assertNotIn("branches", self.controller.session())
+        # The successful resume above advanced the state: settle back to the
+        # running workshop before the final missing-copy refusal.
+        self.make_ready()
+        state = self.controller.status()
+        base = dict(base, expectedRevision=state["revision"])
+        events = list(self.backend.events)
         (self.copy / "map.json").unlink()
         result = self.send("mode", actor=self.admin, **base)
         self.assertFalse(result["ok"])
@@ -911,9 +952,6 @@ class GitInboxTests(unittest.TestCase):
 
     def test_old_session_uuid_cannot_rebind_after_switching_away(self):
         self.new_session()
-        self.store.versions.create_branch(
-            "arena", "other", self.heads["arena"]["versionDigest"], self.admin
-        )
         before = self.controller.status()
         events = list(self.backend.events)
         with self.assertRaisesRegex(ValueError, "already bound"):
@@ -924,72 +962,33 @@ class GitInboxTests(unittest.TestCase):
                 session={
                     "schema": 1,
                     "id": self.session["id"],
-                    "maps": ["arena"],
-                    "branches": {"arena": "other"},
+                    "maps": ["lobby"],
                 },
             )
         self.assertEqual(self.controller.status(), before)
         self.assertEqual(self.backend.events, events)
 
-    def test_large_merge_choices_reach_exact_core_conflict_validation(self):
-        target = self.heads["arena"]["versionDigest"]
-        source, ancestor = "e" * 64, "d" * 64
-        config = self.store.versions.read("arena", target)["files"]["map.json"]
-        paths = [f"world/region/r.{index}.0.mca" for index in range(10000)]
-
-        def manifest(digest, parent):
-            return {
-                "kind": "arena",
-                "parent": parent,
-                "files": {
-                    "map.json": config,
-                    **dict.fromkeys(paths, digest),
-                },
-            }
-
-        common = manifest("1" * 64, None)
-        histories = {
-            source: {ancestor: common, source: manifest("3" * 64, ancestor)},
-            target: {ancestor: common, target: manifest("2" * 64, ancestor)},
-        }
-        choices = dict.fromkeys(paths, "ours")
+    def test_only_publish_accepts_large_payloads(self):
+        choices = {f"world/region/r.{index}.0.mca": "ours" for index in range(10000)}
         self.assertGreater(len(json.dumps(choices).encode()), 65536)
-        # Mock history loading so the transport boundary exercises 10,000 real choices without 10,000 disk files.
-        with mock.patch.object(
-            self.store.versions,
-            "_ancestors",
-            side_effect=lambda map_id, version: histories[version],
-        ):
-            preview = self.send(
-                "merge-preview",
-                mapId="arena",
-                versionDigest=source,
-                expectedHead=target,
-                resolutions=choices,
-            )
-            self.assertTrue(preview["ok"], preview["error"])
-            self.assertEqual(len(preview["payload"]["conflicts"]), 10000)
-            self.assertEqual(preview["payload"]["unresolved"], [])
-            bad_choice = self.send(
-                "merge-preview",
-                mapId="arena",
-                versionDigest=source,
-                expectedHead=target,
-                resolutions={**choices, paths[0]: "overwrite"},
-            )
-            self.assertFalse(bad_choice["ok"])
-            unknown_path = {**choices, "../escape": choices[paths[0]]}
-            del unknown_path[paths[0]]
-            bad_path = self.send(
-                "merge-preview",
-                mapId="arena",
-                versionDigest=source,
-                expectedHead=target,
-                resolutions=unknown_path,
-            )
-            self.assertFalse(bad_path["ok"])
+        big_publish = self.send(
+            "publish",
+            actor=self.admin,
+            candidateId="0" * 32,
+            resolutions=choices,
+        )
+        self.assertFalse(big_publish["ok"])
+        self.assertIn("unknown candidate", big_publish["error"])
+        big_candidate = self.send(
+            "candidate",
+            mapId="arena",
+            workingCopyId=self.session["id"],
+            note="oversized envelope",
+            resolutions=choices,
+        )
+        self.assertFalse(big_candidate["ok"])
+        self.assertIn("too large", big_candidate["error"])
         self.assertEqual(self.backend.events, [])
-        self.assertIn(self.game, self.backend.processes)
         self.assertEqual(self.store.versions.head("arena"), self.heads["arena"])
 
 

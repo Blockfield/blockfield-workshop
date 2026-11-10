@@ -196,6 +196,20 @@ def _map_store(env, backend):
             Path(env.get("BF_LIMBO_DERIVED_DIR", str(archive / "limbo"))),
             getattr(backend, "proxy_stopped", lambda: False),
         )
+    # Linearize pre-linear history at startup: every named branch tip that
+    # differs from the map head becomes a named snapshot; refs are removed
+    # only after their snapshot is written and re-read. Idempotent.
+    try:
+        summary = store.versions.migrate_branches_to_snapshots()
+    except ValueError as error:
+        raise ValueError(f"map branch migration failed: {error}") from error
+    migrated, at_head = summary["migrated"], summary["atHead"]
+    if migrated or at_head:
+        print(
+            "workshop: linearized map branches: "
+            f"{len(migrated)} snapshots, {len(at_head)} already at head",
+            file=sys.stderr,
+        )
     return store
 
 
@@ -337,12 +351,6 @@ def main(argv=None, backend_factory=None) -> int:
         nargs="+",
         help="selected canonical map ids; omitted = all on new, previous selection on resume",
     )
-    workshop.add_argument(
-        "--branches",
-        nargs="+",
-        metavar="MAP=BRANCH",
-        help="freeze named branches for every selected map; changing a branch needs a new session UUID",
-    )
     game = request.add_parser("game")
     game.add_argument("--release")
     game.add_argument(
@@ -387,17 +395,10 @@ def main(argv=None, backend_factory=None) -> int:
         help="export an accepted immutable version through the ready workshop's trusted WorldEdit adapter",
     )
     limbo_export.add_argument("--version-digest", required=True)
-    branch_create = commands.add_parser(
-        "branch-create", help="create a named work branch from an immutable map version"
-    )
-    branch_create.add_argument("--map-id", required=True)
-    branch_create.add_argument("--branch", required=True)
-    branch_create.add_argument("--version-digest", required=True)
     commit = commands.add_parser(
-        "commit", help="save the selected editor copy as a sequential branch commit"
+        "commit", help="save the selected editor copy as a linear map commit"
     )
     commit.add_argument("--map-id", required=True)
-    commit.add_argument("--branch", required=True)
     commit.add_argument("--working-copy-id", required=True)
     commit.add_argument("--expected-head", required=True)
     commit.add_argument("--message", required=True)
@@ -405,17 +406,19 @@ def main(argv=None, backend_factory=None) -> int:
     compare.add_argument("--map-id", required=True)
     compare.add_argument("--before", required=True)
     compare.add_argument("--after", required=True)
-    preview = commands.add_parser(
-        "merge-preview", help="preview a source commit against the exact current main"
+    snap_create = commands.add_parser(
+        "snapshot-create", help="pin a named snapshot at an immutable map version"
     )
-    preview.add_argument("--map-id", required=True)
-    preview.add_argument("--version-digest", required=True)
-    preview.add_argument("--expected-head", required=True)
-    preview.add_argument(
-        "--resolutions",
-        default="{}",
-        help="JSON object of exact conflict paths to ours/theirs",
+    snap_create.add_argument("--map-id", required=True)
+    snap_create.add_argument("--name", required=True)
+    snap_create.add_argument("--version-digest", required=True)
+    snap_delete = commands.add_parser(
+        "snapshot-delete", help="remove a named map snapshot (history is kept)"
     )
+    snap_delete.add_argument("--map-id", required=True)
+    snap_delete.add_argument("--name", required=True)
+    snap_list = commands.add_parser("snapshots", help="list named snapshots of a map")
+    snap_list.add_argument("--map-id", required=True)
     args = parser.parse_args(argv)
 
     try:
@@ -466,33 +469,34 @@ def main(argv=None, backend_factory=None) -> int:
                 {"draslId": "host", "name": "host"},
                 args.message,
                 working_copy_id=args.working_copy_id,
-                branch=args.branch,
-                expected_branch_head=args.expected_head,
+                expected_head=args.expected_head,
                 commit=True,
             )
-        elif args.command in {"branch-create", "compare", "merge-preview"}:
+        elif args.command == "compare":
             with controller._locked():
-                if args.command == "branch-create":
-                    result = controller.maps.versions.create_branch(
-                        args.map_id,
-                        args.branch,
-                        args.version_digest,
-                        {"draslId": "host", "name": "host"},
-                    )
-                    controller.export_maps()
-                elif args.command == "compare":
-                    result = controller.maps.versions.compare(
-                        args.map_id, args.before, args.after
-                    )
-                else:
-                    from map_package import _json
-
-                    result = controller._merge_preview(
-                        args.map_id,
-                        args.version_digest,
-                        args.expected_head,
-                        _json(args.resolutions.encode()),
-                    )
+                result = controller.maps.versions.compare(
+                    args.map_id, args.before, args.after
+                )
+        elif args.command == "snapshot-create":
+            with controller._locked():
+                result = controller.maps.versions.create_snapshot(
+                    args.map_id,
+                    args.name,
+                    args.version_digest,
+                    {"draslId": "host", "name": "host"},
+                )
+                controller.export_maps()
+        elif args.command == "snapshot-delete":
+            with controller._locked():
+                controller.maps.versions.delete_snapshot(args.map_id, args.name)
+                controller.export_maps()
+                result = {"mapId": args.map_id, "deleted": args.name}
+        elif args.command == "snapshots":
+            with controller._locked():
+                result = {
+                    "mapId": args.map_id,
+                    "snapshots": controller.maps.versions.snapshots(args.map_id),
+                }
         elif args.command == "activate-map":
             expected = None if args.expected_head == "none" else args.expected_head
             with controller._locked():
@@ -566,22 +570,7 @@ def main(argv=None, backend_factory=None) -> int:
                 )
                 if args.maps is not None:
                     session = {**session, "maps": args.maps}
-                    if "branches" in session:
-                        session["branches"] = {
-                            map_id: session["branches"].get(
-                                map_id, "work-" + goal.session
-                            )
-                            for map_id in args.maps
-                        }
-                if args.branches is not None:
-                    selections = [entry.split("=", 1) for entry in args.branches]
-                    if any(len(entry) != 2 for entry in selections) or len(
-                        {entry[0] for entry in selections}
-                    ) != len(selections):
-                        raise ValueError(
-                            "branches must be distinct MAP=BRANCH selections"
-                        )
-                    session = {**session, "branches": dict(selections)}
+                session.pop("branches", None)
             result = controller.request(
                 str(uuid4()),
                 goal,

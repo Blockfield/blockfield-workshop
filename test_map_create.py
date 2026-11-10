@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import shutil
 import stat
 import struct
 import unittest
@@ -64,13 +65,13 @@ class ZeroMapTests(unittest.TestCase):
         session = created["session"]["id"]
         bundle = self.store.versions.working_copy(created["mapId"], session)
         (bundle / "map.json").write_text(json.dumps(config))
+        head = self.store.versions.head(created["mapId"])
         return self.store.commit(
             created["mapId"],
             ACTOR,
             "Complete layout",
             working_copy_id=session,
-            branch=created["branch"]["name"],
-            expected_head=created["branch"]["versionDigest"],
+            expected_head=head["versionDigest"] if head else None,
         )
 
     def review(self, created, committed):
@@ -79,7 +80,6 @@ class ZeroMapTests(unittest.TestCase):
             ACTOR,
             "Review layout",
             working_copy_id=created["session"]["id"],
-            branch=created["branch"]["name"],
             expected_head=committed["versionDigest"],
         )
 
@@ -248,16 +248,17 @@ class ZeroMapTests(unittest.TestCase):
         self.assertEqual(self.controller.status(), before)
         self.assertEqual(self.backend.events, [])
         created = self.create()
-        ref = self.store.versions._branch_path("new_map", created["branch"]["name"])
-        ref.unlink()
+        versions_dir = self.store.versions.archive / "versions" / "new_map"
+        shutil.rmtree(versions_dir)
         with self.assertRaises((OSError, ValueError)):
             self.create(session_id=created["session"]["id"])
-        self.assertFalse(ref.exists())
+        self.assertFalse(versions_dir.exists())
 
     def test_private_commit_needs_no_template_and_initial_publish_is_exact_null_cas(
         self,
     ):
         created = self.create(modes=list(map_package.SUPPORTED_MODES))
+        seed = created["versionDigest"]
         incomplete = self.commit(
             created,
             map_package.seed_config(
@@ -267,20 +268,13 @@ class ZeroMapTests(unittest.TestCase):
         self.assertIsNone(self.store.versions.head("new_map"))
         with self.assertRaises(ValueError):
             self.review(created, incomplete)
-        created["branch"] = incomplete["branch"]
         committed = self.commit(created, playable())
         review = self.review(created, committed)
         self.assertIsNone(review["targetHead"])
-        preview = self.controller._merge_preview(
-            "new_map", review["versionDigest"], None
-        )
-        self.assertIsNone(preview["baseVersion"])
-        self.assertIsNone(preview["targetVersion"])
-        self.assertEqual(preview["conflicts"], [])
+        compared = self.store.versions.compare("new_map", seed, review["versionDigest"])
+        self.assertTrue(compared["files"])
         with self.assertRaisesRegex(ValueError, "explicit expectedHead"):
             self.store.publish(review["id"], ACTOR, force=True)
-        with self.assertRaisesRegex(ValueError, "force"):
-            self.store.publish(review["id"], ACTOR, expected_head=None, force=True)
         with mock.patch.object(
             self.store, "activate", side_effect=OSError("activation unavailable")
         ):
@@ -288,7 +282,7 @@ class ZeroMapTests(unittest.TestCase):
                 self.store.publish(review["id"], ACTOR, expected_head=None)
         self.assertIsNone(self.store.versions.head("new_map"))
         accepted = self.store.publish(review["id"], ACTOR, expected_head=None)
-        self.assertEqual(accepted["mergeVersion"], committed["versionDigest"])
+        self.assertEqual(accepted["versionDigest"], committed["versionDigest"])
         self.assertEqual(
             self.store.versions.head("new_map")["versionDigest"],
             committed["versionDigest"],
