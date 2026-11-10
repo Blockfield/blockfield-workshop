@@ -569,6 +569,144 @@ class MapLinearTests(unittest.TestCase):
         self.store.publish(review["id"], ACTOR, expected_head=self.base)
         self.assertEqual(self.versions.head("konstaxa")["versionDigest"], committed)
 
+    # -- round 2: publish is a transaction, one atomic base record, migrated copies --
+
+    def test_publish_stage_or_activate_failure_leaves_copy_at_old_base(self):
+        # r4523970909: the copy advances only after the head is activated, so a
+        # failed stage/activation leaves the copy at its old base and the head
+        # unchanged (another review can still publish against it).
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"first edit")
+        first = self.commit(copy_id, self.base)
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=first
+        )
+        for step in ("prepare", "activate"):
+            with mock.patch.object(
+                self.versions, step, side_effect=OSError(f"{step} down")
+            ):
+                with self.assertRaisesRegex(OSError, f"{step} down"):
+                    self.store.publish(review["id"], ACTOR, expected_head=self.base)
+            self.assertEqual(self.versions.head("konstaxa")["versionDigest"], self.base)
+            self.assertEqual(
+                self.versions.validate_working_copy("konstaxa", copy_id)[
+                    "versionDigest"
+                ],
+                self.base,
+            )
+        # The unchanged head still accepts a competing review; the failed
+        # copy keeps its world edits at the old base.
+        other_id, other = self.draft()
+        (other / "world/region/r.0.0.mca").write_bytes(b"second edit")
+        other_version = self.commit(other_id, self.base)
+        other_review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=other_id, expected_head=other_version
+        )
+        self.store.publish(other_review["id"], ACTOR, expected_head=self.base)
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], other_version)
+        self.assertEqual(
+            (bundle / "world/region/r.0.0.mca").read_bytes(), b"first edit"
+        )
+
+    def test_crash_between_base_writes_recovers_on_read(self):
+        # r4523970919: manifest.json is the authoritative base; a torn marker
+        # write heals on the next read instead of stranding the copy.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"edit")
+        committed = self.commit(copy_id, self.base)
+        real_atomic = candidates._atomic_json
+
+        def torn_write(path, value, **kwargs):
+            if path.name == "blockfield-base.json":
+                raise OSError("power cut between base writes")
+            return real_atomic(path, value, **kwargs)
+
+        with mock.patch.object(candidates, "_atomic_json", side_effect=torn_write):
+            with self.assertRaisesRegex(OSError, "power cut"):
+                self.versions.advance_working_copy("konstaxa", copy_id, committed)
+        # Manifest moved, marker did not: the next read repairs the marker.
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", copy_id)["versionDigest"],
+            committed,
+        )
+        marker = json.loads((bundle / "world" / "blockfield-base.json").read_text())
+        self.assertEqual(marker["versionDigest"], committed)
+
+    def test_migrated_copy_published_branch_can_publish_again(self):
+        # r4523970925: legacy branch commits kept the checkout marker and the
+        # branch tip was published without advancing the copy.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"branch work")
+        config = json.loads((bundle / "map.json").read_text())
+        files = self.versions.world_files(bundle / "world", json.dumps(config).encode())
+        tip = self.versions.commit_head(
+            "konstaxa",
+            files,
+            ACTOR,
+            "Branch tip",
+            self.base,
+            copy_id,
+            self.base,
+            source="commit",
+        )
+        self.versions.activate("konstaxa", tip, ACTOR, self.base)
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"edit after branch publish")
+        committed = self.commit(copy_id, tip)
+        self.assertEqual(self.versions.read("konstaxa", committed)["parents"], [tip])
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=committed
+        )
+        self.store.publish(review["id"], ACTOR, expected_head=tip)
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], committed)
+        self.assertEqual(
+            (bundle / "world/region/r.0.0.mca").read_bytes(),
+            b"edit after branch publish",
+        )
+
+    def test_sibling_publish_merges_without_reverting(self):
+        # Same-function variant: another copy's publish moves the head; this
+        # copy's base is an ancestor, so its world rebases onto the head (the
+        # sibling's file changes merge in, local edits win) instead of going stale.
+        first_id, first_bundle = self.draft()
+        second_id, second_bundle = self.draft()
+        (first_bundle / "world/region/r.0.0.mca").write_bytes(b"sibling change")
+        first = self.commit(first_id, self.base)
+        first_review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=first_id, expected_head=first
+        )
+        self.store.publish(first_review["id"], ACTOR, expected_head=self.base)
+        config = json.loads((second_bundle / "map.json").read_text())
+        config["name"] = "Renamed"
+        (second_bundle / "map.json").write_text(json.dumps(config))
+        committed = self.commit(second_id, first)
+        self.assertEqual(self.versions.read("konstaxa", committed)["parents"], [first])
+        # The sibling's region change merged into this copy; the local rename kept.
+        self.assertEqual(
+            (second_bundle / "world/region/r.0.0.mca").read_bytes(), b"sibling change"
+        )
+        self.assertEqual(
+            json.loads((second_bundle / "map.json").read_text())["name"], "Renamed"
+        )
+        second_review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=second_id, expected_head=committed
+        )
+        self.store.publish(second_review["id"], ACTOR, expected_head=first)
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], committed)
+
+    def test_forked_copy_is_not_rebased(self):
+        # Same-function variant: a base outside the head's parent chain is a
+        # fork, never a migrated branch — it stays stale and records nothing.
+        fork = self._record_version(
+            "konstaxa", dict(seed_config("konstaxa"), name="Fork"), None
+        )
+        self.versions.activate("konstaxa", fork, ACTOR, self.base)
+        copy_id, bundle = self.draft(version=self.base)
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"fork edit")
+        before = set(self.history_parents())
+        with self.assertRaisesRegex(ValueError, "behind|stale"):
+            self.commit(copy_id, fork)
+        self.assertEqual(set(self.history_parents()), before)
+
 
 if __name__ == "__main__":
     unittest.main()

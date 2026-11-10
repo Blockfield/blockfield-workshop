@@ -301,21 +301,31 @@ class MapStore:
         # head itself advances only on publish/activate/restore, never on merge.
         world = self.check(map_id, working_copy_id)
         if working_copy_id is not None:
-            base_version = map_package._json((world / BASE_MARKER).read_bytes())[
-                "versionDigest"
-            ]
-            self.versions.read(map_id, base_version)
+            # Manifest-authoritative: also repairs a torn base write on read.
+            _, base_version, _ = self.versions._working_copy_manifest(
+                map_id, working_copy_id
+            )
         else:
             base_version = self._base_version(map_id)
         head = self.versions.head(map_id)
         head_digest = head["versionDigest"] if head else None
         if expected_head is not EXPECTED_HEAD_ABSENT:
             self.versions.check_head(map_id, expected_head)
-            if expected_head is not None and base_version != expected_head:
-                raise ValueError("working copy is behind the map head; resume it first")
-            # An explicit null head pins a headless map: the first commit
-            # bootstraps history from the template import.
-            parent = base_version if expected_head is None else expected_head
+            if expected_head is None:
+                # An explicit null head pins a headless map: the first commit
+                # bootstraps history from the template import.
+                parent = base_version
+            elif base_version != expected_head:
+                # Stale base with a fresh expectation: a migrated branch copy
+                # (or a foreign publish) whose base is an ancestor of the head
+                # rebases onto it here; a fork still raises below.
+                self.versions.reconcile_working_copy(
+                    map_id, working_copy_id, expected_head
+                )
+                base_version = expected_head
+                parent = expected_head
+            else:
+                parent = expected_head
         elif head_digest is None:
             parent = base_version
         else:
@@ -487,12 +497,10 @@ class MapStore:
                         raise ValueError(
                             "base changed: the map's template changed after this draft was copied; confirm to overwrite"
                         )
-            # The published version came from this copy's world, so the copy now
-            # sits on the new head: advance its base pointer, keeping edits.
-            if meta.get("workingCopyId") is not None:
-                self.versions.advance_working_copy(
-                    map_id, meta["workingCopyId"], meta["versionDigest"]
-                )
+            # Publication is a transaction: validate, stage, move the head (the
+            # commit point), and only then advance the copy. A failed stage or
+            # activation leaves the copy at its old base, so the unchanged
+            # head stays publishable by another review.
             self.versions.prepare(map_id, meta["versionDigest"])
             meta.update(
                 status="accepted",
@@ -503,6 +511,12 @@ class MapStore:
             meta.pop("sourceBranch", None)
             self._write_meta(meta)
             self.activate(map_id, meta["versionDigest"], actor, expected_head)
+            # The published version came from this copy's world, so the copy now
+            # sits on the new head: advance its base pointer, keeping edits.
+            if meta.get("workingCopyId") is not None:
+                self.versions.advance_working_copy(
+                    map_id, meta["workingCopyId"], meta["versionDigest"]
+                )
             return meta
         map_package.validate_playable(self._candidate_config(meta))
         if (
@@ -543,6 +557,9 @@ class MapStore:
                 raise ValueError(
                     "base changed: the map's template changed after this draft was copied; confirm to overwrite"
                 )
+        if expected_head is not ACCEPT_ONLY:
+            # CAS before recording: a stale head must not strand an import.
+            self.versions.check_head(map_id, expected_head)
         version = meta.get("versionDigest")
         if version is None:
             version = self.versions.import_package(
@@ -555,7 +572,6 @@ class MapStore:
                 note=meta.get("note", ""),
             )
         if expected_head is not ACCEPT_ONLY:
-            self.versions.check_head(map_id, expected_head)
             if (
                 not force
                 and expected_head is not None
@@ -2068,6 +2084,129 @@ class MapVersions:
             "bundle": str(target),
         }
 
+    def _working_copy_manifest(self, map_id: str, working_copy_id: str) -> tuple:
+        """The copy's authoritative base: manifest.json verified against the CAS.
+
+        manifest.json is byte-identical to an immutable archived version, so its
+        sha256 both identifies and verifies the base; the world marker only
+        mirrors it. A torn advance write (or a legacy/hand-written marker) is
+        repaired here, so no crash point leaves the copy permanently invalid.
+        """
+        target = self.working_copy(map_id, working_copy_id)
+        manifest_file = target / "manifest.json"
+        marker_path = target / "world" / BASE_MARKER
+        for path in (target, target / "world", manifest_file):
+            if path.is_symlink() or not path.exists():
+                raise ValueError("working copy missing or unsafe")
+        if manifest_file.stat().st_size > 4 << 20:
+            raise ValueError("working copy metadata missing or unsafe")
+        version = _sha256(manifest_file)
+        manifest = self.read(map_id, version)
+        if marker_path.is_symlink() or (
+            marker_path.is_file() and marker_path.stat().st_size > 65536
+        ):
+            raise ValueError("working copy missing or unsafe")
+        try:
+            marker = map_package._json(marker_path.read_bytes())
+            intact = (
+                isinstance(marker, dict)
+                and marker.get("versionDigest") == version
+                and marker.get("templateDigest") == manifest["worldDigest"]
+            )
+        except (OSError, ValueError):
+            intact = False
+        if not intact:
+            _atomic_json(
+                marker_path,
+                {
+                    "schema": 1,
+                    "templateDigest": manifest["worldDigest"],
+                    "versionDigest": version,
+                },
+                owner=False,
+            )
+        return target, version, manifest
+
+    def _write_copy_base(self, target: Path, manifest: dict, version: str) -> None:
+        """Move a working copy's base pointer; the world files stay untouched."""
+        _atomic_json(target / "manifest.json", manifest, owner=False)
+        _atomic_json(
+            target / "world" / BASE_MARKER,
+            {
+                "schema": 1,
+                "templateDigest": manifest["worldDigest"],
+                "versionDigest": version,
+            },
+            owner=False,
+        )
+        _chown_tree(target)
+
+    def _place_blob(self, digest: str, path: Path) -> None:
+        source = self._verify_blob(digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".rebase-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                with source.open("rb") as origin:
+                    shutil.copyfileobj(origin, handle, 1 << 20)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o664)
+            os.replace(temporary, path)
+            _sync_directory(path.parent)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def reconcile_working_copy(
+        self, map_id: str, working_copy_id, head_version: str
+    ) -> str:
+        """Rebase a stale copy onto a descendant head (migrated branch copies).
+
+        Legacy branch commits kept the checkout marker while their branch tip
+        was published as the head. When the copy's base is an ancestor of the
+        named head — proved by walking hash-verified manifests — fast-forward
+        the copy's unchanged files to the head and keep local edits, so the
+        next commit parents the head without dropping anything. A base outside
+        the head's chain is a fork and stays stale.
+        """
+        if working_copy_id is None:
+            raise ValueError("working copy is behind the map head; resume it first")
+        target, base_version, base_manifest = self._working_copy_manifest(
+            map_id, working_copy_id
+        )
+        head_manifest = self.read(map_id, head_version)
+        ancestor, depth = head_version, 0
+        while ancestor != base_version and depth < 10000:
+            parent = self.read(map_id, ancestor).get("parent")
+            if parent is None:
+                break
+            ancestor, depth = parent, depth + 1
+        if ancestor != base_version:
+            raise ValueError("working copy is behind the map head; resume it first")
+        if base_version != head_version:
+            base_files, head_files = base_manifest["files"], head_manifest["files"]
+            for name in sorted(set(base_files) | set(head_files)):
+                old, new = base_files.get(name), head_files.get(name)
+                if old == new:
+                    continue
+                path = target / name
+                if path.is_symlink():
+                    raise ValueError("working copy missing or unsafe")
+                if path.is_file():
+                    if _sha256(path) == old:
+                        pass  # Untouched since the base: take the head's bytes.
+                    else:
+                        continue  # Local edit wins on an explicitly rebased head.
+                elif old is not None:
+                    continue  # Local deletion wins too.
+                if new is None:
+                    path.unlink()
+                    _sync_directory(path.parent)
+                else:
+                    self._place_blob(new, path)
+            self._write_copy_base(target, head_manifest, head_version)
+        return head_version
+
     def advance_working_copy(
         self, map_id: str, working_copy_id: str, version: str
     ) -> bool:
@@ -2081,28 +2220,14 @@ class MapVersions:
         target = self.working_copy(map_id, working_copy_id)
         if not target.exists() and not target.is_symlink():
             return False
+        _, current, _ = self._working_copy_manifest(map_id, working_copy_id)
         manifest = self.read(map_id, version)
-        marker_path = target / "world" / BASE_MARKER
-        for path in (target, target / "world", target / "manifest.json", marker_path):
-            if path.is_symlink() or not path.exists():
-                raise ValueError("working copy missing or unsafe")
-        marker = map_package._json(marker_path.read_bytes())
         # The copy sits on the published version's parent — or already on the
         # version itself (first publish on a headless map, or a republish
         # after the activation below failed midway).
-        if marker.get("versionDigest") not in {version, manifest["parent"]}:
+        if current not in {version, manifest["parent"]}:
             raise ValueError("working copy moved during review; resume it first")
-        _atomic_json(target / "manifest.json", manifest, owner=False)
-        _atomic_json(
-            marker_path,
-            {
-                "schema": 1,
-                "templateDigest": manifest["worldDigest"],
-                "versionDigest": version,
-            },
-            owner=False,
-        )
-        _chown_tree(target)
+        self._write_copy_base(target, manifest, version)
         return True
 
     def validate_working_copy(self, map_id: str, working_copy_id: str) -> dict:
@@ -2127,15 +2252,9 @@ class MapVersions:
                 raise ValueError("working copy metadata missing or unsafe")
         if config_file.stat().st_size > 1 << 20:
             raise ValueError("map config too large")
-        version = _sha256(manifest_file)
-        manifest = self.read(map_id, version)
-        marker = map_package._json((target / "world" / BASE_MARKER).read_bytes())
-        if (
-            not isinstance(marker, dict)
-            or marker.get("versionDigest") != version
-            or marker.get("templateDigest") != manifest["worldDigest"]
-        ):
-            raise ValueError("working copy base mismatch")
+        # The manifest is the authoritative base; resolving it repairs a torn
+        # marker write, so a crash between the two base writes heals on read.
+        _, version, manifest = self._working_copy_manifest(map_id, working_copy_id)
         config = map_package._json(config_file.read_bytes())
         self.validate_config(map_id, config)
         if config.get("kind", "arena") != manifest["kind"]:
