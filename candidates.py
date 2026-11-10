@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import zipfile
@@ -33,6 +34,13 @@ ACCEPT_ONLY = object()
 # A snapshot/commit call without any head expectation. Distinct from an
 # explicit null head (the caller saw a headless map), which is checked.
 EXPECTED_HEAD_ABSENT = object()
+# A working copy whose base is not the current head is stale. Publishing from
+# it is refused with this message; nothing is edited or merged. The way out
+# is snapshot_working_copy plus checkout_fresh_copy.
+STALE_COPY_MESSAGE = (
+    "stale working copy: the map has a newer version; "
+    "save your draft as a snapshot and start from the current version"
+)
 OWNER = (
     1000,
     1000,
@@ -316,21 +324,18 @@ class MapStore:
                 # bootstraps history from the template import.
                 parent = base_version
             elif base_version != expected_head:
-                # Stale base with a fresh expectation: a migrated branch copy
-                # (or a foreign publish) whose base is an ancestor of the head
-                # rebases onto it here; a fork still raises below.
-                self.versions.reconcile_working_copy(
-                    map_id, working_copy_id, expected_head
-                )
-                base_version = expected_head
-                parent = expected_head
+                # Stale base with a fresh expectation: this PR removed merges,
+                # so an automatic file rebase is a merge in disguise. Refuse
+                # and leave the draft untouched; the explicit snapshot path
+                # preserves it.
+                raise ValueError(STALE_COPY_MESSAGE)
             else:
                 parent = expected_head
         elif head_digest is None:
             parent = base_version
         else:
             if base_version != head_digest:
-                raise ValueError("working copy is behind the map head; resume it first")
+                raise ValueError(STALE_COPY_MESSAGE)
             parent = head_digest
         self.candidates.mkdir(parents=True, exist_ok=True)
         # Exports run under the controller lock, so any temporary archive here was left by one that was killed.
@@ -498,9 +503,9 @@ class MapStore:
                             "base changed: the map's template changed after this draft was copied; confirm to overwrite"
                         )
             # Publication is a transaction: validate, stage, move the head (the
-            # commit point), and only then advance the copy. A failed stage or
-            # activation leaves the copy at its old base, so the unchanged
-            # head stays publishable by another review.
+            # commit point). A failed stage or activation leaves the copy at
+            # its old base, so the unchanged head stays publishable by another
+            # review.
             self.versions.prepare(map_id, meta["versionDigest"])
             meta.update(
                 status="accepted",
@@ -511,12 +516,25 @@ class MapStore:
             meta.pop("sourceBranch", None)
             self._write_meta(meta)
             self.activate(map_id, meta["versionDigest"], actor, expected_head)
-            # The published version came from this copy's world, so the copy now
-            # sits on the new head: advance its base pointer, keeping edits.
+            # The copy advance after activation is best effort: the publish is
+            # final at activation. A failing advance is logged and leaves the
+            # copy stale (a stale copy is refused, never merged), and the
+            # result reports the publish plus copyAdvanced False.
+            copy_advanced = True
             if meta.get("workingCopyId") is not None:
-                self.versions.advance_working_copy(
-                    map_id, meta["workingCopyId"], meta["versionDigest"]
-                )
+                try:
+                    copy_advanced = self.versions.advance_working_copy(
+                        map_id, meta["workingCopyId"], meta["versionDigest"]
+                    )
+                except Exception as error:
+                    copy_advanced = False
+                    print(
+                        "candidate: working copy advance failed after publish:"
+                        f" {error!r}",
+                        file=sys.stderr,
+                    )
+            meta["copyAdvanced"] = copy_advanced
+            self._write_meta(meta)
             return meta
         map_package.validate_playable(self._candidate_config(meta))
         if (
@@ -654,6 +672,210 @@ class MapStore:
 
     def checkout(self, map_id: str, version_digest: str, working_copy_id: str) -> dict:
         return self.versions.checkout(map_id, version_digest, working_copy_id)
+
+    def snapshot_working_copy(
+        self, map_id: str, name: str, working_copy_id: str, actor: dict
+    ) -> dict:
+        """Preserve a (possibly stale) draft as a named snapshot; the copy is untouched.
+
+        Records the draft's current world as an immutable version parented at
+        the copy's base — never at the head, never merged — then pins it with
+        the existing snapshot create. An unedited draft adds no new content,
+        so the snapshot points at its base version. The draft is read only
+        after hold_saves() flushed and paused the running editor.
+        """
+        self.versions._actor(actor)
+        self.versions._branch_name(name)
+        with self.hold_saves():
+            target, base_version, base_manifest = self.versions._working_copy_manifest(
+                map_id, working_copy_id
+            )
+            config = self._map_json(map_id, working_copy_id)
+            files = self.versions.world_files(
+                target / "world",
+                json.dumps(config, ensure_ascii=False, indent=2).encode(),
+            )
+            files = self.versions._same_config_files(files, base_manifest["files"])
+        if files == base_manifest["files"]:
+            version = base_version
+        else:
+            version = self.versions._record(
+                map_id,
+                files,
+                parent=base_version,
+                author=actor,
+                created_at=int(self._now() * 1000),
+                source="snapshot",
+                source_id=working_copy_id,
+                note=f"Draft snapshot {name}",
+            )
+        return self.versions.create_snapshot(map_id, name, version, actor)
+
+    def checkout_fresh_copy(self, map_id: str, working_copy_id: str) -> dict:
+        """Start from the current head: materialize it into a new copy id.
+
+        The draft is never read, but the copy lands on disk beside the live
+        editor, so this also runs after hold_saves(). An existing id is
+        refused rather than overwritten.
+        """
+        with self.hold_saves():
+            head = self.versions.head(map_id)
+            if head is None:
+                raise ValueError(
+                    f"map {map_id} has no active head; import and activate it first"
+                )
+            return self.versions.checkout(
+                map_id, head["versionDigest"], working_copy_id
+            )
+
+    def migrate_branches_to_snapshots(self) -> dict:
+        """Store-level linearization: branch refs plus stale legacy drafts.
+
+        Runs the archive migration, then preserves every stale edited draft on
+        a map that had legacy branch refs as a migrated-draft-<hex> snapshot
+        (the draft's content can no longer be committed, so without this it
+        would be silently lost). Each draft is read after hold_saves(); when
+        the editor cannot be paused the draft is logged and left for the
+        explicit snapshot_working_copy path. Unedited drafts need no snapshot:
+        their content is already immutable history. Assumes the controller
+        lock, like every other map mutation.
+        """
+        branch_authors: dict[str, dict] = {}
+        root = self.versions.archive / "branches"
+        if not root.is_symlink() and root.is_dir():
+            for map_dir in sorted(root.iterdir()):
+                if map_dir.is_symlink() or not map_dir.is_dir():
+                    continue
+                for path in sorted(map_dir.glob("*.json")):
+                    try:
+                        value = map_package._json(path.read_bytes())
+                    except (OSError, ValueError):
+                        continue
+                    if (
+                        isinstance(value, dict)
+                        and value.get("mapId") == map_dir.name
+                        and isinstance(value.get("createdBy"), dict)
+                    ):
+                        branch_authors.setdefault(map_dir.name, value["createdBy"])
+        summary = self.versions.migrate_branches_to_snapshots()
+        ref_maps = {entry["mapId"] for entry in summary["migrated"] + summary["atHead"]}
+        draft_snapshots, draft_skipped = [], []
+        drafts = self.versions.active / "drafts"
+        if ref_maps and not drafts.is_symlink() and drafts.is_dir():
+            for copy_dir in sorted(drafts.iterdir()):
+                if copy_dir.is_symlink() or not copy_dir.is_dir():
+                    continue
+                try:
+                    working_copy_id = str(UUID(copy_dir.name))
+                except (ValueError, AttributeError):
+                    continue
+                for map_dir in sorted(copy_dir.iterdir()):
+                    if (
+                        map_dir.is_symlink()
+                        or not map_dir.is_dir()
+                        or map_dir.name not in ref_maps
+                    ):
+                        continue
+                    map_id = map_dir.name
+                    try:
+                        head = self.versions.head(map_id)
+                        head_digest = head["versionDigest"] if head else None
+                        target, base, base_manifest = (
+                            self.versions._working_copy_manifest(
+                                map_id, working_copy_id
+                            )
+                        )
+                    except ValueError as error:
+                        draft_skipped.append(
+                            {
+                                "mapId": map_id,
+                                "workingCopyId": working_copy_id,
+                                "reason": str(error),
+                            }
+                        )
+                        print(
+                            f"workshop: draft snapshot skipped for {map_id}: {error!r}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if head_digest is None or base == head_digest:
+                        continue
+                    actor = branch_authors.get(map_id)
+                    try:
+                        session = self.session(working_copy_id)
+                    except ValueError:
+                        session = None
+                    if session is not None:
+                        actor = session["startedBy"]
+                    if actor is None:
+                        draft_skipped.append(
+                            {
+                                "mapId": map_id,
+                                "workingCopyId": working_copy_id,
+                                "reason": "no draft author",
+                            }
+                        )
+                        print(
+                            "workshop: draft snapshot skipped for"
+                            f" {map_id}: no draft author",
+                            file=sys.stderr,
+                        )
+                        continue
+                    try:
+                        with self.hold_saves():
+                            config = self._map_json(map_id, working_copy_id)
+                            files = self.versions.world_files(
+                                target / "world",
+                                json.dumps(
+                                    config, ensure_ascii=False, indent=2
+                                ).encode(),
+                            )
+                            files = self.versions._same_config_files(
+                                files, base_manifest["files"]
+                            )
+                    except Exception as error:
+                        draft_skipped.append(
+                            {
+                                "mapId": map_id,
+                                "workingCopyId": working_copy_id,
+                                "reason": str(error),
+                            }
+                        )
+                        print(
+                            f"workshop: draft snapshot skipped for {map_id}: {error!r}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if files == base_manifest["files"]:
+                        continue
+                    version = self.versions._record(
+                        map_id,
+                        files,
+                        parent=base,
+                        author=actor,
+                        created_at=int(self._now() * 1000),
+                        source="snapshot",
+                        source_id=working_copy_id,
+                        note=f"Migrated stale draft of {map_id}",
+                    )
+                    name = f"migrated-draft-{version[:12]}"
+                    try:
+                        existing = self.versions.snapshot(map_id, name)
+                    except ValueError:
+                        existing = None
+                    if existing is not None and (existing["versionDigest"] == version):
+                        continue
+                    snap = self.versions.create_snapshot(map_id, name, version, actor)
+                    draft_snapshots.append(
+                        {
+                            "mapId": map_id,
+                            "name": name,
+                            "versionDigest": snap["versionDigest"],
+                        }
+                    )
+        summary["draftSnapshots"] = draft_snapshots
+        summary["draftSkipped"] = draft_skipped
+        return summary
 
     def prepare_session(
         self,
@@ -1494,13 +1716,11 @@ class MapVersions:
         if parent_version is not None:
             self._digest(parent_version)
         if base_version != parent_version:
-            raise ValueError("working copy is behind the map head; resume it first")
+            raise ValueError(STALE_COPY_MESSAGE)
         if working_copy_id is not None:
             self.working_copy(map_id, working_copy_id)
         previous = self.read(map_id, parent_version)["files"] if parent_version else {}
-        # JSON whitespace/key order is not a builder edit; preserve the original blob.
-        if previous and self._same(self._config(files), self._config(previous)):
-            files = files | {"map.json": previous["map.json"]}
+        files = self._same_config_files(files, previous)
         # The first snapshot bootstraps history; every later commit must move it.
         if (
             parent_version is not None
@@ -1519,6 +1739,15 @@ class MapVersions:
             note=note.strip() if isinstance(note, str) else note,
             parents=[parent_version] if parent_version else [],
         )
+
+    def _same_config_files(self, files, previous_files):
+        # JSON whitespace/key order is not a builder edit; keep the old blob
+        # so an untouched draft compares equal to its base version.
+        if previous_files and self._same(
+            self._config(files), self._config(previous_files)
+        ):
+            return files | {"map.json": previous_files["map.json"]}
+        return files
 
     def _config(self, files):
         path = self._verify_blob(files["map.json"])
@@ -2140,72 +2369,6 @@ class MapVersions:
             owner=False,
         )
         _chown_tree(target)
-
-    def _place_blob(self, digest: str, path: Path) -> None:
-        source = self._verify_blob(digest)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".rebase-")
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                with source.open("rb") as origin:
-                    shutil.copyfileobj(origin, handle, 1 << 20)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o664)
-            os.replace(temporary, path)
-            _sync_directory(path.parent)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
-
-    def reconcile_working_copy(
-        self, map_id: str, working_copy_id, head_version: str
-    ) -> str:
-        """Rebase a stale copy onto a descendant head (migrated branch copies).
-
-        Legacy branch commits kept the checkout marker while their branch tip
-        was published as the head. When the copy's base is an ancestor of the
-        named head — proved by walking hash-verified manifests — fast-forward
-        the copy's unchanged files to the head and keep local edits, so the
-        next commit parents the head without dropping anything. A base outside
-        the head's chain is a fork and stays stale.
-        """
-        if working_copy_id is None:
-            raise ValueError("working copy is behind the map head; resume it first")
-        target, base_version, base_manifest = self._working_copy_manifest(
-            map_id, working_copy_id
-        )
-        head_manifest = self.read(map_id, head_version)
-        ancestor, depth = head_version, 0
-        while ancestor != base_version and depth < 10000:
-            parent = self.read(map_id, ancestor).get("parent")
-            if parent is None:
-                break
-            ancestor, depth = parent, depth + 1
-        if ancestor != base_version:
-            raise ValueError("working copy is behind the map head; resume it first")
-        if base_version != head_version:
-            base_files, head_files = base_manifest["files"], head_manifest["files"]
-            for name in sorted(set(base_files) | set(head_files)):
-                old, new = base_files.get(name), head_files.get(name)
-                if old == new:
-                    continue
-                path = target / name
-                if path.is_symlink():
-                    raise ValueError("working copy missing or unsafe")
-                if path.is_file():
-                    if _sha256(path) == old:
-                        pass  # Untouched since the base: take the head's bytes.
-                    else:
-                        continue  # Local edit wins on an explicitly rebased head.
-                elif old is not None:
-                    continue  # Local deletion wins too.
-                if new is None:
-                    path.unlink()
-                    _sync_directory(path.parent)
-                else:
-                    self._place_blob(new, path)
-            self._write_copy_base(target, head_manifest, head_version)
-        return head_version
 
     def advance_working_copy(
         self, map_id: str, working_copy_id: str, version: str

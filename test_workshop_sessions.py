@@ -443,6 +443,75 @@ class GitInboxTests(unittest.TestCase):
             self.assertIn("admin", result["error"])
         self.assertEqual(self.store.versions.head("arena"), self.heads["arena"])
 
+    def test_snapshot_copy_and_checkout_fresh_recover_stale_copy(self):
+        # Round 3 way out through the inbox: a stale session copy is refused,
+        # snapshot-copy preserves its draft, checkout-fresh restarts from head.
+        head = self.heads["arena"]["versionDigest"]
+        other = str(uuid4())
+        self.store.checkout("arena", head, other)
+        other_region = (
+            self.store.versions.working_copy("arena", other) / "world/region/r.0.0.mca"
+        )
+        other_region.write_bytes(b"sibling change")
+        sibling = {"draslId": "b" * 32, "name": "Builder"}
+        committed = self.store.commit(
+            "arena", sibling, "Sibling", working_copy_id=other, expected_head=head
+        )["versionDigest"]
+        review = self.store.review(
+            "arena", sibling, "", working_copy_id=other, expected_head=committed
+        )
+        self.store.publish(
+            review["id"], {"draslId": "a" * 32, "name": "Admin"}, expected_head=head
+        )
+        new_head = self.store.versions.head("arena")["versionDigest"]
+        self.assertEqual(new_head, committed)
+        self.region.write_bytes(b"stale session edit")
+        refused = self.send(
+            "commit",
+            mapId="arena",
+            workingCopyId=self.session["id"],
+            expectedHead=new_head,
+            note="Stale attempt",
+        )
+        self.assertFalse(refused["ok"])
+        self.assertIn("newer version", refused["error"])
+        builder_copy = self.send(
+            "snapshot-copy",
+            mapId="arena",
+            name="stale-arena",
+            workingCopyId=self.session["id"],
+        )
+        self.assertFalse(builder_copy["ok"])
+        self.assertIn("admin", builder_copy["error"])
+        preserved = self.send(
+            "snapshot-copy",
+            actor=self.admin,
+            mapId="arena",
+            name="stale-arena",
+            workingCopyId=self.session["id"],
+        )
+        self.assertTrue(preserved["ok"], preserved["error"])
+        manifest = self.store.versions.read(
+            "arena", preserved["payload"]["versionDigest"]
+        )
+        self.assertEqual(manifest["parent"], head)
+        blob = self.store.versions._verify_blob(
+            manifest["files"]["world/region/r.0.0.mca"]
+        )
+        self.assertEqual(blob.read_bytes(), b"stale session edit")
+        fresh_id = str(uuid4())
+        fresh = self.send("checkout-fresh", mapId="arena", workingCopyId=fresh_id)
+        self.assertTrue(fresh["ok"], fresh["error"])
+        self.assertEqual(fresh["payload"]["versionDigest"], new_head)
+        # The stale copy is untouched by the whole way out.
+        self.assertEqual(self.region.read_bytes(), b"stale session edit")
+        self.assertEqual(
+            self.store.versions.validate_working_copy("arena", self.session["id"])[
+                "versionDigest"
+            ],
+            head,
+        )
+
     def test_candidate_snapshots_current_draft_instead_of_reusing_commit(self):
         first = self.commit(b"committed bytes")
         self.region.write_bytes(b"uncommitted bytes")

@@ -3598,11 +3598,13 @@ class Controller:
             "reject",
             "rollback",
             "checkout",
+            "checkout-fresh",
             "export",
             "limbo-export",
             "commit",
             "compare",
             "snapshot-create",
+            "snapshot-copy",
             "snapshot-delete",
             "snapshots",
         }:
@@ -3640,6 +3642,7 @@ class Controller:
                     "rollback",
                     "limbo-export",
                     "snapshot-create",
+                    "snapshot-copy",
                     "snapshot-delete",
                 },
             )
@@ -3678,6 +3681,7 @@ class Controller:
                             "reject",
                             "rollback",
                             "snapshot-create",
+                            "snapshot-copy",
                             "snapshot-delete",
                         },
                     )
@@ -3714,6 +3718,18 @@ class Controller:
                             document.get("name"),
                             document.get("versionDigest"),
                             actor,
+                        )
+                    elif kind == "snapshot-copy":
+                        result = self.maps.snapshot_working_copy(
+                            map_id,
+                            document.get("name"),
+                            document.get("workingCopyId"),
+                            actor,
+                        )
+                    elif kind == "checkout-fresh":
+                        result = self.maps.checkout_fresh_copy(
+                            map_id,
+                            document.get("workingCopyId"),
                         )
                     elif kind == "snapshot-delete":
                         self.maps.versions.delete_snapshot(map_id, document.get("name"))

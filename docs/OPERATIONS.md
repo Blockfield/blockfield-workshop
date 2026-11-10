@@ -318,6 +318,9 @@ Changed files add blobs; unchanged files reuse hashes. A small full manifest con
 Map history is linear: every manifest has exactly one parent (restores parent the restored-onto head).
 At startup `migrate_branches_to_snapshots()` converts every pre-linear named branch tip that differs from
 the map head into a named snapshot and then removes the branch ref; tips already at the head need no snapshot.
+Stale edited drafts on maps that had branch refs are preserved as `migrated-draft-<hex>` snapshots (unedited
+drafts need none: their content is already immutable history). Each draft is read after saves are held; a draft
+that cannot be paused is logged and left for the explicit `snapshot-copy` path.
 The migration runs under the controller lock, so concurrent CLI invocations cannot race on the refs.
 There is no automatic history/ZIP deletion or binary patch chain. Existing ZIPs/releases/schematics remain intact;
 `BF_LEGACY_CANDIDATES_DIR` reads old candidates without moving them, and current metadata takes precedence.
@@ -389,12 +392,19 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
 - `snapshot-create {mapId, name, versionDigest}` / `snapshot-delete {mapId, name}` / `snapshots {mapId}`
   manage named history pointers beside the head: each snapshot pins one immutable version (generation/author/time
   preserved) and resolves through the same CAS blobs. Snapshots never move the head and are never merged.
+- `snapshot-copy {mapId, name, workingCopyId}` (admin) preserves a stale working-copy draft as a named
+  snapshot: the draft's world is recorded parented at the copy's base and pinned, the copy itself is untouched.
+  `checkout-fresh {mapId, workingCopyId}` materializes the current head into a new copy id (an existing id is
+  refused). Both read the draft only after saves are held, like `candidate`.
 - `candidate {mapId, workingCopyId?, expectedHead?, note?}` snapshots the legacy draft or the identified SSD working copy,
   producing only CAS blobs, an immutable version manifest and metadata (`native:true`, `sha256:null`, `size:null`).
   `baseVersion` tracks the actual head/template or checkout's
   pinned origin; an accepted-but-inactive candidate never becomes another draft's base.
-  `expectedHead` pins the exact current head the commit parents; a moved head refuses the
-  snapshot as stale instead of rebasing it. The immutable candidate freezes `versionDigest` and `targetHead`.
+  `expectedHead` pins the exact current head the commit parents; a moved head, or a
+  working copy whose base is not the current head, refuses the snapshot as stale instead
+  of rebasing it ("the map has a newer version; save your draft as a snapshot and start
+  from the current version"). The way out is `snapshot-copy` plus `checkout-fresh` below.
+  The immutable candidate freezes `versionDigest` and `targetHead`.
 - `candidate {mapId, workingCopyId, expectedHead, commit:true, note}` is the tablet's one-press
   commit-and-review: hot-snapshot the current draft (or read sleeping drafts) onto the current head, then freeze that
   **new** digest and current head into a pending review under the same controller lock. A nonempty 1–200-character
@@ -412,7 +422,9 @@ Controller inbox contract (the same authenticated site/admin envelope and contro
   overwrites only). Missing `expectedHead` is refused; explicit `null` publishes the initial head.
   Stale heads, stale bases, corrupt blobs and insufficient staging space fail before head mutation.
   Acceptance and activation are distinct: if the final head write fails after acceptance, the accepted candidate
-  can be retried with the same explicit expectedHead.
+  can be retried with the same explicit expectedHead. The working-copy advance after activation is best
+  effort: a failing advance is logged and leaves the copy stale, and the result reports the publish plus
+  `copyAdvanced:false`.
   Reviews require the frozen `targetHead`; a changed target needs a fresh review.
   They reject `force`. Only an admin can publish or restore main.
 - `rollback {mapId, versionDigest, expectedHead}` restores that archived tree through a **new** commit parented to

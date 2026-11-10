@@ -143,14 +143,16 @@ def build_controller(
     if branches is not None and (branches.exists() or branches.is_symlink()):
         with controller._locked():
             try:
-                summary = controller.maps.versions.migrate_branches_to_snapshots()
+                summary = controller.maps.migrate_branches_to_snapshots()
             except ValueError as error:
                 raise ValueError(f"map branch migration failed: {error}") from error
         migrated, at_head = summary["migrated"], summary["atHead"]
-        if migrated or at_head:
+        drafts = summary.get("draftSnapshots", [])
+        if migrated or at_head or drafts:
             print(
                 "workshop: linearized map branches: "
-                f"{len(migrated)} snapshots, {len(at_head)} already at head",
+                f"{len(migrated)} snapshots, {len(at_head)} already at head,"
+                f" {len(drafts)} stale drafts preserved",
                 file=sys.stderr,
             )
     os.chmod(directory, 0o700)

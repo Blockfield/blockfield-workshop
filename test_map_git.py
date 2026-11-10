@@ -1,8 +1,10 @@
 """Linear map history: single-parent commits, fast-forward publish, named snapshots."""
 
 import hashlib
+import io
 import json
 import unittest
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -531,7 +533,8 @@ class MapLinearTests(unittest.TestCase):
             "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=first
         )
         (bundle / "world/region/r.0.0.mca").write_bytes(b"edit while review pending")
-        self.store.publish(review["id"], ACTOR, expected_head=self.base)
+        published = self.store.publish(review["id"], ACTOR, expected_head=self.base)
+        self.assertTrue(published["copyAdvanced"])
         self.assertEqual(self.versions.head("konstaxa")["versionDigest"], first)
         self.assertEqual(
             self.versions.validate_working_copy("konstaxa", copy_id)["versionDigest"],
@@ -632,41 +635,42 @@ class MapLinearTests(unittest.TestCase):
         marker = json.loads((bundle / "world" / "blockfield-base.json").read_text())
         self.assertEqual(marker["versionDigest"], committed)
 
-    def test_migrated_copy_published_branch_can_publish_again(self):
-        # r4523970925: legacy branch commits kept the checkout marker and the
-        # branch tip was published without advancing the copy.
-        copy_id, bundle = self.draft()
-        (bundle / "world/region/r.0.0.mca").write_bytes(b"branch work")
-        config = json.loads((bundle / "map.json").read_text())
-        files = self.versions.world_files(bundle / "world", json.dumps(config).encode())
-        tip = self.versions.commit_head(
-            "konstaxa",
-            files,
-            ACTOR,
-            "Branch tip",
-            self.base,
-            copy_id,
-            self.base,
-            source="commit",
+    def test_stale_copy_commit_refused_without_edits(self):
+        # Round 3: no automatic rebase. A copy whose base is not the head is
+        # stale: committing from it is refused with one clear message and the
+        # draft on disk is left untouched.
+        first_id, first_bundle = self.draft()
+        second_id, second_bundle = self.draft()
+        (first_bundle / "world/region/r.0.0.mca").write_bytes(b"first")
+        first = self.commit(first_id, self.base)
+        first_review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=first_id, expected_head=first
         )
-        self.versions.activate("konstaxa", tip, ACTOR, self.base)
-        (bundle / "world/region/r.0.0.mca").write_bytes(b"edit after branch publish")
-        committed = self.commit(copy_id, tip)
-        self.assertEqual(self.versions.read("konstaxa", committed)["parents"], [tip])
-        review = self.store.review(
-            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=committed
-        )
-        self.store.publish(review["id"], ACTOR, expected_head=tip)
-        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], committed)
+        self.store.publish(first_review["id"], ACTOR, expected_head=self.base)
+        (second_bundle / "world/region/r.0.0.mca").write_bytes(b"stale edit")
+        before = set(self.history_parents())
+        with self.assertRaisesRegex(ValueError, "newer version"):
+            self.store.commit(
+                "konstaxa", ACTOR, "stale attempt", working_copy_id=second_id
+            )
+        with self.assertRaisesRegex(ValueError, "newer version"):
+            self.store.commit(
+                "konstaxa",
+                ACTOR,
+                "stale attempt",
+                working_copy_id=second_id,
+                expected_head=first,
+            )
+        self.assertEqual(set(self.history_parents()), before)
         self.assertEqual(
-            (bundle / "world/region/r.0.0.mca").read_bytes(),
-            b"edit after branch publish",
+            (second_bundle / "world/region/r.0.0.mca").read_bytes(), b"stale edit"
         )
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], first)
 
-    def test_sibling_publish_merges_without_reverting(self):
-        # Same-function variant: another copy's publish moves the head; this
-        # copy's base is an ancestor, so its world rebases onto the head (the
-        # sibling's file changes merge in, local edits win) instead of going stale.
+    def test_stale_copy_snapshot_and_fresh_copy_after_hold(self):
+        # Round 3 way out: an explicit snapshot preserves the stale draft and
+        # a fresh copy starts from the current head. Both read the draft only
+        # after hold_saves() flushed and paused the editor.
         first_id, first_bundle = self.draft()
         second_id, second_bundle = self.draft()
         (first_bundle / "world/region/r.0.0.mca").write_bytes(b"sibling change")
@@ -675,23 +679,182 @@ class MapLinearTests(unittest.TestCase):
             "konstaxa", ACTOR, "", working_copy_id=first_id, expected_head=first
         )
         self.store.publish(first_review["id"], ACTOR, expected_head=self.base)
-        config = json.loads((second_bundle / "map.json").read_text())
-        config["name"] = "Renamed"
-        (second_bundle / "map.json").write_text(json.dumps(config))
-        committed = self.commit(second_id, first)
-        self.assertEqual(self.versions.read("konstaxa", committed)["parents"], [first])
-        # The sibling's region change merged into this copy; the local rename kept.
+        (second_bundle / "world/region/r.0.0.mca").write_bytes(b"stale draft edit")
+        events = []
+        real_hold, real_map_json = self.store.hold_saves, self.store._map_json
+
+        @contextmanager
+        def hold():
+            events.append("hold-enter")
+            with real_hold():
+                yield
+            events.append("hold-exit")
+
+        def spy_map_json(map_id, working_copy_id=None):
+            events.append("draft-read")
+            return real_map_json(map_id, working_copy_id)
+
+        with (
+            mock.patch.object(self.store, "hold_saves", hold),
+            mock.patch.object(self.store, "_map_json", side_effect=spy_map_json),
+        ):
+            snap = self.store.snapshot_working_copy(
+                "konstaxa", "stale-draft", second_id, ACTOR
+            )
+        self.assertEqual(events, ["hold-enter", "draft-read", "hold-exit"])
+        preserved = self.versions.read("konstaxa", snap["versionDigest"])
         self.assertEqual(
-            (second_bundle / "world/region/r.0.0.mca").read_bytes(), b"sibling change"
+            self.versions._verify_blob(
+                preserved["files"]["world/region/r.0.0.mca"]
+            ).read_bytes(),
+            b"stale draft edit",
+        )
+        # The stale copy itself is untouched: still at its old base with edits.
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", second_id)["versionDigest"],
+            self.base,
         )
         self.assertEqual(
-            json.loads((second_bundle / "map.json").read_text())["name"], "Renamed"
+            (second_bundle / "world/region/r.0.0.mca").read_bytes(),
+            b"stale draft edit",
         )
-        second_review = self.store.review(
-            "konstaxa", ACTOR, "", working_copy_id=second_id, expected_head=committed
+        # The way back in: a fresh copy from the current head, then publish.
+        fresh_id = str(uuid4())
+        with mock.patch.object(self.store, "hold_saves", hold):
+            fresh = self.store.checkout_fresh_copy("konstaxa", fresh_id)
+            self.assertEqual(events[-2:], ["hold-enter", "hold-exit"])
+        self.assertEqual(fresh["versionDigest"], first)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.store.checkout_fresh_copy("konstaxa", second_id)
+        fresh_bundle = Path(fresh["bundle"])
+        (fresh_bundle / "world/region/r.0.0.mca").write_bytes(b"rebuilt on head")
+        committed = self.commit(fresh_id, first)
+        review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=fresh_id, expected_head=committed
         )
-        self.store.publish(second_review["id"], ACTOR, expected_head=first)
+        published = self.store.publish(review["id"], ACTOR, expected_head=first)
+        self.assertTrue(published["copyAdvanced"])
         self.assertEqual(self.versions.head("konstaxa")["versionDigest"], committed)
+
+    def _publish_branch_tip(self, copy_id, bundle, note="Branch tip"):
+        config = json.loads((bundle / "map.json").read_text())
+        files = self.versions.world_files(bundle / "world", json.dumps(config).encode())
+        tip = self.versions.commit_head(
+            "konstaxa",
+            files,
+            ACTOR,
+            note,
+            self.base,
+            copy_id,
+            self.base,
+            source="commit",
+        )
+        self.versions.activate("konstaxa", tip, ACTOR, self.base)
+        return tip
+
+    def test_migration_snapshots_published_branch_draft(self):
+        # Round 3: a migrated copy whose legacy branch was published is stale
+        # by rule 1. Migration preserves its draft as a named snapshot —
+        # no rebase, no content loss, copy and head untouched.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"branch work")
+        tip = self._publish_branch_tip(copy_id, bundle)
+        self._write_branch_ref("konstaxa", "work-old", tip, generation=2)
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"edit after publish")
+        plain_id, _plain_bundle = self.draft()
+        summary = self.store.migrate_branches_to_snapshots()
+        self.assertEqual(
+            summary["atHead"],
+            [{"mapId": "konstaxa", "name": "work-old", "versionDigest": tip}],
+        )
+        self.assertEqual(len(summary["draftSnapshots"]), 1)
+        snap = self.versions.snapshot("konstaxa", summary["draftSnapshots"][0]["name"])
+        preserved = self.versions.read("konstaxa", snap["versionDigest"])
+        self.assertEqual(
+            self.versions._verify_blob(
+                preserved["files"]["world/region/r.0.0.mca"]
+            ).read_bytes(),
+            b"edit after publish",
+        )
+        # The unedited copy needed no snapshot: its content is the old head.
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", plain_id)["versionDigest"],
+            self.base,
+        )
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], tip)
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", copy_id)["versionDigest"],
+            self.base,
+        )
+        again = self.store.migrate_branches_to_snapshots()
+        self.assertEqual(
+            again,
+            {"migrated": [], "atHead": [], "draftSnapshots": [], "draftSkipped": []},
+        )
+
+    def test_migration_hold_failure_leaves_draft_for_explicit_path(self):
+        # Round 3: when the running editor cannot be paused, migration logs
+        # the draft and leaves it for the explicit snapshot path.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"branch work")
+        tip = self._publish_branch_tip(copy_id, bundle)
+        self._write_branch_ref("konstaxa", "work-old", tip, generation=2)
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"unsaved draft edit")
+
+        @contextmanager
+        def dead_hold():
+            raise RuntimeError("save-on did not confirm autosave restored")
+            yield
+
+        log = io.StringIO()
+        with (
+            mock.patch.object(self.store, "hold_saves", dead_hold),
+            redirect_stderr(log),
+        ):
+            summary = self.store.migrate_branches_to_snapshots()
+        self.assertEqual(summary["draftSnapshots"], [])
+        self.assertEqual(len(summary["draftSkipped"]), 1)
+        self.assertIn("konstaxa", log.getvalue())
+        self.assertEqual(
+            summary["atHead"],
+            [{"mapId": "konstaxa", "name": "work-old", "versionDigest": tip}],
+        )
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], tip)
+        self.assertEqual(
+            (bundle / "world/region/r.0.0.mca").read_bytes(), b"unsaved draft edit"
+        )
+
+    def test_advance_failure_after_activation_still_reports_publish(self):
+        # r4524172368: the publish is final at activation. A failing copy
+        # advance is best effort: the publish reports success with
+        # copyAdvanced False and the copy stays stale for the explicit path.
+        copy_id, bundle = self.draft()
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"first edit")
+        self.commit(copy_id, self.base)
+        (bundle / "world/region/r.0.0.mca").write_bytes(b"second edit")
+        second = self.commit(copy_id, self.base)
+        second_review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=copy_id, expected_head=second
+        )
+        with mock.patch.object(
+            self.versions,
+            "advance_working_copy",
+            side_effect=OSError("disk full"),
+        ):
+            with redirect_stderr(io.StringIO()):
+                published = self.store.publish(
+                    second_review["id"], ACTOR, expected_head=self.base
+                )
+        self.assertFalse(published["copyAdvanced"])
+        self.assertEqual(published["status"], "accepted")
+        self.assertEqual(self.versions.head("konstaxa")["versionDigest"], second)
+        self.assertEqual(
+            self.versions.validate_working_copy("konstaxa", copy_id)["versionDigest"],
+            self.base,
+        )
+        self.assertEqual(
+            (bundle / "world/region/r.0.0.mca").read_bytes(), b"second edit"
+        )
 
     def test_forked_copy_is_not_rebased(self):
         # Same-function variant: a base outside the head's parent chain is a
