@@ -412,11 +412,42 @@ print(json.dumps(stored))
 """
 
 
+def _provision_ai_key_dir_as_root(base) -> None:
+    """Fresh install under a root controller: create the key dir for its owner.
+
+    Only when `base` is root-owned and nobody else can write it: then no
+    other user can have planted or can swap the entry, so root's mkdir and
+    the fchown of that very directory (by descriptor) are not a confused
+    deputy. Anything else is left for the owner-side checks to judge.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        base_fd = os.open(base, flags)
+    except OSError:
+        return
+    try:
+        info = os.fstat(base_fd)
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            return
+        try:
+            os.mkdir("blockfield-workshop", 0o755, dir_fd=base_fd)
+        except FileExistsError:
+            return
+        dir_fd = os.open("blockfield-workshop", flags, dir_fd=base_fd)
+        try:
+            os.fchown(dir_fd, AI_KEY_UID, AI_KEY_GID)
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(base_fd)
+
+
 def _write_ai_key_as_owner(base, filename: str, kind: str, key: str | None) -> dict:
     """Run _write_ai_key as AI_KEY_UID: in-process when we are that user,
     in a child that drops to it when we are root, refused otherwise."""
     if os.geteuid() != 0:
         return _write_ai_key(base, filename, kind, key)
+    _provision_ai_key_dir_as_root(base)
     import subprocess
 
     result = subprocess.run(

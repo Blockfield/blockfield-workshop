@@ -435,6 +435,61 @@ class ProviderKeyAsOwnerTests(unittest.TestCase):
         self.assertFalse(stored["set"])
         self.assertFalse(path.exists())
 
+    def fake_base_owner(self, uid):
+        real_fstat = os.fstat
+        base = self.base
+
+        class FakeStat:
+            def __init__(self, info):
+                self.st_mode, self.st_gid, self.st_ino = (
+                    info.st_mode,
+                    info.st_gid,
+                    info.st_ino,
+                )
+                self.st_uid = uid
+
+        def patched(fd, *args, **kwargs):
+            info = real_fstat(fd, *args, **kwargs)
+            try:
+                resolved = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                return info
+            return FakeStat(info) if Path(resolved) == base else info
+
+        return mock.patch("controller.os.fstat", side_effect=patched)
+
+    def test_root_provisions_fresh_dir_in_root_only_base(self):
+        """r4523045435: fresh install, root-owned 0755 data dir, no key dir yet.
+        Root creates it for the owner (fchown by descriptor), then the owner
+        child writes the key."""
+        (self.base / "blockfield-workshop").rmdir()
+        chowned = []
+        with (
+            self.fake_base_owner(0),
+            mock.patch(
+                "controller.os.fchown",
+                side_effect=lambda fd, u, g: chowned.append((u, g)),
+            ),
+        ):
+            stored, _ = self.run_as_owner("sk-or-" + "c" * 40)
+        self.assertEqual(chowned, [(os.getuid(), controller.AI_KEY_GID)])
+        self.assertTrue(stored["set"])
+
+    def test_root_never_provisions_in_a_base_others_can_write(self):
+        (self.base / "blockfield-workshop").rmdir()
+        os.chmod(self.base, 0o777)
+        self.addCleanup(os.chmod, self.base, 0o755)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("root must not chown in a shared base")
+
+        with (
+            self.fake_base_owner(0),
+            mock.patch("controller.os.fchown", side_effect=forbidden),
+        ):
+            controller._provision_ai_key_dir_as_root(self.base)
+        self.assertFalse((self.base / "blockfield-workshop").exists())
+
     def test_child_failure_is_a_value_error_without_the_key(self):
         os.chmod(self.base / "blockfield-workshop", 0o777)
         key = "sk-or-" + "b" * 40
