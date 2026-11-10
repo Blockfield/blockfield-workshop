@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from controller import (
     AI_SIDECAR_KEY_NAME,
@@ -47,6 +48,62 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
             ensure_ai_sidecar_key(self.base).read_text(),
             "operator-managed-secret-0123456789-_AB",
         )
+
+    def test_hardens_existing_key_permissions(self):
+        path = self.key_path()
+        path.parent.mkdir(parents=True)
+        path.write_text("operator-managed-secret-0123456789-_AB")
+        os.chmod(path, 0o644)
+        self.assertEqual(
+            ensure_ai_sidecar_key(self.base).read_text(),
+            "operator-managed-secret-0123456789-_AB",
+        )
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_rejects_symlink_key(self):
+        target = self.dir / "elsewhere.key"
+        target.write_text("operator-managed-secret-0123456789-_AB")
+        path = self.key_path()
+        path.parent.mkdir(parents=True)
+        path.symlink_to(target)
+        with self.assertRaises(ValueError):
+            ensure_ai_sidecar_key(self.base)
+
+    def test_rejects_invalid_existing_key(self):
+        path = self.key_path()
+        path.parent.mkdir(parents=True)
+        path.write_text("too short")
+        with self.assertRaises(ValueError):
+            ensure_ai_sidecar_key(self.base)
+
+    def test_tolerates_unprivileged_chown(self):
+        with mock.patch("controller.os.chown", side_effect=PermissionError):
+            first = ensure_ai_sidecar_key(self.base)
+            self.assertTrue(AI_SIDECAR_KEY_PATTERN.fullmatch(first.read_text()))
+            self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+            second = ensure_ai_sidecar_key(self.base)
+            self.assertEqual(second.read_text(), first.read_text())
+
+    def test_unprivileged_run_keeps_caller_owned_directory(self):
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        with (
+            mock.patch("controller.AI_KEY_UID", 1999),
+            mock.patch("controller.AI_KEY_GID", 1999),
+            mock.patch("controller.os.geteuid", return_value=1000),
+        ):
+            ensure_ai_sidecar_key(self.base)  # must not raise for the caller-owned dir
+
+    def test_privileged_run_still_fails_closed_on_foreign_directory(self):
+        directory = self.base / "blockfield-workshop"
+        directory.mkdir(parents=True)
+        with (
+            mock.patch("controller.AI_KEY_UID", 1999),
+            mock.patch("controller.AI_KEY_GID", 1999),
+            mock.patch("controller.os.geteuid", return_value=0),
+        ):
+            with self.assertRaises(ValueError):
+                ensure_ai_sidecar_key(self.base)
 
     def test_controller_init_ensures_key(self):
         inbox = self.dir / "inbox"

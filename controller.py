@@ -157,34 +157,55 @@ AI_SIDECAR_KEY_NAME = "ai-sidecar.key"
 AI_SIDECAR_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,2048}")
 
 
+def _chown_ai_key(path: Path) -> None:
+    """Best-effort chown to 1000:1000; unprivileged runs keep caller ownership."""
+    try:
+        os.chown(path, AI_KEY_UID, AI_KEY_GID)
+    except PermissionError:
+        pass  # tests and non-root runs: the key stays with the caller's ownership
+
+
 def ensure_ai_sidecar_key(base: Path) -> Path:
     """Create the AI sidecar Bearer secret once; never rotate or overwrite here.
 
-    Returns the key path. An existing file (or symlink attack surface) is left alone:
-    rotation is an explicit operator action, not a controller step.
+    Returns the key path. An existing regular file is hardened in place
+    (0600, validated) and never rotated: rotation is an explicit operator
+    action, not a controller step. Anything else fails closed.
     """
     directory, path = (
         Path(base) / "blockfield-workshop",
         Path(base) / f"blockfield-workshop/{AI_SIDECAR_KEY_NAME}",
     )
-    if path.exists() or path.is_symlink():
+    if path.is_symlink():
+        raise ValueError("unsafe ai-sidecar-key path")
+    if path.exists():
+        # Harden a pre-existing operator key: never leave a Bearer secret
+        # world-readable. Symlinks are rejected above so chmod/chown below
+        # can only touch the real key file.
+        _chown_ai_key(path)
+        os.chmod(path, 0o600)
+        if AI_SIDECAR_KEY_PATTERN.fullmatch(path.read_text().strip()) is None:
+            raise ValueError("invalid ai-sidecar key file")
         return path
     try:
         info = os.stat(directory)
     except FileNotFoundError:
         directory.mkdir(mode=0o755, parents=True)
         os.chmod(directory, 0o755)
-        os.chown(directory, AI_KEY_UID, AI_KEY_GID)
+        _chown_ai_key(directory)
     else:
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != AI_KEY_UID
-            or info.st_gid != AI_KEY_GID
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("unsafe ai-sidecar-key directory")
+        _chown_ai_key(directory)
+        info = os.stat(directory)
+        if os.geteuid() == 0 and (
+            info.st_uid != AI_KEY_UID or info.st_gid != AI_KEY_GID
         ):
             raise ValueError("unsafe ai-sidecar-key directory")
     data = secrets.token_urlsafe(32).encode()
     assert AI_SIDECAR_KEY_PATTERN.fullmatch(data.decode())
-    atomic_write(path, data, owner=(AI_KEY_UID, AI_KEY_GID))
+    atomic_write(path, data)
+    _chown_ai_key(path)
     return path
 
 

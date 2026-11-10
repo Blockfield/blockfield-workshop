@@ -16,10 +16,13 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.Base64;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Contract shapes over a live loopback server: auth, stub endpoints, idempotency. */
 class AiSidecarTest {
@@ -28,15 +31,29 @@ class AiSidecarTest {
     private HttpServer server;
     private HttpClient client;
     private String base;
+    private AtomicReference<Instant> now;
 
     @BeforeEach
     void start() throws Exception {
-        server =
-                AiSidecar.start(
-                        "127.0.0.1",
-                        0,
-                        SECRET,
-                        Clock.fixed(Instant.parse("2026-11-09T00:00:00Z"), ZoneOffset.UTC));
+        now = new AtomicReference<>(Instant.parse("2026-11-09T00:00:00Z"));
+        Clock clock =
+                new Clock() {
+                    @Override
+                    public ZoneId getZone() {
+                        return ZoneOffset.UTC;
+                    }
+
+                    @Override
+                    public Clock withZone(ZoneId zone) {
+                        return this;
+                    }
+
+                    @Override
+                    public Instant instant() {
+                        return now.get();
+                    }
+                };
+        server = AiSidecar.start("127.0.0.1", 0, SECRET, clock);
         base = "http://127.0.0.1:" + server.getAddress().getPort();
         client = HttpClient.newHttpClient();
     }
@@ -165,6 +182,18 @@ class AiSidecarTest {
     void unknownJobIs404() throws Exception {
         HttpResponse<String> response = get("/v1/jobs/" + UUID.randomUUID(), "Bearer " + SECRET);
         assertEquals(404, response.statusCode());
+    }
+
+    @Test
+    void expiredJobIs404() throws Exception {
+        String requestId = UUID.randomUUID().toString();
+        HttpResponse<String> created =
+                post("/v1/generate", generateBody(requestId, "hut"), "Bearer " + SECRET);
+        assertEquals(200, created.statusCode());
+        String jobId = new JSONObject(created.body()).getString("jobId");
+        assertEquals(200, get("/v1/jobs/" + jobId, "Bearer " + SECRET).statusCode());
+        now.set(now.get().plus(Duration.ofHours(25)));
+        assertEquals(404, get("/v1/jobs/" + jobId, "Bearer " + SECRET).statusCode());
     }
 
     @Test

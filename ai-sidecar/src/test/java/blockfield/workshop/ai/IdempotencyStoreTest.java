@@ -112,4 +112,32 @@ class IdempotencyStoreTest {
                 });
         assertEquals(1, calls.get());
     }
+
+    @Test
+    void expiredEntriesArePurged() {
+        AtomicReference<Instant> now = new AtomicReference<>(NOW);
+        Clock clock =
+                new Clock() {
+                    @Override
+                    public ZoneId getZone() {
+                        return ZoneOffset.UTC;
+                    }
+
+                    @Override
+                    public Clock withZone(ZoneId zone) {
+                        return this;
+                    }
+
+                    @Override
+                    public Instant instant() {
+                        return now.get();
+                    }
+                };
+        IdempotencyStore store = new IdempotencyStore(clock);
+        store.use("generate:old", IdempotencyStore.sha256(new byte[] {1}), () -> stored(200, "{}"));
+        assertEquals(1, store.size());
+        now.set(NOW.plus(Duration.ofHours(25)));
+        store.use("generate:new", IdempotencyStore.sha256(new byte[] {2}), () -> stored(200, "{}"));
+        assertEquals(1, store.size());
+    }
 }

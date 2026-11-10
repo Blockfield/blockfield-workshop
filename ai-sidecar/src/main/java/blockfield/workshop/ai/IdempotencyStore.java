@@ -48,10 +48,12 @@ final class IdempotencyStore {
 
     /**
      * Returns the stored outcome for key+hash, computes and stores it when absent, or throws {@link
-     * ConflictException} when the key exists with a different hash.
+     * ConflictException} when the key exists with a different hash. Entries past {@link
+     * #RETAIN_MILLIS} are purged first, so the store never retains anything without bound.
      */
     synchronized Stored use(String key, byte[] hash, Supplier<Stored> compute) {
         long now = clock.millis();
+        purgeExpired(now);
         Entry existing = entries.get(key);
         if (existing != null) {
             if (now - existing.storedAt > RETAIN_MILLIS) {
@@ -69,5 +71,15 @@ final class IdempotencyStore {
 
     synchronized void forget(String key) {
         entries.remove(key);
+    }
+
+    private void purgeExpired(long now) {
+        entries.entrySet().removeIf(entry -> now - entry.getValue().storedAt > RETAIN_MILLIS);
+    }
+
+    /** Test hook: live entry count after purging expired entries. */
+    synchronized int size() {
+        purgeExpired(clock.millis());
+        return entries.size();
     }
 }

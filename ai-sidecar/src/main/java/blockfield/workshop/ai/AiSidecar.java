@@ -36,11 +36,16 @@ public final class AiSidecar {
     static final Pattern PALETTE_ENTRY = Pattern.compile("[a-z0-9_.\\-]+:[a-z0-9_./\\-]+");
 
     private final String secret;
+    private final Clock clock;
     private final IdempotencyStore idempotency;
-    private final Map<String, JSONObject> jobs = new ConcurrentHashMap<>();
+    private final Map<String, Job> jobs = new ConcurrentHashMap<>();
+
+    /** A completed stub plan with its creation time; jobs older than the idempotency window 404. */
+    private record Job(JSONObject plan, long storedAt) {}
 
     AiSidecar(String secret, Clock clock) {
         this.secret = secret;
+        this.clock = clock;
         this.idempotency = new IdempotencyStore(clock);
     }
 
@@ -126,13 +131,14 @@ public final class AiSidecar {
             deadline(request);
             byte[] hash = IdempotencyStore.sha256(body);
             String idempotencyKey = "generate:" + key;
+            purgeExpiredJobs(clock.millis());
             IdempotencyStore.Stored stored =
                     idempotency.use(
                             idempotencyKey,
                             hash,
                             () -> {
                                 String jobId = UUID.randomUUID().toString();
-                                jobs.put(jobId, stubPlan());
+                                jobs.put(jobId, new Job(stubPlan(), clock.millis()));
                                 return json(200, new JSONObject().put("jobId", jobId));
                             });
             send(
@@ -211,14 +217,23 @@ public final class AiSidecar {
             if (id.startsWith("/")) {
                 id = id.substring(1);
             }
-            JSONObject plan = id.isEmpty() || id.contains("/") ? null : jobs.get(id);
-            if (plan == null) {
+            purgeExpiredJobs(clock.millis());
+            Job job = id.isEmpty() || id.contains("/") ? null : jobs.get(id);
+            if (job == null) {
                 throw new HttpError(404, "request", "http", "unknown job");
             }
-            send(exchange, 200, new JSONObject().put("phase", "done").put("plan", plan));
+            send(exchange, 200, new JSONObject().put("phase", "done").put("plan", job.plan()));
         } catch (HttpError e) {
             send(exchange, e.status, e.envelope());
         }
+    }
+
+    /** Jobs share the idempotency retention window; expired entries never accumulate. */
+    private void purgeExpiredJobs(long now) {
+        jobs.entrySet()
+                .removeIf(
+                        entry ->
+                                now - entry.getValue().storedAt() > IdempotencyStore.RETAIN_MILLIS);
     }
 
     // Validation.
