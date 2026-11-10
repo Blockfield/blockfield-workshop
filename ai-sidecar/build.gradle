@@ -1,0 +1,39 @@
+plugins {
+    id "java"
+    id "application"
+}
+
+group = "blockfield.workshop"
+version = "0.1.0"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+application {
+    mainClass = "blockfield.workshop.ai.AiSidecar"
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.release = 21
+}
+
+// Identical commit -> identical jar (mod precedent: reproducible archives).
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+dependencies {
+    implementation "org.json:json:20250517"
+    testImplementation "org.junit.jupiter:junit-jupiter:5.11.3"
+    testRuntimeOnly "org.junit.jupiter:junit-jupiter-engine:5.11.3"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.11.3"
+}
+
+tasks.named("test", Test) {
+    useJUnitPlatform()
+}
