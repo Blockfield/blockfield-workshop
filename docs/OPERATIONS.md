@@ -880,12 +880,17 @@ after the RCON fence resurrects java, which then reads as alive-but-unselected a
    `DOKPLOY_SERVER_WEBHOOK`; no PAT, no Dokploy API token anywhere). Until this is done the release workflow
    still moves `:approved` but skips the Workshop redeploy with a warning. Rollback is a manual dispatch of
    `move-approved-tag.yml` with an older verified release tag, from the GitHub UI.
-2. Controller secret files: the controller needs NO GitHub or webhook secret anymore. Delete
-   `ghcr-package-token` (legacy) and `workshop-deploy-webhook-url` from the controller app
-   `blockfield-workshop-controller` (`FZqi5pLyiucGEmoMqvjEm`) once this revision deploys — coordinator note,
-   do not edit Dokploy from an agent session. Set the Workshop restart policy so a stopped Java is **not**
-   resurrected automatically: RCON `stop` must stay stopped until the next release-driven webhook deploy,
-   otherwise fencing cannot go quiet.
+2. Controller secrets: the Workshop app's deploy webhook URL
+   (`WORKSHOP_DEPLOY_WEBHOOK_URL`, secret; or `WORKSHOP_DEPLOY_WEBHOOK_URL_FILE`
+   pointing at a mounted secret file — same URL the server CI holds as
+   `DOKPLOY_WORKSHOP_WEBHOOK`), so a stopped editor restarts without a manual
+   deploy. Still no GitHub secret and no Dokploy API token anywhere. Delete the
+   legacy `ghcr-package-token` and `workshop-deploy-webhook-url` secrets from the
+   controller app `blockfield-workshop-controller` (`FZqi5pLyiucGEmoMqvjEm`) once
+   this revision deploys — coordinator note, do not edit Dokploy from an agent
+   session. Set the Workshop restart policy so a stopped Java is **not**
+   resurrected automatically: RCON `stop` must stay stopped until the webhook
+   redeploy, otherwise fencing cannot go quiet.
 3. Private network only: reachable RCON host/port with the Workshop's own password
    (`BF_WORKSHOP_RCON_HOST`, `BF_WORKSHOP_RCON_PORT`, `BF_WORKSHOP_RCON_PASSWORD_FILE`, 0600). Never publish
    RCON or reuse the Game password.
@@ -1024,12 +1029,15 @@ Create application `blockfield-workshop-controller` exactly as
   `BF_STEP_FOLLOW_S=12`, `BF_STEP_POLL_S=2`, `BF_HEALTH_PORT=8080`,
   `BF_WORKSHOP_RCON_HOST=blockfield-workshop`,
   `BF_WORKSHOP_RCON_PORT=25575`.
-- Secret by NAME only (one Dokploy-managed secret file, read-only 0400 at
-  `/run/secrets/`, referenced as `BF_WORKSHOP_RCON_PASSWORD_FILE`): the
-  Workshop's own RCON password (never the Game password). No GitHub or
-  webhook secret on the controller: delete `ghcr-package-token` (legacy) and
-  `workshop-deploy-webhook-url` from the controller app once this revision
-  deploys (coordinator note).
+- Secrets by NAME only (Dokploy-managed secret files, read-only 0400 at
+  `/run/secrets/`): the Workshop's own RCON password (never the Game password),
+  referenced as `BF_WORKSHOP_RCON_PASSWORD_FILE`; and the Workshop app's deploy
+  webhook URL (secret, same value the server CI holds as
+  `DOKPLOY_WORKSHOP_WEBHOOK`), either as `WORKSHOP_DEPLOY_WEBHOOK_URL` or via
+  `WORKSHOP_DEPLOY_WEBHOOK_URL_FILE` pointing at a mounted secret file. Unset
+  keeps the manual-deploy path with a warning. No GitHub secret, no API token:
+  delete `ghcr-package-token` (legacy) and the legacy `workshop-deploy-webhook-url`
+  entry from the controller app once this revision deploys (coordinator note).
 - No `docker.sock`, no `privileged`, no `cap_add`, no host namespaces
   (`network_mode/pid/ipc: host`), no `/proc`, `/sys`, `/var/run` mounts.
   Any host bind proposed for the data interface needs a separate owner
@@ -1045,9 +1053,12 @@ Create application `blockfield-workshop-controller` exactly as
    At W07 creation time verify Dokploy actually mounts these as secret
    files (the compose `secrets:` file resolution is docs-only and was never
    executed offline).
-   The controller holds NO GitHub or webhook secret: after this revision deploys, delete the legacy
-   `ghcr-package-token` and `workshop-deploy-webhook-url` secrets from the controller app
-   `blockfield-workshop-controller` (`FZqi5pLyiucGEmoMqvjEm`) — coordinator note, never from an agent session.
+   The controller holds no GitHub secret and no API token. It needs the Workshop
+   app's deploy webhook URL again (`WORKSHOP_DEPLOY_WEBHOOK_URL` or its `_FILE`
+   variant, same value as `DOKPLOY_WORKSHOP_WEBHOOK`): after this revision deploys,
+   delete the legacy `ghcr-package-token` and `workshop-deploy-webhook-url` secrets
+   from the controller app `blockfield-workshop-controller` (`FZqi5pLyiucGEmoMqvjEm`)
+   — coordinator note, never from an agent session.
 
 ### Step 4 — import state into the volumes (root; new app still stopped)
 
