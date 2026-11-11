@@ -4,12 +4,15 @@ Mechanism (owner decision 2026-10-30): the server release CI owns the fixed
 GHCR tag (``<repository>:approved``) — it moves the tag to the verified
 release with its own GITHUB_TOKEN after release verification passes, then
 triggers the Workshop app redeploy through the app's Dokploy webhook. This
-backend never moves tags and never calls webhooks: start() only persists the
-verified selection (profile.json) and clears the READY file, while
-save/stop/status go through direct private-network RCON plus the mod's READY
+backend never moves tags. start() persists the verified selection
+(profile.json) and clears the READY file, then POSTs the Workshop app's
+deploy webhook when WORKSHOP_DEPLOY_WEBHOOK_URL is set, so a stopped
+editor restarts without a manual deploy; unset keeps the manual-deploy
+behaviour. save/stop/status go through direct private-network RCON plus the mod's READY
 file. The approved release is read back from the running Workshop (READY +
 selection) for reporting only. No docker CLI, no Dokploy API token, no
-GitHub credentials at all: only the Workshop's own RCON password.
+GitHub credentials at all: only the Workshop's own RCON password plus,
+optionally, the deploy webhook URL (both secrets, never logged).
 
 The old DockerBackend stays authoritative (see docs/OPERATIONS.md); this
 module is staged beside it and shares the controller Backend protocol, the
@@ -19,19 +22,31 @@ profile.json selection schema and the READY-file contract.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import socket
 import struct
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from controller import Goal, Process, atomic_write
 
+logger = logging.getLogger(__name__)
+
 READY_FILE = ".blockfield-ready.json"
 UNKNOWN_SESSION = "00000000-0000-0000-0000-000000000000"
+
+DEPLOY_WEBHOOK_ENV = "WORKSHOP_DEPLOY_WEBHOOK_URL"
+DEPLOY_WEBHOOK_FILE_ENV = "WORKSHOP_DEPLOY_WEBHOOK_URL_FILE"
+DEPLOY_WEBHOOK_TIMEOUT_S = 10.0
+DEPLOY_WEBHOOK_ATTEMPTS = 3
+DEPLOY_WEBHOOK_RETRY_DELAY_S = 2.0
+DEPLOY_WEBHOOK_RESPONSE_CAP = 65536
 
 
 class RconError(RuntimeError):
@@ -62,6 +77,26 @@ def read_secret(
         if secret:
             return secret
     raise error(f"{what} credential is not configured")
+
+
+def _post_deploy_webhook(url: str, timeout_s: float = DEPLOY_WEBHOOK_TIMEOUT_S) -> None:
+    """POST one Dokploy deploy webhook; raise without ever carrying the URL."""
+    from cp_client import _NoRedirect
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    request = urllib.request.Request(url, data=b"", method="POST")
+    try:
+        with opener.open(request, timeout=timeout_s) as response:
+            response.read(DEPLOY_WEBHOOK_RESPONSE_CAP + 1)
+            status = response.status
+    except urllib.error.HTTPError as error:
+        try:
+            error.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"deploy webhook answered http {error.code}") from error
+    if not 200 <= status <= 299:
+        raise RuntimeError(f"deploy webhook answered http {status}")
 
 
 class RconClient:
@@ -190,9 +225,12 @@ class DokployBackend:
 
     Observes the mod's READY file plus an RCON liveness probe (TCP connect,
     no auth), saves through ``save-all flush`` and stops through RCON
-    ``stop``. start() only persists the verified selection and clears the
+    ``stop``. start() persists the verified selection and clears the
     READY file — the :approved rollout itself is the server release CI's
-    job; the approved release is read back from the running Workshop for
+    job — then POSTs the Workshop app's Dokploy deploy webhook when
+    WORKSHOP_DEPLOY_WEBHOOK_URL is set, so a stopped editor restarts
+    without a manual deploy; unset keeps the manual-deploy path. The
+    approved release is read back from the running Workshop for
     reporting only. Never touches Game: observe() reports Workshop/test
     only, so Game reads as unavailable.
     """
@@ -274,6 +312,9 @@ class DokployBackend:
         if shutil.disk_usage(self.data).free < self.min_free_bytes:
             raise OSError("not enough free space for the backend data")
         self._digest(goal.release)
+        # Fail closed on a misconfigured webhook secret before anything
+        # stops: a set-but-invalid URL raises here, never mid-restart.
+        self._deploy_webhook_url()
 
     def _digest(self, release: str) -> str:
         import releases as release_catalog
@@ -533,12 +574,81 @@ class DokployBackend:
                 pass
         return str(uuid4())
 
+    def _deploy_webhook_url(self) -> str:
+        """Workshop app's Dokploy deploy webhook URL, or "" when unset.
+
+        Direct env var first, then a secret file, mirroring the RCON
+        password lookup. Set-but-invalid raises (fail closed); unset is
+        not an error — the caller keeps the manual-deploy path. The URL
+        itself never appears in errors: it is a secret.
+        """
+        from cp_client import _check_cp_url
+
+        url = os.environ.get(DEPLOY_WEBHOOK_ENV, "").strip()
+        if not url:
+            path = os.environ.get(DEPLOY_WEBHOOK_FILE_ENV, "").strip()
+            if not path:
+                return ""
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    url = handle.readline().strip()
+            except OSError as exc:
+                raise ValueError(
+                    f"{DEPLOY_WEBHOOK_ENV} secret file unreadable"
+                ) from exc
+            if not url:
+                return ""
+        try:
+            _check_cp_url(url)
+        except ValueError as exc:
+            raise ValueError(
+                f"{DEPLOY_WEBHOOK_ENV} must be https "
+                "(http only for loopback or an internal service name)"
+            ) from exc
+        return url
+
+    def _trigger_deploy_webhook(self) -> bool:
+        """POST the configured deploy webhook; never raises, never logs the URL.
+
+        Unset keeps today's manual-deploy path with one actionable warning.
+        A failed POST warns (exception type only, no URL, no body) and
+        returns False: the persisted selection is the durable intent, and
+        the STARTING deadline/rollback stays the visible state — never an
+        ERROR loop.
+        """
+        url = self._deploy_webhook_url()
+        if not url:
+            logger.warning(
+                "%s is not set; a stopped editor needs a manual deploy "
+                "until the Workshop app's Dokploy deploy webhook URL is configured",
+                DEPLOY_WEBHOOK_ENV,
+            )
+            return False
+        for attempt in range(1, DEPLOY_WEBHOOK_ATTEMPTS + 1):
+            try:
+                _post_deploy_webhook(url, DEPLOY_WEBHOOK_TIMEOUT_S)
+                return True
+            except Exception as error:
+                if attempt >= DEPLOY_WEBHOOK_ATTEMPTS:
+                    logger.warning(
+                        "deploy webhook POST failed after %d attempts (%s); "
+                        "selection is persisted, waiting for a manual deploy",
+                        DEPLOY_WEBHOOK_ATTEMPTS,
+                        type(error).__name__,
+                    )
+                    return False
+                self._sleep(DEPLOY_WEBHOOK_RETRY_DELAY_S)
+        return False
+
     def start(self, goal: Goal) -> None:
-        """Persist the verified selection; the :approved rollout is CI's job.
+        """Persist the verified selection, then restart a stopped editor.
 
         Only a verified catalog release is accepted (fail-closed selection);
         the approved release itself is read back from the running Workshop
-        for reporting only (observe()/readiness()).
+        for reporting only (observe()/readiness()). When
+        WORKSHOP_DEPLOY_WEBHOOK_URL is set this also POSTs the Workshop
+        app's Dokploy deploy webhook once, so a stopped container comes
+        back; a failed POST only warns (see _trigger_deploy_webhook).
         """
         self.preflight(goal)
         self._digest(goal.release)
@@ -565,3 +675,6 @@ class DokployBackend:
         (self.data / READY_FILE).unlink(missing_ok=True)
         # The generation persists in profile.json first, so a retried
         # start() for the same goal reuses it instead of minting a new one.
+        # The webhook goes out last: the persisted selection is already the
+        # durable restart intent if the POST fails.
+        self._trigger_deploy_webhook()
