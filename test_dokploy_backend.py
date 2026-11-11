@@ -741,6 +741,18 @@ class DeployWebhookTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "empty"):
                 self.backend._deploy_webhook_url()
 
+    def test_secret_emptied_after_preflight_does_not_raise_from_start(self):
+        # Preflight reads a valid secret; the later read in the trigger finds it
+        # emptied. start() must warn, not raise into a retry loop.
+        self.backend._deploy_webhook_url = mock.Mock(
+            side_effect=[self.WEBHOOK, ValueError("secret file is empty")]
+        )
+        with self.assertLogs(logging.getLogger("dokploy_backend"), "WARNING"):
+            self.backend.start(self.goal)
+        self.assertEqual(self.open.call_count, 0)
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(selected["release"], RELEASE)
+
     def test_webhook_failure_keeps_selection_and_warns(self):
         self.open.side_effect = urllib.error.URLError(ConnectionRefusedError("down"))
         with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}):

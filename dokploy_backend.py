@@ -629,7 +629,17 @@ class DokployBackend:
         the STARTING deadline/rollback stays the visible state — never an
         ERROR loop.
         """
-        url = self._deploy_webhook_url()
+        try:
+            url = self._deploy_webhook_url()
+        except ValueError as error:
+            # Preflight validated it; a secret changed since then must not
+            # turn start() into an exception loop.
+            logger.warning(
+                "deploy webhook not posted (%s); selection is persisted, "
+                "waiting for a manual deploy",
+                error,
+            )
+            return False
         if not url:
             logger.warning(
                 "%s is not set; a stopped editor needs a manual deploy "
