@@ -678,6 +678,37 @@ class MapLinearTests(unittest.TestCase):
         )
         self.assertEqual(self.versions.head("konstaxa")["versionDigest"], first)
 
+    def test_stale_copy_refusal_carries_machine_readable_code(self):
+        # Coord#31: the site must not match the message text. The refusal
+        # keeps its exact wording but carries a machine-readable code.
+        from candidates import STALE_COPY_MESSAGE, StaleWorkingCopyError
+
+        first_id, first_bundle = self.draft()
+        second_id, second_bundle = self.draft()
+        (first_bundle / "world/region/r.0.0.mca").write_bytes(b"first")
+        first = self.commit(first_id, self.base)
+        first_review = self.store.review(
+            "konstaxa", ACTOR, "", working_copy_id=first_id, expected_head=first
+        )
+        self.store.publish(first_review["id"], ACTOR, expected_head=self.base)
+        (second_bundle / "world/region/r.0.0.mca").write_bytes(b"stale edit")
+        with self.assertRaises(StaleWorkingCopyError) as ctx:
+            self.store.commit(
+                "konstaxa",
+                ACTOR,
+                "stale attempt",
+                working_copy_id=second_id,
+                expected_head=first,
+            )
+        self.assertEqual(str(ctx.exception), STALE_COPY_MESSAGE)
+        self.assertEqual(ctx.exception.code, "stale_working_copy")
+        self.assertIsInstance(ctx.exception, ValueError)
+        # The no-expectation path refuses the same way.
+        with self.assertRaises(StaleWorkingCopyError):
+            self.store.commit(
+                "konstaxa", ACTOR, "stale attempt", working_copy_id=second_id
+            )
+
     def test_stale_copy_snapshot_and_fresh_copy_after_hold(self):
         # Round 3 way out: an explicit snapshot preserves the stale draft and
         # a fresh copy starts from the current head. Both read the draft only

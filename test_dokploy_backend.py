@@ -579,6 +579,42 @@ class LifecycleIntegrationTests(unittest.TestCase):
         selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
         self.assertEqual(selected["release"], RELEASE)
 
+    def test_recover_adopts_live_matching_editor_without_restart(self):
+        # Incident 2026-11-10 (coord#30): ERROR state with a healthy
+        # editor; recover fenced/saved/stopped it, then sat in STARTING
+        # forever because start() only persists the selection. Recovery
+        # must adopt a live backend that already matches the goal.
+        goal = Goal("workshop", RELEASE, str(uuid4()))
+        self.controller.request(str(uuid4()), goal, 0)
+        self.assertEqual(self.controller.step()["phase"], "STARTING")
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        # The deploy brings java up; the mod reports READY for this generation.
+        self.server.come_back()
+        (self.data / ".blockfield-ready.json").write_text(
+            json.dumps(
+                {
+                    "profile": "workshop",
+                    "generation": selected["generation"],
+                    "session": goal.session,
+                    "release": RELEASE,
+                }
+            )
+        )
+        self.assertEqual(self.controller.step()["phase"], "workshop")
+        self.server.commands.clear()
+        # ERROR with the editor still healthy: keep the valid journal,
+        # flip only the phase, like the unreadable-state incident did.
+        broken = self.controller.status()
+        broken.update(phase="ERROR", gate="closed", error="Boom", errorMessage="boom")
+        self.controller._write(broken)
+        recovered = self.controller.step(recover=True)
+        self.assertEqual(
+            (recovered["phase"], recovered["gate"], recovered["error"]),
+            ("workshop", "builders", None),
+        )
+        self.assertNotIn("stop", self.server.commands)
+        self.assertEqual(self.controller.status()["phase"], "workshop")
+
 
 class ShadowRunTests(unittest.TestCase):
     """Read-only shadow: ticks against a sanitized state export with Game off

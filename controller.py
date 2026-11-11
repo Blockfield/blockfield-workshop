@@ -678,6 +678,17 @@ class CommitIncompleteError(OSError):
     non-idempotent op."""
 
 
+class UnknownStateSchemaError(ValueError):
+    """state.json uses a schema this controller does not understand.
+
+    Raised instead of parking the state in ERROR: step() re-raises it
+    without writing state.json or projections, so a rollback to an older
+    controller image leaves newer state (and its last exports) alone. A
+    ValueError subclass so old `except ValueError` handlers still fail
+    closed on it.
+    """
+
+
 class Controller:
     def __init__(
         self,
@@ -873,12 +884,13 @@ class Controller:
             return result
 
         state = json.loads(data, object_pairs_hook=unique)
-        if (
-            not isinstance(state, dict)
-            or type(state.get("schema")) is not int
-            or state["schema"] != 1
-        ):
+        if not isinstance(state, dict) or type(state.get("schema")) is not int:
             raise ValueError("unsupported state schema")
+        if state["schema"] != 1:
+            # Forward compatibility: an int schema we do not know is newer,
+            # not corrupt. Refuse it without writing anything (see step):
+            # a rollback to this image must not reinterpret newer state.
+            raise UnknownStateSchemaError(f"unsupported state schema {state['schema']}")
         if type(state.get("revision")) is not int or state["revision"] < 0:
             raise ValueError("invalid state revision")
         gates = {
@@ -2373,6 +2385,13 @@ class Controller:
                     raise ValueError(
                         "missing committed active release identity; explicit import required"
                     )
+            except UnknownStateSchemaError:
+                # A rollback onto newer state: refuse without writing
+                # anything — no state.json, no projections — so the newer
+                # controller's last exports stay in force. Health and the
+                # log surface the refusal (entrypoint logs, /healthz 503);
+                # roll forward to operate again.
+                raise
             except (ValueError, OSError) as error:
                 self._export(
                     {
@@ -2450,8 +2469,15 @@ class Controller:
                         state.get("error"),
                         state.get("errorMessage"),
                     )
-                    self.backend.fence_pending_starts()
                     processes, game, current = self._observe()
+                    if current is None or current.goal != goal:
+                        # Only fence what does not already match: stopping a
+                        # live backend for the same goal is unrecoverable for
+                        # the Dokploy backend, which cannot restart a stopped
+                        # container (start() only persists the selection).
+                        # A matching backend is adopted below instead.
+                        self.backend.fence_pending_starts()
+                        processes, game, current = self._observe()
                 if (
                     getattr(self.maps, "canonical_sessions", False) is True
                     and state["phase"] == "workshop"
@@ -3041,6 +3067,7 @@ class Controller:
                 for _, name, document, error in pending:
                     request_id = name[: -len(".json")]
                     actor, revision, payload = "?", None, None
+                    code = None
                     try:
                         if error:
                             raise ValueError(error)
@@ -3073,6 +3100,11 @@ class Controller:
                         break
                     except Exception as failure:
                         error, revision = str(failure) or type(failure).__name__, None
+                        # Machine-readable refusal marker (coord#31): coded
+                        # failures (e.g. a stale working copy) carry their
+                        # code beside the human text, so the site keys its
+                        # recovery buttons off `code`, not the message.
+                        code = getattr(failure, "code", None)
                     else:
                         error = None
                     result = {
@@ -3082,6 +3114,8 @@ class Controller:
                         "revision": revision,
                         "doneAt": now_ms,
                     }
+                    if code is not None:
+                        result["code"] = code
                     if payload is not None:
                         result["payload"] = payload
                         if isinstance(payload, dict) and payload.get("kind") in (

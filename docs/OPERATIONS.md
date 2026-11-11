@@ -48,7 +48,9 @@ None of these are live Docker/Minecraft acceptance tests; the process journal be
 
 Admin status contains `{schema:1,revision,operation,phase,gate,error,errorMessage,since,deadline,desired,message,updatedAt,game:{phase,gate,release}}`.
 Session contains `{schema:1,id,maps,startedAt,startedBy}`; the mod offers only the selected maps.
-Results contain `{id,ok,error,revision,doneAt,payload?}`; newest200 are kept.
+Results contain `{id,ok,error,revision,doneAt,payload?,code?}`; newest200 are kept. `code` is the
+machine-readable refusal marker (e.g. `stale_working_copy` when a save is refused from an outdated copy);
+the site keys its recovery buttons off `code`, never the `error` text.
 
 `release` is `build` from the image's `/opt/blockfield-build.json` (the modpack tag, e.g. `v2.27.0`). Readiness counts only
 when all four fields equal that app's `profile.json` and exactly one Java of that app runs. Game's optional
@@ -71,7 +73,9 @@ and a single-file bind mount would keep showing the old inode.
   Stable exports keep their inode and timestamp until content changes; the timer restores deleted exports.
 - Builder/tester gates open only for the exact observed selected release/session/generation. Missing or invalid ACL
   admits nobody. Malformed Workshop selection or controller state closes Workshop and requires explicit recovery;
-  a ready Game remains public. Untrusted Game readiness closes Game entry independently without stopping the editor.
+  a ready Game remains public. A `state.json` with an unknown (newer) `schema` is refused without writing
+  anything — no state, no projections — so rolling the controller image back never turns newer state into ERROR;
+  roll forward to operate again. Untrusted Game readiness closes Game entry independently without stopping the editor.
   Unknown external full-backend processes or duplicate JVMs still fail closed; the controller never kills them.
 - STARTING has a deadline (`BF_START_TIMEOUT_S`, default 600 s). A recorded Workshop/test transition rolls back to its
   previous goal after timeout or `workshopctl cancel`; its previous session export is restored as well. A failed
@@ -79,7 +83,12 @@ and a single-file bind mount would keep showing the old inode.
   no visible process cannot prove an accepted delayed start was cancelled, so the timer never reissues it.
 - An unexpected Workshop/test process during an unresolved start is fenced before recovery. Ordinary ERROR never retries
   automatically. `workshopctl request game --recover` retains its legacy command spelling but fences only Workshop,
-  saves/stops it when needed and resumes the same editor session. Ordinary `request game` also means resume editor;
+  saves/stops it when needed and resumes the same editor session — except a live backend already matching the
+  goal is adopted, never stopped: the Dokploy backend cannot restart a stopped container (`start()` only persists
+  the selection; swarm on-failure keeps exit-0 down), so recovery must not kill a healthy editor. If the editor
+  container is already down, recovery persists the selection and waits (STARTING) for the next redeploy of the
+  same image to bring it back; restarting it on demand needs an owner decision (deploy webhook wiring or a
+  supervising image guard — the controller has only RCON and files). Ordinary `request game` also means resume editor;
   it never switches off Workshop or starts Game. A missing selected session is an error, not permission to invent one.
 - A validated selection changes only Workshop. Stable editor activation uses save/stop/start with the same
   session. During a test, transition, ERROR or unknown runtime, selection updates the approved target and selection journal only;
@@ -861,7 +870,7 @@ sees the backend (a booting java listens before RCON answers), bounded by the st
 turns a boot race into ERROR. `test_dokploy_backend.py` FakeRconServer emulates this
 vanilla behavior. Fencing cannot cancel a deploy already queued in Dokploy: a delayed queued deploy landing
 after the RCON fence resurrects java, which then reads as alive-but-unselected and fails closed
-(explicit recovery).
+(explicit recovery adopts it without a restart when it matches the committed goal).
 
 ### One-time production setup (requires explicit owner approval — NOT performed)
 
