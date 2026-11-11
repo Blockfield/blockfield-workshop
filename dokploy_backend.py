@@ -431,15 +431,24 @@ class DokployBackend:
 
     def _stop_and_wait(self, timeout_message: str) -> None:
         """RCON stop, then wait dark. Shutdown tears down the reply path, so
-        a mid-command RCON error only matters if the backend stays alive;
-        connect/auth errors still raise immediately."""
+        a mid-command RCON error only matters if the backend stays alive; a
+        connect/auth failure retries while the TCP probe still sees the
+        backend (a booting java listens before RCON answers), bounded by
+        stop_timeout."""
         error: RconError | None = None
-        with self._rcon() as rcon:
+        deadline = self._clock() + self.stop_timeout
+        while self._alive():
             try:
-                rcon.command("stop")
+                with self._rcon() as rcon:
+                    rcon.command("stop")
+                break
             except RconError as exc:
                 error = exc
-        deadline = self._clock() + self.stop_timeout
+                if not self._alive():
+                    return
+                if self._clock() >= deadline:
+                    raise TimeoutError(timeout_message) from error
+                self._sleep(self.poll)
         while self._alive():
             if self._clock() >= deadline:
                 raise TimeoutError(timeout_message) from error
