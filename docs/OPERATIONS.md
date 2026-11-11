@@ -856,7 +856,9 @@ RCON framing is proven against a real Java on the isolated stand (W06): vanilla 
 under its id and the empty drain marker with error text under its own id, never an empty echo, so the client
 terminates a command on a re-auth fence reply (id 2, no game effect) instead of an empty body, and `stop()` /
 `fence_pending_starts()` treat a dying reply path as success once liveness goes dark (a mid-shutdown
-`ConnectionResetError` no longer fails the stop). `test_dokploy_backend.py` FakeRconServer emulates this
+`ConnectionResetError` no longer fails the stop). A connect/auth refusal retries while the TCP probe still
+sees the backend (a booting java listens before RCON answers), bounded by the stop timeout, so a fence never
+turns a boot race into ERROR. `test_dokploy_backend.py` FakeRconServer emulates this
 vanilla behavior. Fencing cannot cancel a deploy already queued in Dokploy: a delayed queued deploy landing
 after the RCON fence resurrects java, which then reads as alive-but-unselected and fails closed
 (explicit recovery).

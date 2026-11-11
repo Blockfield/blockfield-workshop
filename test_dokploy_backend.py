@@ -434,6 +434,43 @@ class BackendTests(unittest.TestCase):
         self.backend.fence_pending_starts()
         self.assertEqual(self.backend.observe(), [])
 
+    def test_fence_rcon_flap_then_accepts_stop(self):
+        # Booting java answers TCP before RCON auth: refused attempts retry
+        # until one gets through, then the fence stops the backend.
+        self.assertTrue(self.backend._alive())
+        new_client = self.backend._rcon
+        attempts = []
+
+        def flaky():
+            attempts.append(1)
+            if len(attempts) <= 2:
+                raise RconError("RCON connect failed: ConnectionRefusedError")
+            return new_client()
+
+        with mock.patch.object(self.backend, "_rcon", side_effect=flaky):
+            self.backend.fence_pending_starts()
+        self.assertEqual(self.backend.observe(), [])
+
+    def test_fence_rcon_refused_until_dark_returns(self):
+        # The fence must never turn a boot race into ERROR: a backend that
+        # goes dark on its own is fenced, RCON errors notwithstanding.
+        with mock.patch.object(
+            self.backend, "_rcon", side_effect=RconError("RCON refused")
+        ):
+            with mock.patch.object(
+                self.backend, "_alive", side_effect=[True, True, False, False]
+            ):
+                self.backend.fence_pending_starts()
+
+    def test_fence_rcon_refused_while_alive_times_out(self):
+        refusing = FakeRconServer(password="wrong-password", stop_closes=False)
+        refusing.start()
+        self.addCleanup(refusing.shutdown)
+        self.backend.rcon_port = refusing.port
+        with self.assertRaises(TimeoutError) as ctx:
+            self.backend.fence_pending_starts()
+        self.assertIsInstance(ctx.exception.__cause__, RconError)
+
     def test_game_is_never_managed(self):
         with self.assertRaises(ValueError):
             self.backend.preflight(Goal("game", RELEASE))
