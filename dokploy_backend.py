@@ -79,6 +79,17 @@ def read_secret(
     raise error(f"{what} credential is not configured")
 
 
+def _webhook_not_sent(error: BaseException) -> bool:
+    """True only when the POST never reached Dokploy, so a retry cannot queue
+    a second deployment (a timeout or HTTP answer may already be accepted)."""
+    reason = getattr(error, "reason", None)
+    return (
+        isinstance(error, urllib.error.URLError)
+        and not isinstance(error, urllib.error.HTTPError)
+        and isinstance(reason, (ConnectionRefusedError, socket.gaierror))
+    )
+
+
 def _post_deploy_webhook(url: str, timeout_s: float = DEPLOY_WEBHOOK_TIMEOUT_S) -> None:
     """POST one Dokploy deploy webhook; raise without ever carrying the URL."""
     from cp_client import _NoRedirect
@@ -597,7 +608,9 @@ class DokployBackend:
                     f"{DEPLOY_WEBHOOK_ENV} secret file unreadable"
                 ) from exc
             if not url:
-                return ""
+                # A configured but empty secret is a misconfiguration: treating
+                # it as unset would let a stop proceed with no way to start.
+                raise ValueError(f"{DEPLOY_WEBHOOK_ENV} secret file is empty")
         try:
             _check_cp_url(url)
         except ValueError as exc:
@@ -629,11 +642,11 @@ class DokployBackend:
                 _post_deploy_webhook(url, DEPLOY_WEBHOOK_TIMEOUT_S)
                 return True
             except Exception as error:
-                if attempt >= DEPLOY_WEBHOOK_ATTEMPTS:
+                if attempt >= DEPLOY_WEBHOOK_ATTEMPTS or not _webhook_not_sent(error):
                     logger.warning(
-                        "deploy webhook POST failed after %d attempts (%s); "
+                        "deploy webhook POST failed after %d attempt(s) (%s); "
                         "selection is persisted, waiting for a manual deploy",
-                        DEPLOY_WEBHOOK_ATTEMPTS,
+                        attempt,
                         type(error).__name__,
                     )
                     return False

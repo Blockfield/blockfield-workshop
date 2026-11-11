@@ -707,8 +707,8 @@ class DeployWebhookTests(unittest.TestCase):
 
     def test_webhook_retry_then_success(self):
         failures = [
-            urllib.error.URLError("flap 1"),
-            urllib.error.URLError("flap 2"),
+            urllib.error.URLError(ConnectionRefusedError("flap 1")),
+            urllib.error.URLError(ConnectionRefusedError("flap 2")),
         ]
         self.open.side_effect = [*failures, self.open.return_value]
         with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}):
@@ -716,8 +716,33 @@ class DeployWebhookTests(unittest.TestCase):
         self.assertEqual(self.open.call_count, 3)
         self.assertEqual(self.backend._sleep.call_count, 2)
 
+    def test_ambiguous_webhook_failure_is_not_retried(self):
+        # A timeout may follow an accepted deploy: retrying could queue a second
+        # deployment that restarts a ready editor.
+        for error in (TimeoutError("slow"), urllib.error.URLError(TimeoutError())):
+            self.open.reset_mock()
+            self.open.side_effect = error
+            with mock.patch.dict(
+                os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}
+            ):
+                with self.assertLogs(logging.getLogger("dokploy_backend"), "WARNING"):
+                    self.backend.start(self.goal)
+            self.assertEqual(self.open.call_count, 1)
+
+    def test_empty_configured_webhook_file_fails_closed(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+            path = handle.name
+        self.addCleanup(os.unlink, path)
+        env = {
+            "WORKSHOP_DEPLOY_WEBHOOK_URL": "",
+            "WORKSHOP_DEPLOY_WEBHOOK_URL_FILE": path,
+        }
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaisesRegex(ValueError, "empty"):
+                self.backend._deploy_webhook_url()
+
     def test_webhook_failure_keeps_selection_and_warns(self):
-        self.open.side_effect = urllib.error.URLError("dokploy down")
+        self.open.side_effect = urllib.error.URLError(ConnectionRefusedError("down"))
         with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}):
             with self.assertLogs(
                 logging.getLogger("dokploy_backend"), "WARNING"
