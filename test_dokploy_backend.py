@@ -1,16 +1,20 @@
 """DokployBackend against a fake RCON server.
 
-No docker.sock, no Dokploy API, no GitHub credentials, no webhooks:
-no network beyond 127.0.0.1 loopback.
+No docker.sock, no Dokploy API, no GitHub credentials: no network beyond
+127.0.0.1 loopback. The deploy webhook fires only when
+WORKSHOP_DEPLOY_WEBHOOK_URL is set, and tests mock the HTTP layer.
 """
 
 import json
+import logging
 import os
 import socket
 import struct
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -259,7 +263,7 @@ class BackendTests(unittest.TestCase):
         )
 
     def test_start_persists_selection_and_reports_ready(self):
-        # No tag move, no webhook: start() only persists the verified
+        # No tag move, no webhook configured: start() persists the verified
         # selection; the approved release is read back from the running
         # Workshop for reporting.
         self.backend.start(self.goal)
@@ -639,6 +643,171 @@ class LifecycleIntegrationTests(unittest.TestCase):
         )
         self.assertNotIn("stop", self.server.commands)
         self.assertEqual(self.controller.status()["phase"], "workshop")
+
+
+class DeployWebhookTests(unittest.TestCase):
+    """Stopped editor restarts through the Workshop app's Dokploy webhook.
+
+    The HTTP layer is mocked: no real network beyond 127.0.0.1 loopback.
+    """
+
+    WEBHOOK = "https://dokploy.example.test/api/app/deploy/WEBHOOK-SECRET-TOKEN"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.data, self.lock = root / "data", root / "lock"
+        self.data.mkdir()
+        (self.lock / "workshop").mkdir(parents=True)
+        # Dark backend: nothing listens, as after RCON stop.
+        self.server = FakeRconServer(
+            outputs={"save-all flush": b"Saved the game"}, paused=True
+        )
+        self.server.start()
+        self.addCleanup(self.server.shutdown)
+        self.backend = DokployBackend(
+            data=self.data,
+            lock_dir=self.lock,
+            rcon_host="127.0.0.1",
+            rcon_port=self.server.port,
+            rcon_password=RCON_PASSWORD,
+            releases={RELEASE: release_record()},
+            stop_timeout=1.0,
+            poll=0.01,
+            min_free_bytes=0,
+        )
+        self.backend._sleep = mock.Mock()
+        self.goal = Goal("workshop", RELEASE, str(uuid4()))
+        opener = mock.patch("urllib.request.OpenerDirector.open")
+        self.open = opener.start()
+        self.addCleanup(opener.stop)
+        response = mock.MagicMock(name="webhook-response")
+        response.status = 200
+        response.read.return_value = b"ok"
+        response.__enter__.return_value = response
+        self.open.return_value = response
+
+    def posted_urls(self):
+        return [call.args[0].get_full_url() for call in self.open.call_args_list]
+
+    def test_start_posts_deploy_webhook_once(self):
+        with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}):
+            self.backend.start(self.goal)
+        self.assertEqual(self.open.call_count, 1)
+        self.assertEqual(self.posted_urls(), [self.WEBHOOK])
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(selected["release"], RELEASE)
+        self.assertFalse((self.data / ".blockfield-ready.json").exists())
+
+    def test_success_posts_nothing_to_logs(self):
+        with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}):
+            with self.assertNoLogs(logging.getLogger("dokploy_backend")):
+                self.backend.start(self.goal)
+
+    def test_webhook_retry_then_success(self):
+        failures = [
+            urllib.error.URLError(ConnectionRefusedError("flap 1")),
+            urllib.error.URLError(ConnectionRefusedError("flap 2")),
+        ]
+        self.open.side_effect = [*failures, self.open.return_value]
+        with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}):
+            self.backend.start(self.goal)
+        self.assertEqual(self.open.call_count, 3)
+        self.assertEqual(self.backend._sleep.call_count, 2)
+
+    def test_ambiguous_webhook_failure_is_not_retried(self):
+        # A timeout may follow an accepted deploy: retrying could queue a second
+        # deployment that restarts a ready editor.
+        for error in (TimeoutError("slow"), urllib.error.URLError(TimeoutError())):
+            self.open.reset_mock()
+            self.open.side_effect = error
+            with mock.patch.dict(
+                os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}
+            ):
+                with self.assertLogs(logging.getLogger("dokploy_backend"), "WARNING"):
+                    self.backend.start(self.goal)
+            self.assertEqual(self.open.call_count, 1)
+
+    def test_empty_configured_webhook_file_fails_closed(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+            path = handle.name
+        self.addCleanup(os.unlink, path)
+        env = {
+            "WORKSHOP_DEPLOY_WEBHOOK_URL": "",
+            "WORKSHOP_DEPLOY_WEBHOOK_URL_FILE": path,
+        }
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaisesRegex(ValueError, "empty"):
+                self.backend._deploy_webhook_url()
+
+    def test_secret_emptied_after_preflight_does_not_raise_from_start(self):
+        # Preflight reads a valid secret; the later read in the trigger finds it
+        # emptied. start() must warn, not raise into a retry loop.
+        self.backend._deploy_webhook_url = mock.Mock(
+            side_effect=[self.WEBHOOK, ValueError("secret file is empty")]
+        )
+        with self.assertLogs(logging.getLogger("dokploy_backend"), "WARNING"):
+            self.backend.start(self.goal)
+        self.assertEqual(self.open.call_count, 0)
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(selected["release"], RELEASE)
+
+    def test_webhook_failure_keeps_selection_and_warns(self):
+        self.open.side_effect = urllib.error.URLError(ConnectionRefusedError("down"))
+        with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}):
+            with self.assertLogs(
+                logging.getLogger("dokploy_backend"), "WARNING"
+            ) as logs:
+                self.backend.start(self.goal)  # must not raise: no ERROR loop
+        self.assertEqual(self.open.call_count, 3)  # bounded retry, then give up
+        output = "\n".join(logs.output)
+        self.assertNotIn(self.WEBHOOK, output)
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(selected["release"], RELEASE)
+
+    def test_unset_env_keeps_old_path_with_warning(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertLogs(
+                logging.getLogger("dokploy_backend"), "WARNING"
+            ) as logs:
+                self.backend.start(self.goal)
+        self.assertEqual(self.open.call_count, 0)
+        self.assertIn("WORKSHOP_DEPLOY_WEBHOOK_URL", "\n".join(logs.output))
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(selected["release"], RELEASE)
+
+    def test_rejected_scheme_raises_without_url_before_effects(self):
+        bad = "http://dokploy.example.test/api/app/deploy/BAD-SECRET-TOKEN"
+        with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": bad}):
+            with self.assertRaises(ValueError) as ctx:
+                self.backend.start(self.goal)
+        self.assertNotIn(bad, str(ctx.exception))
+        self.assertEqual(self.open.call_count, 0)
+        self.assertFalse((self.lock / "workshop/profile.json").exists())
+
+    def test_recover_on_stopped_editor_posts_webhook_once(self):
+        # Incident behind coord#30: ERROR with a stopped editor; explicit
+        # recovery must bring it back with exactly one webhook POST.
+        controller = Controller(
+            Path(self.temp.name) / "state",
+            self.backend,
+            releases={RELEASE: release_record()},
+        )
+        with mock.patch.dict(os.environ, {"WORKSHOP_DEPLOY_WEBHOOK_URL": self.WEBHOOK}):
+            controller.request(str(uuid4()), self.goal, 0)
+            self.assertEqual(controller.step()["phase"], "STARTING")
+            self.open.reset_mock()
+            broken = controller.status()
+            broken.update(
+                phase="ERROR", gate="closed", error="Boom", errorMessage="boom"
+            )
+            controller._write(broken)
+            with self.assertNoLogs(logging.getLogger("dokploy_backend")):
+                recovered = controller.step(recover=True)
+        self.assertEqual(recovered["phase"], "STARTING")
+        self.assertEqual(self.open.call_count, 1)
+        self.assertEqual(self.posted_urls(), [self.WEBHOOK])
 
 
 class ShadowRunTests(unittest.TestCase):
