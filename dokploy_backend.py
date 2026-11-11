@@ -347,7 +347,8 @@ class DokployBackend:
             return False
         if ready.get("release") == expected.get("release"):
             return True
-        for record in self.releases.values():
+        # No catalog configured: nothing binds the two names, so not ready.
+        for record in (self.releases or {}).values():
             if not isinstance(record, dict):
                 continue
             names = {
