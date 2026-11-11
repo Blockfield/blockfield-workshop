@@ -277,6 +277,31 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(observed[0].goal.release, RELEASE)
         self.assertEqual(self.backend.readiness()["generation"], selected["generation"])
 
+    def test_digest_selected_release_reports_tagged_ready(self):
+        # move-approved-tag selects by image digest while the server attests
+        # its baked build tag: the same verified record must read as ready.
+        digest = self.record["imageDigest"].split("@", 1)[1]
+        self.backend.releases = {RELEASE: self.record, digest: self.record}
+        goal = Goal("workshop", digest, str(uuid4()))
+        self.backend.start(goal)
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(selected["release"], digest)
+        self.ready(selected["generation"], goal.session, release=RELEASE)
+        observed = self.backend.observe()
+        self.assertEqual(len(observed), 1)
+        self.assertTrue(observed[0].ready)
+        self.assertEqual(observed[0].goal.release, digest)
+
+    def test_foreign_tag_does_not_report_ready_for_digest_goal(self):
+        # Identity stays strict: another tag is not the selected record.
+        digest = self.record["imageDigest"].split("@", 1)[1]
+        self.backend.releases = {RELEASE: self.record, digest: self.record}
+        goal = Goal("workshop", digest, str(uuid4()))
+        self.backend.start(goal)
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.ready(selected["generation"], goal.session, release="v9.9.9")
+        self.assertFalse(self.backend.observe()[0].ready)
+
     def test_retry_across_starts_reuses_generation(self):
         # A retried start() for the same goal reuses the generation
         # persisted in profile.json, not a fresh uuid4.
