@@ -331,6 +331,34 @@ class DokployBackend:
             return None
         return data
 
+    def _ready_matches(self, ready: dict, expected: dict) -> bool:
+        """Whether the attested READY file is the selected backend.
+
+        profile/generation/session compare strictly; release accepts either
+        name of the same verified catalog record (the image's build tag vs
+        the approval's image digest). Without a catalog binding both names
+        the backend is not ready.
+        """
+        if (
+            ready.get("profile") != expected.get("profile")
+            or ready.get("generation") != expected.get("generation")
+            or ready.get("session") != expected.get("session")
+        ):
+            return False
+        if ready.get("release") == expected.get("release"):
+            return True
+        # No catalog configured: nothing binds the two names, so not ready.
+        for record in (self.releases or {}).values():
+            if not isinstance(record, dict):
+                continue
+            names = {
+                record.get("release"),
+                (record.get("imageDigest") or "").split("@", 1)[-1],
+            }
+            if ready.get("release") in names and expected.get("release") in names:
+                return True
+        return False
+
     def observe(self) -> list[Process]:
         try:
             selected = self.selection()
@@ -369,7 +397,17 @@ class DokployBackend:
                 )
             except (ValueError, TypeError):
                 goal, expected = Goal("workshop", "unknown", UNKNOWN_SESSION), None
-        return [Process(goal, bool(alive and expected and ready == expected))]
+        return [
+            Process(
+                goal,
+                bool(
+                    alive
+                    and expected
+                    and ready
+                    and self._ready_matches(ready, expected)
+                ),
+            )
+        ]
 
     def save_and_freeze(self, process: Process) -> None:
         if process.goal.profile == "game":
