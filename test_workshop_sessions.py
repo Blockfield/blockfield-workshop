@@ -393,6 +393,34 @@ class GitInboxTests(unittest.TestCase):
                 self.assertEqual(self.backend.events, events)
                 self.assertEqual(self.controller.status()["phase"], "workshop")
 
+    def test_stale_copy_inbox_refusal_carries_machine_readable_code(self):
+        # Coord#31: the site must key recovery buttons off `code`, not the
+        # message text. The wording stays byte-identical for older readers.
+        from candidates import STALE_COPY_MESSAGE
+
+        first = self.commit(b"reviewed draft")
+        # Rollback moves the head without advancing the selected copy, so
+        # its base is now stale for the commit below.
+        restored = self.send(
+            "rollback",
+            actor=self.admin,
+            mapId="arena",
+            versionDigest=first["versionDigest"],
+            expectedHead=self.heads["arena"]["versionDigest"],
+        )
+        self.assertTrue(restored["ok"], restored["error"])
+        self.region.write_bytes(b"stale draft")
+        refused = self.send(
+            "commit",
+            mapId="arena",
+            workingCopyId=self.session["id"],
+            expectedHead=self.store.versions.head("arena")["versionDigest"],
+            note="Update arena",
+        )
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["error"], STALE_COPY_MESSAGE)
+        self.assertEqual(refused.get("code"), "stale_working_copy")
+
     def test_scope_and_exact_membership_are_authoritative(self):
         before = self.heads["arena"]["versionDigest"]
         self.assertTrue(

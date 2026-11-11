@@ -277,6 +277,31 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(observed[0].goal.release, RELEASE)
         self.assertEqual(self.backend.readiness()["generation"], selected["generation"])
 
+    def test_digest_selected_release_reports_tagged_ready(self):
+        # move-approved-tag selects by image digest while the server attests
+        # its baked build tag: the same verified record must read as ready.
+        digest = self.record["imageDigest"].split("@", 1)[1]
+        self.backend.releases = {RELEASE: self.record, digest: self.record}
+        goal = Goal("workshop", digest, str(uuid4()))
+        self.backend.start(goal)
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.assertEqual(selected["release"], digest)
+        self.ready(selected["generation"], goal.session, release=RELEASE)
+        observed = self.backend.observe()
+        self.assertEqual(len(observed), 1)
+        self.assertTrue(observed[0].ready)
+        self.assertEqual(observed[0].goal.release, digest)
+
+    def test_foreign_tag_does_not_report_ready_for_digest_goal(self):
+        # Identity stays strict: another tag is not the selected record.
+        digest = self.record["imageDigest"].split("@", 1)[1]
+        self.backend.releases = {RELEASE: self.record, digest: self.record}
+        goal = Goal("workshop", digest, str(uuid4()))
+        self.backend.start(goal)
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        self.ready(selected["generation"], goal.session, release="v9.9.9")
+        self.assertFalse(self.backend.observe()[0].ready)
+
     def test_retry_across_starts_reuses_generation(self):
         # A retried start() for the same goal reuses the generation
         # persisted in profile.json, not a fresh uuid4.
@@ -578,6 +603,42 @@ class LifecycleIntegrationTests(unittest.TestCase):
         self.assertEqual(recovered["phase"], "STARTING")
         selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
         self.assertEqual(selected["release"], RELEASE)
+
+    def test_recover_adopts_live_matching_editor_without_restart(self):
+        # Incident 2026-11-10 (coord#30): ERROR state with a healthy
+        # editor; recover fenced/saved/stopped it, then sat in STARTING
+        # forever because start() only persists the selection. Recovery
+        # must adopt a live backend that already matches the goal.
+        goal = Goal("workshop", RELEASE, str(uuid4()))
+        self.controller.request(str(uuid4()), goal, 0)
+        self.assertEqual(self.controller.step()["phase"], "STARTING")
+        selected = json.loads((self.lock / "workshop/profile.json").read_bytes())
+        # The deploy brings java up; the mod reports READY for this generation.
+        self.server.come_back()
+        (self.data / ".blockfield-ready.json").write_text(
+            json.dumps(
+                {
+                    "profile": "workshop",
+                    "generation": selected["generation"],
+                    "session": goal.session,
+                    "release": RELEASE,
+                }
+            )
+        )
+        self.assertEqual(self.controller.step()["phase"], "workshop")
+        self.server.commands.clear()
+        # ERROR with the editor still healthy: keep the valid journal,
+        # flip only the phase, like the unreadable-state incident did.
+        broken = self.controller.status()
+        broken.update(phase="ERROR", gate="closed", error="Boom", errorMessage="boom")
+        self.controller._write(broken)
+        recovered = self.controller.step(recover=True)
+        self.assertEqual(
+            (recovered["phase"], recovered["gate"], recovered["error"]),
+            ("workshop", "builders", None),
+        )
+        self.assertNotIn("stop", self.server.commands)
+        self.assertEqual(self.controller.status()["phase"], "workshop")
 
 
 class ShadowRunTests(unittest.TestCase):
