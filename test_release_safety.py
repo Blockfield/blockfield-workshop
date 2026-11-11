@@ -158,6 +158,27 @@ class ReleaseSafetyTests(unittest.TestCase):
                 self.assertEqual(self.controller.file.read_bytes(), old_state)
                 self.assertEqual(self.controller.target_file.read_bytes(), old_target)
 
+    def test_unknown_state_schema_refuses_without_writing(self):
+        # Rollback safety (coord#30): an older controller image on newer
+        # state must refuse without writing state.json or projections,
+        # never park the unreadable state in ERROR.
+        from controller import UnknownStateSchemaError
+
+        self.ready()
+        raw = self.controller.file.read_bytes()
+        gate = self.controller.gate_file.read_bytes()
+        public = self.controller.public_file.read_bytes()
+        newer = json.loads(raw)
+        newer["schema"] = 2
+        self.controller.file.write_text(json.dumps(newer))
+        with self.assertRaises(UnknownStateSchemaError):
+            self.controller.step()
+        self.assertEqual(json.loads(self.controller.file.read_bytes()), newer)
+        self.assertEqual(self.controller.gate_file.read_bytes(), gate)
+        self.assertEqual(self.controller.public_file.read_bytes(), public)
+        with self.assertRaises(UnknownStateSchemaError):
+            self.controller.status()
+
     def test_projection_failure_reconciles_from_committed_state_after_restart(self):
         self.ready()
         import controller

@@ -41,6 +41,23 @@ STALE_COPY_MESSAGE = (
     "stale working copy: the map has a newer version; "
     "save your draft as a snapshot and start from the current version"
 )
+
+
+class StaleWorkingCopyError(ValueError):
+    """Refusal to publish from a stale working copy (coord#31).
+
+    `code` is the machine-readable marker the site keys its recovery
+    buttons off instead of matching the message text. str() stays exactly
+    STALE_COPY_MESSAGE so older readers keep working; a ValueError
+    subclass so old `except ValueError` handlers still catch it.
+    """
+
+    code = "stale_working_copy"
+
+    def __init__(self):
+        super().__init__(STALE_COPY_MESSAGE)
+
+
 # Pre-upgrade pending reviews are not carried into the linear model: their
 # versions and files stay in the archive, but the review itself is closed.
 CANDIDATE_SUPERSEDE_REASON = "pre-upgrade review; submit again after the upgrade"
@@ -331,14 +348,14 @@ class MapStore:
                 # so an automatic file rebase is a merge in disguise. Refuse
                 # and leave the draft untouched; the explicit snapshot path
                 # preserves it.
-                raise ValueError(STALE_COPY_MESSAGE)
+                raise StaleWorkingCopyError()
             else:
                 parent = expected_head
         elif head_digest is None:
             parent = base_version
         else:
             if base_version != head_digest:
-                raise ValueError(STALE_COPY_MESSAGE)
+                raise StaleWorkingCopyError()
             parent = head_digest
         self.candidates.mkdir(parents=True, exist_ok=True)
         # Exports run under the controller lock, so any temporary archive here was left by one that was killed.
@@ -1860,7 +1877,7 @@ class MapVersions:
         if parent_version is not None:
             self._digest(parent_version)
         if base_version != parent_version:
-            raise ValueError(STALE_COPY_MESSAGE)
+            raise StaleWorkingCopyError()
         if working_copy_id is not None:
             self.working_copy(map_id, working_copy_id)
         previous = self.read(map_id, parent_version)["files"] if parent_version else {}
