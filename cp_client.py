@@ -1110,6 +1110,8 @@ class CredentialRenewer:
             return 0.0
         if status != 200 or not isinstance(me, dict):
             return RENEW_RETRY_S
+        if not me.get("issuedAt") or not me.get("expiresAt"):
+            return RENEW_MAX_SLEEP_S  # CP without renewal support: check back hourly
         due = renew_at(_epoch(me["issuedAt"]), _epoch(me["expiresAt"]))
         now = self._now()
         if now < due:

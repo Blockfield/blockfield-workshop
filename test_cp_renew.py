@@ -107,6 +107,19 @@ class CredentialRenewerTest(unittest.TestCase):
         r.tick()
         self.assertEqual(r.token(KEY), "env")
 
+    def test_cp_without_renewal_support_is_checked_hourly(self):
+        calls = []
+        r = CredentialRenewer(
+            "https://cp.test",
+            self.state,
+            {KEY: "env"},
+            call=lambda *a: calls.append(a) or (200, {"client": "workshop"}),
+            now=lambda: self.now,
+        )
+        r.tick()
+        self.assertEqual(r.due[KEY], NOW + 3600)
+        self.assertEqual(len(calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
