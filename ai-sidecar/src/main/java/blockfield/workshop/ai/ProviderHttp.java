@@ -1045,6 +1045,15 @@ final class ProviderHttp {
                 // Same receipt rule as the JSON post: only a carried receipt may be billed.
                 if (refused.receipt == null) {
                     if (refused.unbilled()) certain = true;
+                    else {
+                        // Unknown billing outcome: the provider may still have billed this
+                        // exact request, so keep the send-time bound (the most it could
+                        // cost under the owner ceilings) and release only the provably
+                        // unspent remainder on close. The accumulation never under-charges
+                        // a retry.
+                        confirmed = confirmed.add(BigDecimal.valueOf(bound, 6));
+                        certain = true;
+                    }
                     throw refused;
                 }
                 response = refused.receipt;

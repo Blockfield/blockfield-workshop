@@ -162,7 +162,8 @@ final class WorkshopAiFill {
     }
 
     static Option parseOption(JsonObject o, int sy) {
-        int axis = wireInt(o, "axis", 0, 1);
+        // analyze emits axis 0 (x) and 2 (z); consumers treat any non-zero axis as z.
+        int axis = wireInt(o, "axis", 0, 2);
         if (!o.has("sides") || !o.get("sides").isJsonArray() || o.getAsJsonArray("sides").isEmpty())
             throw new IllegalArgumentException("Fill option sides must be a non-empty array");
         var sides = new ArrayList<Side>();
@@ -207,7 +208,11 @@ final class WorkshopAiFill {
             throw new IllegalArgumentException("Fill option holds at most 4 sides");
         int touch = wireInt(o, "touch", 0, 1 << 20);
         boolean periodic = wireBool(o, "periodic");
-        int seam = wireInt(o, "seam", 0, 1 << 20);
+        // option() emits -1 for single-side and non-periodic options; only a periodic
+        // bridge (two sides) carries a real split.
+        int seam = wireInt(o, "seam", -1, 1 << 20);
+        if (seam < 0 && periodic && sides.size() == 2)
+            throw new IllegalArgumentException("Bridge fill option needs a seam");
         if (!o.has("plan") || !o.get("plan").isJsonObject())
             throw new IllegalArgumentException("Fill option plan must be an object");
         var plan = new HashMap<Long, String>();

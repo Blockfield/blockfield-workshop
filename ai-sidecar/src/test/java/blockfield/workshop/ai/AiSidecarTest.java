@@ -1,6 +1,7 @@
 package blockfield.workshop.ai;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sun.net.httpserver.HttpServer;
@@ -9,18 +10,23 @@ import org.json.JSONObject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.Base64;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -32,6 +38,8 @@ class AiSidecarTest {
     private HttpClient client;
     private String base;
     private AtomicReference<Instant> now;
+
+    @TempDir Path root;
 
     @BeforeEach
     void start() throws Exception {
@@ -229,5 +237,59 @@ class AiSidecarTest {
         base.put("wav", Base64.getEncoder().encodeToString(new byte[] {2}));
         HttpResponse<String> conflict = post("/v1/transcribe", base.toString(), "Bearer " + SECRET);
         assertEquals(409, conflict.statusCode());
+    }
+
+    @Test
+    void customTranscriptionPhaseNeedsItsOwnBaseUrl() throws Exception {
+        // Review finding: the per-phase selector inherited the fallback host for a
+        // custom phase, so the guard below never fired and the custom bearer went
+        // to the fallback host.
+        Path keyFile = root.resolve("sidecar-key.txt");
+        Files.writeString(keyFile, "test-transcription-key-0123456789-_AB");
+        Map<String, String> env =
+                Map.of(
+                        "AI_SIDECAR_PROVIDER",
+                        "openrouter",
+                        "AI_SIDECAR_PROVIDER_KEY_FILE",
+                        keyFile.toString(),
+                        "AI_SIDECAR_TRANSCRIPTION_PROVIDER",
+                        "custom");
+        assertThrows(IOException.class, () -> AiSidecar.selectSelections(env));
+    }
+
+    @Test
+    void customPhaseWithExplicitBaseUrlIsSelected() throws Exception {
+        Path keyFile = root.resolve("sidecar-key.txt");
+        Files.writeString(keyFile, "test-transcription-key-0123456789-_AB");
+        Map<String, String> env =
+                Map.of(
+                        "AI_SIDECAR_PROVIDER",
+                        "openrouter",
+                        "AI_SIDECAR_PROVIDER_KEY_FILE",
+                        keyFile.toString(),
+                        "AI_SIDECAR_TRANSCRIPTION_PROVIDER",
+                        "custom",
+                        "AI_SIDECAR_TRANSCRIPTION_BASE_URL",
+                        "https://stt.example.invalid/v1",
+                        "AI_SIDECAR_CLEANUP_PROVIDER",
+                        "openrouter");
+        AiSidecar.Selections selections = AiSidecar.selectSelections(env);
+        assertEquals("custom", selections.transcription().provider());
+        assertEquals("https://stt.example.invalid/v1", selections.transcription().baseUrl());
+    }
+
+    @Test
+    void nonCustomPhaseStillInheritsTheFallbackHost() throws Exception {
+        Path keyFile = root.resolve("sidecar-key.txt");
+        Files.writeString(keyFile, "test-transcription-key-0123456789-_AB");
+        Map<String, String> env =
+                Map.of(
+                        "AI_SIDECAR_PROVIDER",
+                        "openrouter",
+                        "AI_SIDECAR_PROVIDER_KEY_FILE",
+                        keyFile.toString());
+        AiSidecar.Selections selections = AiSidecar.selectSelections(env);
+        assertEquals("openrouter", selections.transcription().provider());
+        assertEquals(ProviderHttp.OPENROUTER_BASE, selections.transcription().baseUrl());
     }
 }

@@ -181,6 +181,51 @@ class ProviderHttpTest {
     }
 
     @Test
+    void uncertainAudioFailureKeepsOnlyTheSendTimeBound() throws Exception {
+        // Review finding: postAudio settled nothing on a timeout/transport failure
+        // the provider may still have billed (no receipt, not 401/402), so a later
+        // zero-cost success on the same billing released the whole held bound and
+        // the possibly-billed call vanished from the ledger. Mirror the JSON-post
+        // unknown-outcome accounting: hold the send-time bound.
+        status = 500;
+        payload = "{\"error\":\"boom\"}";
+        Files.writeString(
+                root.resolve("ai-limits.json"),
+                "{\"schema\":1,\"revision\":0,\"currency\":\"USD\",\"mode\":\"session\","
+                        + "\"sessions\":{ \""
+                        + SESSION
+                        + "\":1000000},\"builders\":{ \""
+                        + BUILDER
+                        + "\":1000000}}");
+        Budget budget = Budget.open(root.resolve("ai-limits.json"), root.resolve("ai-usage.json"));
+        try {
+            long bound = 100;
+            Budget.Reservation reservation = ProviderHttp.reserve(budget, SESSION, BUILDER, bound);
+            ProviderHttp providers = client();
+            try (ProviderHttp.Billing billing =
+                    providers.new Billing(reservation, budget, SESSION, BUILDER)) {
+                billing.caps(0.10, 0.20);
+                assertThrows(
+                        ProviderHttp.Failure.class,
+                        () ->
+                                billing.postAudio(
+                                        "/audio/transcriptions",
+                                        new byte[] {1, 2, 3, 4},
+                                        "test/model",
+                                        null,
+                                        5));
+                status = 200;
+                payload = "{\"usage\":{\"cost\":0}}";
+                billing.postAudio(
+                        "/audio/transcriptions", new byte[] {1, 2, 3, 4}, "test/model", null, 5);
+            }
+            assertEquals(bound, budget.usedMicroUsd("session", SESSION));
+        } finally {
+            budget.close();
+        }
+    }
+
+    @Test
     void serverErrorWithoutReceiptIsBilledFailure() {
         status = 500;
         payload = "{\"error\":\"boom\"}";

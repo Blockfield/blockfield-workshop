@@ -208,9 +208,17 @@ public final class AiSidecar {
                 keyFile == null || keyFile.isEmpty()
                         ? fallback.key()
                         : Auth.loadKey(Path.of(keyFile));
-        String baseUrl = env.getOrDefault("AI_SIDECAR_" + prefix + "_BASE_URL", fallback.baseUrl());
-        if (provider.equals(ProviderHttp.CUSTOM) && (baseUrl == null || baseUrl.isEmpty())) {
+        String explicit = env.get("AI_SIDECAR_" + prefix + "_BASE_URL");
+        if (provider.equals(ProviderHttp.CUSTOM) && (explicit == null || explicit.isEmpty())) {
+            // A custom key sent to the fallback host would mis-bill and disclose the
+            // credential, so custom refuses startup without its own explicit base URL
+            // instead of inheriting the fallback host like the generation path refuses
+            // to default to GATEWAY_BASE.
             throw new IOException("AI_SIDECAR_" + prefix + "_BASE_URL is required for custom");
+        }
+        String baseUrl = explicit;
+        if (baseUrl == null || baseUrl.isEmpty()) {
+            baseUrl = fallback.baseUrl();
         }
         if (baseUrl == null || baseUrl.isEmpty()) {
             baseUrl =
@@ -778,6 +786,25 @@ public final class AiSidecar {
                                             "request",
                                             "invalid_request",
                                             "wav must be base64");
+                                }
+                                // Validation failures are the caller's fault (400), never an
+                                // internal error: reject them before the idempotent section
+                                // so they reserve nothing and stay retryable.
+                                if (!GenerateFlow.voiceModel(model)) {
+                                    throw new HttpError(
+                                            400,
+                                            "request",
+                                            "invalid_request",
+                                            "model outside bounds");
+                                }
+                                try {
+                                    WorkshopAiAudio.validate(wav);
+                                } catch (IllegalArgumentException invalid) {
+                                    throw new HttpError(
+                                            400,
+                                            "request",
+                                            "invalid_request",
+                                            "wav must be 16kHz mono PCM16");
                                 }
                                 GenerateFlow flow =
                                         new GenerateFlow(
