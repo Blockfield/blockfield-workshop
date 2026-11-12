@@ -127,6 +127,11 @@ final class ProviderHttp {
         this.http = http;
     }
 
+    /** The account key, only for redacting rejected-plan debug files. */
+    String key() {
+        return backend.key();
+    }
+
     static HttpClient defaultHttpClient() {
         return HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
@@ -582,6 +587,30 @@ final class ProviderHttp {
         return backend.transport().chatPath();
     }
 
+    /** Audio path of the transcription backend. */
+    String audioPath() {
+        return backend.transport().audioPath();
+    }
+
+    /** Whether this backend serves an endpoint catalog (tariff probe applies). */
+    boolean priceApi() {
+        return backend.transport().priceApi();
+    }
+
+    /** Authenticated GET for public metadata (tariff probe); never sends credentials elsewhere. */
+    JsonObject get(String phase, String path) throws Exception {
+        return exchange(
+                phase,
+                HttpRequest.newBuilder(URI.create(backend.transport().baseUrl() + path))
+                        .timeout(Duration.ofSeconds(10))
+                        .header("Authorization", "Bearer " + backend.key())
+                        .header("Content-Type", "application/json")
+                        .header("HTTP-Referer", APP_URL)
+                        .header("X-Title", APP_TITLE)
+                        .GET()
+                        .build());
+    }
+
     // HTTP choke point: the only code that performs outbound AI HTTP.
 
     JsonObject post(String phase, String path, JsonObject body, int timeout) throws Exception {
@@ -986,6 +1015,51 @@ final class ProviderHttp {
             LOGGER.info("AI usage " + receipt);
             if (upstreamFailure != null) throw upstreamFailure;
             return response;
+        }
+
+        /**
+         * Multipart audio post for OpenAI-compatible transports (file, model, optional language).
+         * Accounting mirrors the JSON post: the transcription settles the duration-sized reserve,
+         * topped up to an authenticated cost.
+         */
+        JsonObject postAudio(String path, byte[] wav, String model, String language)
+                throws Exception {
+            return postAudio(path, wav, model, language, 25);
+        }
+
+        JsonObject postAudio(String path, byte[] wav, String model, String language, int timeout)
+                throws Exception {
+            if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+            if (singleCall && sent) throw new IllegalStateException("Call already sent");
+            reservation.checkPaidCall();
+            sent = true;
+            long bound = reservation.boundMicroUsd();
+            certain = false;
+            JsonObject response;
+            Failure upstreamFailure = null;
+            try {
+                response =
+                        ProviderHttp.this.postMultipart(
+                                "transcription", path, wav, model, language, timeout);
+            } catch (Failure refused) {
+                // Same receipt rule as the JSON post: only a carried receipt may be billed.
+                if (refused.receipt == null) {
+                    if (refused.unbilled()) certain = true;
+                    else {
+                        // Unknown billing outcome: the provider may still have billed this
+                        // exact request, so keep the send-time bound (the most it could
+                        // cost under the owner ceilings) and release only the provably
+                        // unspent remainder on close. The accumulation never under-charges
+                        // a retry.
+                        confirmed = confirmed.add(BigDecimal.valueOf(bound, 6));
+                        certain = true;
+                    }
+                    throw refused;
+                }
+                response = refused.receipt;
+                upstreamFailure = refused;
+            }
+            return account("transcription", new JsonObject(), response, upstreamFailure, bound);
         }
 
         private BigDecimal estimatedCost(
