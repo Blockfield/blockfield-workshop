@@ -38,6 +38,7 @@ import json
 import os
 import re
 import socket
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -975,3 +976,155 @@ class CPClient:
             state["cursor"] = max(state["cursor"], sequence)
             self._store_state()
         return {"applied": applied, "rejected": rejected, "acked": acked}
+
+
+RENEW_MAX_LEAD_S = 7 * 86400
+RENEW_RETRY_S = 30.0
+RENEW_MAX_SLEEP_S = 3600.0
+RENEWED_KEYS = ("BLOCKFIELD_CP_AGENT_TOKEN", "BLOCKFIELD_CP_GATE_TOKEN")
+
+
+def renew_at(issued: float, expires: float) -> float:
+    """~7 days before expiry, or a quarter of a short (test) lifetime."""
+    return expires - min(RENEW_MAX_LEAD_S, (expires - issued) / 4)
+
+
+def _epoch(text: str) -> float:
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class CredentialRenewer:
+    """Self-renewing CP service credentials (coordination#33).
+
+    Renews each token ~7 days before expiry, persists the successor to a 0600
+    state file and only then confirms (which revokes the old token). A
+    persisted successor wins over env while it descends from the current env
+    token; a re-issued env token starts a new chain.
+    """
+
+    def __init__(self, base_url, state_file, env_tokens, call=None, now=time.time):
+        self.base_url = base_url.rstrip("/")
+        self.state_file = Path(state_file)
+        self.original = {k: v.strip() for k, v in env_tokens.items() if v and v.strip()}
+        self.tokens = dict(self.original)
+        self.pending: set[str] = set()
+        self.due = {k: 0.0 for k in self.tokens}
+        self.listeners: dict = {}
+        self._call = call or self._http
+        self._now = now
+        state = self._read()
+        for key, env in self.original.items():
+            entry = state.get(key)
+            if (
+                isinstance(entry, dict)
+                and entry.get("base") == _sha256(env)
+                and isinstance(entry.get("token"), str)
+                and entry["token"]
+            ):
+                self.tokens[key] = entry["token"]
+                # May be unconfirmed (crash before confirm); confirm is idempotent.
+                self.pending.add(key)
+
+    def _read(self) -> dict:
+        try:
+            document = json.loads(self.state_file.read_bytes()[:65536])
+            return document if isinstance(document, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _persist(self, key: str, token: str) -> None:
+        state = self._read()
+        state[key] = {"token": token, "base": _sha256(self.original[key])}
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.state_file.with_name(f".{self.state_file.name}.{os.getpid()}.tmp")
+        try:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(canonical(state))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.state_file)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _http(self, method: str, path: str, token: str) -> tuple[int, dict | None]:
+        opener = urllib.request.build_opener(_NoRedirect)
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=b"" if method == "POST" else None,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            method=method,
+        )
+        try:
+            with opener.open(request, timeout=10) as response:
+                status, raw = response.status, response.read(65536)
+        except urllib.error.HTTPError as error:
+            status, raw = error.code, b""
+            error.close()
+        try:
+            return status, json.loads(raw) if raw else None
+        except ValueError:
+            return status, None
+
+    def token(self, key: str) -> str:
+        return self.tokens.get(key, "")
+
+    def _adopt(self, key: str, token: str) -> None:
+        self.tokens[key] = token
+        listener = self.listeners.get(key)
+        if listener is not None:
+            listener(token)
+
+    def tick(self) -> None:
+        """Run every due key; each schedules its own next check."""
+        for key in self.tokens:
+            now = self._now()
+            if now < self.due[key]:
+                continue
+            try:
+                delay = self._step(key)
+            except Exception as error:  # renewal must never block the loop
+                print(f"cp: {key} renewal check failed: {error!r}", file=sys.stderr)
+                delay = RENEW_RETRY_S
+            self.due[key] = now + delay
+
+    def _step(self, key: str) -> float:
+        token = self.tokens[key]
+        if key in self.pending:
+            status, _ = self._call("POST", "/v2/credentials/renew/confirm", token)
+            # 404: nothing pending for this token; 401: /v2/me below falls back.
+            if status not in (200, 401, 404):
+                return RENEW_RETRY_S
+            self.pending.discard(key)
+        status, me = self._call("GET", "/v2/me", token)
+        env = self.original[key]
+        if status == 401 and token != env:
+            print(
+                f"cp: {key} persisted credential rejected, using env", file=sys.stderr
+            )
+            self._adopt(key, env)
+            return 0.0
+        if status != 200 or not isinstance(me, dict):
+            return RENEW_RETRY_S
+        due = renew_at(_epoch(me["issuedAt"]), _epoch(me["expiresAt"]))
+        now = self._now()
+        if now < due:
+            return max(1.0, min(RENEW_MAX_SLEEP_S, due - now))
+        status, renewed = self._call("POST", "/v2/credentials/renew", token)
+        if status != 201 or not isinstance(renewed, dict) or not renewed.get("token"):
+            print(f"cp: {key} renew status {status}", file=sys.stderr)
+            return RENEW_RETRY_S
+        # Persist before confirm: confirm revokes the old token. A failed write
+        # raises and the retry replays the same successor.
+        self._persist(key, renewed["token"])
+        self._adopt(key, renewed["token"])
+        self.pending.add(key)
+        print(
+            f"cp: {key} renewed, valid until {renewed.get('expiresAt')}",
+            file=sys.stderr,
+        )
+        return 0.0
