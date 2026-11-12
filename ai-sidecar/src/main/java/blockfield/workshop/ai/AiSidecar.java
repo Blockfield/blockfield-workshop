@@ -1,5 +1,6 @@
 package blockfield.workshop.ai;
 
+import com.lunares.blockfield.workshop.WorkshopGeometry;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
@@ -18,6 +19,7 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.util.Base64;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -26,10 +28,10 @@ import java.util.regex.Pattern;
 
 /**
  * Workshop AI sidecar (server#321): health, auth, generate/jobs/transcribe and the idempotency
- * store per {@code docs/ai-sidecar-contract.md}. U-AI1 owns the money ledger ({@link Budget}) and
- * the provider clients ({@link ProviderHttp}, single-shot generation); the stub backend completes
- * jobs with an empty plan until provider keys are configured, and the tool loop, STT and the mod
- * call-site cutover follow in U-AI2.
+ * store per {@code docs/ai-sidecar-contract.md}. Owns the money ledger ({@link Budget}), the
+ * provider clients ({@link ProviderHttp}), the tool loop/orchestration, prompts and STT ({@link
+ * GenerateFlow} and friends); the stub backend completes jobs with an empty plan until provider
+ * keys are configured. The mod calls over HTTP; the game JVM keeps jobs and apply.
  */
 public final class AiSidecar {
     static final int MAX_BODY = 64 << 20;
@@ -47,10 +49,18 @@ public final class AiSidecar {
 
     /**
      * Null selects the stub backend (no outbound traffic): every job completes immediately with an
-     * empty plan. Set when provider keys are configured; the single-shot generation path is the
-     * moved provider client, the loop follows in U-AI2.
+     * empty plan. Set when provider keys are configured; generation, transcription and cleanup each
+     * have a peer, so the tool loop, STT and fill all bill to their own account.
      */
-    private final ProviderHttp providers;
+    private final ProviderHttp generation;
+
+    private final ProviderHttp transcription;
+    private final ProviderHttp cleanup;
+    private final String generationProvider;
+    private final String transcriptionProvider;
+    private final String cleanupProvider;
+    private final java.net.http.HttpClient http;
+    private final Path rejectedPlans;
 
     /** Null disables the money ledger (dev default); set when a policy file is configured. */
     private final Budget budget;
@@ -59,15 +69,45 @@ public final class AiSidecar {
     private record Job(JSONObject plan, long storedAt) {}
 
     AiSidecar(String secret, Clock clock) {
-        this(secret, clock, null, null);
+        this(secret, clock, null, null, Path.of("logs", "workshop-ai-rejected"));
     }
 
-    AiSidecar(String secret, Clock clock, ProviderHttp providers, Budget budget) {
+    AiSidecar(String secret, Clock clock, Selections selections, Budget budget) {
+        this(secret, clock, selections, budget, Path.of("logs", "workshop-ai-rejected"));
+    }
+
+    AiSidecar(
+            String secret, Clock clock, Selections selections, Budget budget, Path rejectedPlans) {
         this.secret = secret;
         this.clock = clock;
         this.idempotency = new IdempotencyStore(clock);
-        this.providers = providers;
+        this.http = ProviderHttp.defaultHttpClient();
+        if (selections == null) {
+            this.generation = null;
+            this.transcription = null;
+            this.cleanup = null;
+            this.generationProvider = null;
+            this.transcriptionProvider = null;
+            this.cleanupProvider = null;
+        } else {
+            this.generation = peer(selections.generation());
+            this.transcription = peer(selections.transcription());
+            this.cleanup = peer(selections.cleanup());
+            this.generationProvider = selections.generation().provider();
+            this.transcriptionProvider = selections.transcription().provider();
+            this.cleanupProvider = selections.cleanup().provider();
+        }
         this.budget = budget;
+        this.rejectedPlans = rejectedPlans;
+    }
+
+    private ProviderHttp peer(ProviderHttp.Selection selection) {
+        return new ProviderHttp(
+                new ProviderHttp.Backend(
+                        selection.key(),
+                        ProviderHttp.Transport.forProvider(
+                                selection.provider(), selection.baseUrl())),
+                http);
     }
 
     public static void main(String[] args) throws Exception {
@@ -76,9 +116,9 @@ public final class AiSidecar {
         Path keyFile =
                 Path.of(env("AI_SIDECAR_KEY_FILE", "/data/blockfield-workshop/ai-sidecar.key"));
         String secret = Auth.loadKey(keyFile);
-        ProviderHttp providers = selectBackend();
+        Selections selections = selectSelections(Map.copyOf(System.getenv()));
         Budget budget = openLedger();
-        HttpServer server = start(bind, port, secret, Clock.systemUTC(), providers, budget);
+        HttpServer server = start(bind, port, secret, Clock.systemUTC(), selections, budget);
         System.out.println("listening on " + bind + ":" + server.getAddress().getPort());
     }
 
@@ -94,6 +134,39 @@ public final class AiSidecar {
     }
 
     static ProviderHttp selectBackend(Map<String, String> env) throws IOException {
+        ProviderHttp.Selection selection = selectGeneration(env);
+        if (selection == null) {
+            return null;
+        }
+        return new ProviderHttp(
+                new ProviderHttp.Backend(
+                        selection.key(),
+                        ProviderHttp.Transport.forProvider(
+                                selection.provider(), selection.baseUrl())),
+                ProviderHttp.defaultHttpClient());
+    }
+
+    /** Null when the generation provider is stub: the whole backend is stubbed. */
+    static Selections selectSelections(Map<String, String> env) throws IOException {
+        ProviderHttp.Selection generation = selectGeneration(env);
+        if (generation == null) {
+            return null;
+        }
+        ProviderHttp.Selection transcription = selectOne(env, "TRANSCRIPTION", generation);
+        ProviderHttp.Selection cleanup = selectOne(env, "CLEANUP", transcription);
+        return new Selections(generation, transcription, cleanup);
+    }
+
+    /**
+     * Per-phase provider topology: ids and URLs the mod config must agree with, keys sidecar-only.
+     */
+    record Selections(
+            ProviderHttp.Selection generation,
+            ProviderHttp.Selection transcription,
+            ProviderHttp.Selection cleanup) {}
+
+    private static ProviderHttp.Selection selectGeneration(Map<String, String> env)
+            throws IOException {
         String provider = env.getOrDefault("AI_SIDECAR_PROVIDER", "stub");
         if (provider.equals("stub")) {
             return null;
@@ -113,16 +186,39 @@ public final class AiSidecar {
             // instead of defaulting to GATEWAY_BASE.
             throw new IOException("AI_SIDECAR_PROVIDER_BASE_URL is required for custom");
         }
-        ProviderHttp.Transport transport =
-                ProviderHttp.Transport.forProvider(
-                        provider,
-                        baseUrl != null && !baseUrl.isEmpty()
-                                ? baseUrl
-                                : provider.equals(ProviderHttp.OPENROUTER)
-                                        ? ProviderHttp.OPENROUTER_BASE
-                                        : ProviderHttp.GATEWAY_BASE);
-        return new ProviderHttp(
-                new ProviderHttp.Backend(key, transport), ProviderHttp.defaultHttpClient());
+        if (baseUrl == null || baseUrl.isEmpty()) {
+            baseUrl =
+                    provider.equals(ProviderHttp.OPENROUTER)
+                            ? ProviderHttp.OPENROUTER_BASE
+                            : ProviderHttp.GATEWAY_BASE;
+        }
+        return new ProviderHttp.Selection(provider, baseUrl, key);
+    }
+
+    private static ProviderHttp.Selection selectOne(
+            Map<String, String> env, String prefix, ProviderHttp.Selection fallback)
+            throws IOException {
+        String provider =
+                env.getOrDefault("AI_SIDECAR_" + prefix + "_PROVIDER", fallback.provider());
+        if (!ProviderHttp.validProvider(provider)) {
+            throw new IOException("unknown AI_SIDECAR_" + prefix + "_PROVIDER: " + provider);
+        }
+        String keyFile = env.get("AI_SIDECAR_" + prefix + "_KEY_FILE");
+        String key =
+                keyFile == null || keyFile.isEmpty()
+                        ? fallback.key()
+                        : Auth.loadKey(Path.of(keyFile));
+        String baseUrl = env.getOrDefault("AI_SIDECAR_" + prefix + "_BASE_URL", fallback.baseUrl());
+        if (provider.equals(ProviderHttp.CUSTOM) && (baseUrl == null || baseUrl.isEmpty())) {
+            throw new IOException("AI_SIDECAR_" + prefix + "_BASE_URL is required for custom");
+        }
+        if (baseUrl == null || baseUrl.isEmpty()) {
+            baseUrl =
+                    provider.equals(ProviderHttp.OPENROUTER)
+                            ? ProviderHttp.OPENROUTER_BASE
+                            : ProviderHttp.GATEWAY_BASE;
+        }
+        return new ProviderHttp.Selection(provider, baseUrl, key);
     }
 
     /**
@@ -158,15 +254,10 @@ public final class AiSidecar {
     }
 
     static HttpServer start(
-            String bind,
-            int port,
-            String secret,
-            Clock clock,
-            ProviderHttp providers,
-            Budget budget)
+            String bind, int port, String secret, Clock clock, Selections selections, Budget budget)
             throws IOException {
-        AiSidecar app = new AiSidecar(secret, clock, providers, budget);
-        if (providers == null) {
+        AiSidecar app = new AiSidecar(secret, clock, selections, budget);
+        if (selections == null) {
             LOGGER.info("ai-sidecar: stub backend (no outbound AI traffic)");
         } else if (budget == null) {
             LOGGER.warning(
@@ -285,11 +376,11 @@ public final class AiSidecar {
     /**
      * Runs inside the idempotency supplier, so a retried request never reserves twice: the first
      * execution stores the jobId and the replay returns it. Stub plans cost nothing (bound 0); real
-     * generations reserve the job envelope up front and settle the exact cost.
+     * generations run the moved tool loop/orchestration and settle the exact cost.
      */
     private JSONObject runGenerate(JSONObject request, UUID sessionId, UUID builderId)
             throws Exception {
-        if (providers == null || budget == null) {
+        if (generation == null || budget == null) {
             // Stub backend (or unconfigured ledger): free empty plan, no reservation.
             Budget.Reservation reservation = null;
             if (budget != null) {
@@ -303,45 +394,310 @@ public final class AiSidecar {
                 }
             }
         }
-        SidecarConfig config;
+        SidecarConfig config = parseConfig(request);
+        checkProvider("generation", config.generationProvider(), generationProvider);
+        JSONObject dims = request.getJSONObject("dims");
+        int sx = dims.getInt("x"), sy = dims.getInt("y"), sz = dims.getInt("z");
+        Set<String> palette = paletteSet(request);
+        int version = version(request);
+        String contextText = contextText(request);
+        WorkshopAiSandbox.Snapshot snapshot = snapshot(request, sx, sy, sz);
+        int deadlineSeconds = request.optInt("deadlineSeconds", DEFAULT_DEADLINE_SECONDS);
+        long outerDeadline = System.currentTimeMillis() + deadlineSeconds * 1000L;
+        GenerateFlow flow =
+                new GenerateFlow(
+                        generation,
+                        transcription,
+                        cleanup,
+                        rejectedPlans,
+                        WorkshopAiPlanning::decide);
+        String mode = request.getString("mode");
+        WorkshopAiPlan plan;
+        if (mode.equals("fill")) {
+            checkProvider("transcription", config.transcriptionProvider(), transcriptionProvider);
+            checkProvider("cleanup", config.cleanupProvider(), cleanupProvider);
+            plan =
+                    runExtend(
+                            request,
+                            flow,
+                            config,
+                            palette,
+                            sx,
+                            sy,
+                            sz,
+                            sessionId,
+                            builderId,
+                            outerDeadline);
+        } else {
+            plan =
+                    flow.generate(
+                            request.getString("prompt"),
+                            contextText,
+                            config,
+                            palette,
+                            sx,
+                            sy,
+                            sz,
+                            budget,
+                            sessionId,
+                            builderId,
+                            version,
+                            progress -> {},
+                            outerDeadline,
+                            snapshot);
+        }
+        return planJson(plan);
+    }
+
+    private WorkshopAiPlan runExtend(
+            JSONObject request,
+            GenerateFlow flow,
+            SidecarConfig config,
+            Set<String> palette,
+            int sx,
+            int sy,
+            int sz,
+            UUID sessionId,
+            UUID builderId,
+            long outerDeadline)
+            throws Exception {
+        JSONObject fill = request.getJSONObject("fill");
+        String extendRequest = fillString(fill, "request", WorkshopAiFill.MAX_REQUEST_CHARS);
+        double destructive = fillNumber(fill, "destructive");
+        if (destructive != 0 && destructive != 1) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "fill.destructive must be 0 or 1");
+        }
+        if (!fill.has("option") || !(fill.opt("option") instanceof JSONObject)) {
+            throw new HttpError(400, "request", "invalid_request", "fill.option must be an object");
+        }
+        WorkshopAiFill.Option option =
+                WorkshopAiFill.parseOption(
+                        com.google.gson.JsonParser.parseString(
+                                        fill.getJSONObject("option").toString())
+                                .getAsJsonObject(),
+                        sy);
+        if (!fill.has("capture") || !(fill.opt("capture") instanceof JSONObject)) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "fill.capture must be an object");
+        }
+        WorkshopAiFill.Capture capture;
         try {
-            config = SidecarConfig.parse(request.getJSONObject("config"));
+            capture =
+                    WorkshopAiFill.parseCapture(
+                            com.google.gson.JsonParser.parseString(
+                                            fill.getJSONObject("capture").toString())
+                                    .getAsJsonObject());
+        } catch (IllegalArgumentException invalid) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "fill.capture: " + invalid.getMessage());
+        }
+        if (capture.sx != sx || capture.sy != sy || capture.sz != sz) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "fill.capture dims must match dims");
+        }
+        Set<String> allowed = new java.util.HashSet<>(palette);
+        allowed.addAll(WorkshopAiFill.sourceIds(capture, option));
+        String hint = request.getString("prompt");
+        WorkshopAiSandbox.Snapshot snapshot =
+                WorkshopAiSandbox.snapshot(sx, sy, sz, capture.columns(), Map.of(), Set.of());
+        return flow.extend(
+                extendRequest,
+                hint,
+                config,
+                allowed,
+                sx,
+                sy,
+                sz,
+                destructive,
+                budget,
+                sessionId,
+                builderId,
+                progress -> {},
+                outerDeadline,
+                snapshot,
+                plan -> WorkshopAiFill.seamReport(capture, option, plan));
+    }
+
+    private SidecarConfig parseConfig(JSONObject request) {
+        if (!(request.opt("config") instanceof JSONObject)) {
+            throw new HttpError(400, "request", "invalid_request", "config must be an object");
+        }
+        try {
+            return SidecarConfig.parse(
+                    com.google.gson.JsonParser.parseString(
+                                    request.getJSONObject("config").toString())
+                            .getAsJsonObject());
         } catch (IllegalArgumentException invalid) {
             throw new HttpError(
                     400, "request", "invalid_request", "config: " + invalid.getMessage());
         }
-        Budget.Reservation reservation =
-                ProviderHttp.reserve(
-                        budget,
-                        sessionId,
-                        builderId,
-                        ProviderHttp.jobBound(ProviderHttp.SINGLE_TOKENS));
-        JSONObject dims = request.getJSONObject("dims");
-        int timeout = generateTimeout(request, dims);
-        String system = systemPrompt(request);
-        String user = userPrompt(request);
-        com.google.gson.JsonObject chat =
-                ProviderHttp.chatRequest(
-                        config.generationModel(),
-                        config.generationProvider(),
-                        config.generationPromptCapUsdPerM(),
-                        config.generationCompletionCapUsdPerM(),
-                        system,
-                        user,
-                        config.effort(),
-                        ProviderHttp.SINGLE_TOKENS);
-        ProviderHttp.Billing billing =
-                providers.new Billing(reservation, receipt -> {}, budget, sessionId, builderId);
-        billing.caps(config.generationPromptCapUsdPerM(), config.generationCompletionCapUsdPerM());
-        try (ProviderHttp.Billing ignored = billing) {
-            com.google.gson.JsonObject response =
-                    billing.post("generation", providers.chatPath(), chat, timeout);
-            String content = ProviderHttp.messageContent(response);
-            if (content == null || content.isBlank()) {
-                throw new ProviderHttp.Failure("generation", "invalid_response", 0);
-            }
-            return parsePlan(content);
+    }
+
+    /** The deployment owns provider topology; the mod config must agree, never override it. */
+    private static void checkProvider(String phase, String requestId, String selected) {
+        if (!requestId.equals(selected)) {
+            throw new HttpError(
+                    400,
+                    "request",
+                    "invalid_request",
+                    phase + " provider " + requestId + " is not configured on this sidecar");
         }
+    }
+
+    private static int version(JSONObject request) {
+        int version = request.optInt("version", -1);
+        if (version < 1 || version > 3) {
+            throw new HttpError(400, "request", "invalid_request", "version must be 1..3");
+        }
+        return version;
+    }
+
+    private static String contextText(JSONObject request) {
+        if (!request.has("contextText")) {
+            return "";
+        }
+        if (!(request.opt("contextText") instanceof String)) {
+            throw new HttpError(400, "request", "invalid_request", "contextText must be a string");
+        }
+        String text = request.getString("contextText");
+        if (text.length() > 8192) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "contextText must hold at most 8192 chars");
+        }
+        return text;
+    }
+
+    private static Set<String> paletteSet(JSONObject request) {
+        JSONArray palette = request.getJSONArray("palette");
+        Set<String> ids = new java.util.HashSet<>();
+        for (int i = 0; i < palette.length(); i++) {
+            ids.add(palette.getString(i));
+        }
+        return ids;
+    }
+
+    private static WorkshopAiSandbox.Snapshot snapshot(JSONObject request, int sx, int sy, int sz) {
+        if (!request.has("snapshot")) {
+            return WorkshopAiSandbox.Snapshot.EMPTY;
+        }
+        if (!(request.opt("snapshot") instanceof JSONObject)) {
+            throw new HttpError(400, "request", "invalid_request", "snapshot must be an object");
+        }
+        JSONObject snap = request.getJSONObject("snapshot");
+        if (snap.length() == 0) {
+            return WorkshopAiSandbox.Snapshot.EMPTY;
+        }
+        try {
+            return WorkshopAiSandbox.Snapshot.fromWire(
+                    wireDims(snap, "sx", sx),
+                    wireDims(snap, "sy", sy),
+                    wireDims(snap, "sz", sz),
+                    wireCells(snap, "blocks"),
+                    wireCells(snap, "surface"),
+                    wireGuarded(snap));
+        } catch (IllegalArgumentException invalid) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "snapshot: " + invalid.getMessage());
+        }
+    }
+
+    private static int wireDims(JSONObject snap, String field, int expected) {
+        int value = snap.optInt(field, -1);
+        if (value != expected) {
+            throw new IllegalArgumentException(field + " must match dims");
+        }
+        return value;
+    }
+
+    private static Map<Integer, String> wireCells(JSONObject snap, String field) {
+        if (!snap.has(field)) {
+            return Map.of();
+        }
+        if (!(snap.opt(field) instanceof JSONObject)) {
+            throw new IllegalArgumentException(field + " must be an object");
+        }
+        JSONObject cells = snap.getJSONObject(field);
+        Map<Integer, String> out = new java.util.HashMap<>();
+        for (String key : cells.keySet()) {
+            final int index;
+            try {
+                index = Integer.parseUnsignedInt(key);
+            } catch (NumberFormatException invalid) {
+                throw new IllegalArgumentException(field + " keys must be cell indexes");
+            }
+            if (!(cells.opt(key) instanceof String) || cells.getString(key).length() > 256) {
+                throw new IllegalArgumentException(field + " values must be block texts");
+            }
+            out.put(index, cells.getString(key));
+        }
+        return out;
+    }
+
+    private static Set<Integer> wireGuarded(JSONObject snap) {
+        if (!snap.has("guarded")) {
+            return Set.of();
+        }
+        if (!(snap.opt("guarded") instanceof JSONArray)) {
+            throw new IllegalArgumentException("guarded must be an array");
+        }
+        JSONArray guarded = snap.getJSONArray("guarded");
+        Set<Integer> out = new java.util.HashSet<>();
+        for (int i = 0; i < guarded.length(); i++) {
+            if (!(guarded.opt(i) instanceof Integer)) {
+                throw new IllegalArgumentException("guarded entries must be cell indexes");
+            }
+            out.add(guarded.getInt(i));
+        }
+        return out;
+    }
+
+    private static String fillString(JSONObject fill, String field, int max) {
+        if (!(fill.opt(field) instanceof String)
+                || fill.getString(field).isEmpty()
+                || fill.getString(field).length() > max) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "fill." + field + " outside bounds");
+        }
+        return fill.getString(field);
+    }
+
+    private static double fillNumber(JSONObject fill, String field) {
+        if (!(fill.opt(field) instanceof Number)) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "fill." + field + " must be a number");
+        }
+        return fill.getDouble(field);
+    }
+
+    /** Moved-plan to the contract plan shape; the mod re-validates it before apply. */
+    private static JSONObject planJson(WorkshopAiPlan plan) {
+        JSONArray cells = new JSONArray();
+        for (WorkshopAiPlan.Cell cell : plan.cells()) {
+            JSONArray writes = new JSONArray();
+            for (WorkshopGeometry.Write write : cell.writes()) {
+                writes.put(
+                        new JSONObject().put("block", write.block()).put("match", write.match()));
+            }
+            cells.put(
+                    new JSONObject()
+                            .put("x", cell.x())
+                            .put("y", cell.y())
+                            .put("z", cell.z())
+                            .put("block", cell.block())
+                            .put("match", cell.match())
+                            .put("writes", writes));
+        }
+        JSONArray warnings = new JSONArray();
+        for (String warning : plan.warnings()) {
+            warnings.put(warning);
+        }
+        return new JSONObject()
+                .put("cells", cells)
+                .put("canonical", plan.canonical())
+                .put("demolishVolume", plan.demolishVolume())
+                .put("warnings", warnings)
+                .put("destructiveScore", plan.destructiveScore());
     }
 
     private void onTranscribe(HttpExchange exchange) throws IOException {
@@ -354,13 +710,13 @@ public final class AiSidecar {
             key = uuid(request, "requestId", true);
             UUID sessionId = UUID.fromString(uuid(request, "session", false));
             UUID builderId = UUID.fromString(uuid(request, "builder", false));
-            String wav = string(request, "wav");
-            if (wav.isEmpty()) {
+            String wavBase64 = string(request, "wav");
+            if (wavBase64.isEmpty()) {
                 throw new HttpError(
                         400, "request", "invalid_request", "wav must be non-empty base64");
             }
             try {
-                Base64.getDecoder().decode(wav);
+                Base64.getDecoder().decode(wavBase64);
             } catch (IllegalArgumentException e) {
                 throw new HttpError(400, "request", "invalid_request", "wav must be base64");
             }
@@ -374,28 +730,78 @@ public final class AiSidecar {
                             idempotencyKey,
                             hash,
                             () -> {
-                                // STT moves in U-AI2; the stub transcript costs nothing but still
-                                // flows through the ledger when enabled, so replays stay free.
-                                Budget.Reservation reservation = null;
-                                try {
-                                    if (budget != null) {
-                                        reservation =
-                                                ProviderHttp.reserve(
-                                                        budget, sessionId, builderId, 0);
+                                // STT runs the moved transcription flow; the stub transcript
+                                // costs nothing but still flows through the ledger when enabled,
+                                // so replays stay free.
+                                if (generation == null || budget == null) {
+                                    Budget.Reservation reservation = null;
+                                    try {
+                                        if (budget != null) {
+                                            reservation =
+                                                    ProviderHttp.reserve(
+                                                            budget, sessionId, builderId, 0);
+                                        }
+                                        return json(200, new JSONObject().put("text", STUB_TEXT));
+                                    } catch (RuntimeException e) {
+                                        throw e;
+                                    } catch (Exception e) {
+                                        throw new GenerateFailed(e);
+                                    } finally {
+                                        if (reservation != null) {
+                                            try {
+                                                reservation.confirm(BigDecimal.ZERO);
+                                            } catch (IOException confirmed) {
+                                                throw new GenerateFailed(confirmed);
+                                            }
+                                        }
                                     }
-                                    return json(200, new JSONObject().put("text", STUB_TEXT));
+                                }
+                                SidecarConfig config = parseConfig(request);
+                                checkProvider(
+                                        "generation",
+                                        config.generationProvider(),
+                                        generationProvider);
+                                checkProvider(
+                                        "transcription",
+                                        config.transcriptionProvider(),
+                                        transcriptionProvider);
+                                checkProvider("cleanup", config.cleanupProvider(), cleanupProvider);
+                                String model = string(request, "model");
+                                String cleanupModel = optionalString(request, "cleanupModel", 128);
+                                String language = optionalString(request, "language", 16);
+                                byte[] wav;
+                                try {
+                                    wav = Base64.getDecoder().decode(wavBase64);
+                                } catch (IllegalArgumentException e) {
+                                    throw new HttpError(
+                                            400,
+                                            "request",
+                                            "invalid_request",
+                                            "wav must be base64");
+                                }
+                                GenerateFlow flow =
+                                        new GenerateFlow(
+                                                generation,
+                                                transcription,
+                                                cleanup,
+                                                rejectedPlans,
+                                                WorkshopAiPlanning::decide);
+                                try {
+                                    String text =
+                                            flow.transcribe(
+                                                    wav,
+                                                    model,
+                                                    cleanupModel,
+                                                    language,
+                                                    config,
+                                                    budget,
+                                                    sessionId,
+                                                    builderId);
+                                    return json(200, new JSONObject().put("text", text));
                                 } catch (RuntimeException e) {
                                     throw e;
                                 } catch (Exception e) {
                                     throw new GenerateFailed(e);
-                                } finally {
-                                    if (reservation != null) {
-                                        try {
-                                            reservation.confirm(BigDecimal.ZERO);
-                                        } catch (IOException confirmed) {
-                                            throw new GenerateFailed(confirmed);
-                                        }
-                                    }
                                 }
                             });
             send(
@@ -476,6 +882,17 @@ public final class AiSidecar {
     private static String string(JSONObject request, String field) {
         if (!(request.opt(field) instanceof String)) {
             throw new HttpError(400, "request", "invalid_request", field + " must be a string");
+        }
+        return request.getString(field);
+    }
+
+    private static String optionalString(JSONObject request, String field, int max) {
+        if (!request.has(field)) {
+            return "";
+        }
+        if (!(request.opt(field) instanceof String) || request.getString(field).length() > max) {
+            throw new HttpError(
+                    400, "request", "invalid_request", field + " must be a short string");
         }
         return request.getString(field);
     }
@@ -567,59 +984,8 @@ public final class AiSidecar {
                 .put("cells", new JSONArray())
                 .put("canonical", "stub")
                 .put("demolishVolume", 0)
+                .put("destructiveScore", 0)
                 .put("warnings", new JSONArray().put(STUB_WARNING));
-    }
-
-    /**
-     * Single-shot instruction for the moved provider client: the mod keeps sending its validated
-     * palette/dims, the sidecar frames them. Prompt engineering and the tool loop move in U-AI2.
-     */
-    private static String systemPrompt(JSONObject request) {
-        JSONObject dims = request.getJSONObject("dims");
-        return "Blockfield builder: reply with a single plan JSON object only"
-                + " {cells:[{x,y,z,block,match,writes[]}],canonical,demolishVolume,warnings[]},"
-                + " no prose. Volume "
-                + dims.getInt("x")
-                + "x"
-                + dims.getInt("y")
-                + "x"
-                + dims.getInt("z")
-                + "; palette "
-                + request.getJSONArray("palette").toString()
-                + "; mode "
-                + request.getString("mode")
-                + ".";
-    }
-
-    private static String userPrompt(JSONObject request) {
-        String prompt = request.getString("prompt");
-        if (request.has("fill")) {
-            return prompt + "\nFill request: " + request.getJSONObject("fill").toString();
-        }
-        return prompt;
-    }
-
-    private static int generateTimeout(JSONObject request, JSONObject dims) {
-        int deadline = request.optInt("deadlineSeconds", DEFAULT_DEADLINE_SECONDS);
-        if (deadline < 60) {
-            return Math.max(1, deadline);
-        }
-        return ProviderHttp.generationTimeoutSeconds(
-                deadline, dims.getInt("x"), dims.getInt("y"), dims.getInt("z"));
-    }
-
-    /** Provider plan text to the contract plan shape; the mod re-validates it before apply. */
-    private static JSONObject parsePlan(String content) {
-        try {
-            com.google.gson.JsonObject plan =
-                    com.google.gson.JsonParser.parseString(content).getAsJsonObject();
-            if (!plan.has("cells") || !plan.get("cells").isJsonArray()) {
-                throw new ProviderHttp.Failure("generation", "invalid_plan", 0);
-            }
-            return new JSONObject(plan.toString());
-        } catch (com.google.gson.JsonParseException | JSONException invalid) {
-            throw new ProviderHttp.Failure("generation", "invalid_plan", 0);
-        }
     }
 
     /** Contract error mapping: upstream statuses pass through, sidecar faults stay 5xx. */

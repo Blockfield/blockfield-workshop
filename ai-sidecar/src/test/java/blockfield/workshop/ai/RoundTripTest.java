@@ -40,8 +40,8 @@ class RoundTripTest {
     private static final UUID BUILDER = UUID.fromString("d0000000-0000-0000-0000-000000000001");
 
     private static final String PLAN =
-            "{\"cells\":[{\"x\":1,\"y\":2,\"z\":3,\"block\":\"minecraft:stone\",\"match\":\"air\","
-                + "\"writes\":[]}],\"canonical\":\"fake\",\"demolishVolume\":0,\"warnings\":[]}";
+            "{\"version\":2,\"operations\":[{\"block\":\"minecraft:stone\",\"match\":\"air\","
+                    + "\"hollow\":false,\"from\":[1,2,3],\"to\":[1,2,3]}]}";
 
     @TempDir Path root;
 
@@ -95,12 +95,16 @@ class RoundTripTest {
         Files.writeString(root.resolve("ai-limits.json"), policy(10_000_000L));
         budget = Budget.open(root.resolve("ai-limits.json"), root.resolve("ai-usage.json"));
         String fakeBase = "http://127.0.0.1:" + fakeProvider.getAddress().getPort();
-        ProviderHttp providers =
-                new ProviderHttp(
-                        new ProviderHttp.Backend(
-                                "fake-key", ProviderHttp.Transport.openrouter(fakeBase)),
-                        ProviderHttp.defaultHttpClient());
-        sidecar = AiSidecar.start("127.0.0.1", 0, SECRET, fixedClock(), providers, budget);
+        // Custom transport skips the OpenRouter tariff probe, which the fake does not serve.
+        ProviderHttp.Selection fake = new ProviderHttp.Selection("custom", fakeBase, "fake-key");
+        sidecar =
+                AiSidecar.start(
+                        "127.0.0.1",
+                        0,
+                        SECRET,
+                        fixedClock(),
+                        new AiSidecar.Selections(fake, fake, fake),
+                        budget);
         base = "http://127.0.0.1:" + sidecar.getAddress().getPort();
     }
 
@@ -140,6 +144,7 @@ class RoundTripTest {
                 .put("builder", BUILDER.toString())
                 .put("prompt", "a small hut")
                 .put("mode", "generate")
+                .put("version", 2)
                 .put("dims", new JSONObject().put("x", 9).put("y", 9).put("z", 9))
                 .put("palette", new JSONArray().put("minecraft:stone"))
                 .put("config", config)
@@ -148,10 +153,19 @@ class RoundTripTest {
                 .toString();
     }
 
+    private static com.google.gson.JsonObject gson(JSONObject config) {
+        return com.google.gson.JsonParser.parseString(config.toString()).getAsJsonObject();
+    }
+
     private static JSONObject realConfig() {
         return new JSONObject()
                 .put("generationModel", "test/model")
-                .put("generationProvider", "openrouter")
+                .put("generationProvider", "custom")
+                .put("transcriptionModel", "test/model")
+                .put("transcriptionProvider", "custom")
+                .put("cleanupProvider", "custom")
+                .put("maxBlocks", 512)
+                .put("planning", new JSONObject())
                 .put("generationPromptCapUsdPerM", 100.0)
                 .put("generationCompletionCapUsdPerM", 100.0)
                 .put("effort", "high");
@@ -237,7 +251,7 @@ class RoundTripTest {
                         .toString();
         HttpServer fake = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 8);
         fake.createContext(
-                "/api/v1/chat/completions",
+                "/chat/completions",
                 exchange -> {
                     assertEquals(
                             "Bearer fake-key",
@@ -262,8 +276,11 @@ class RoundTripTest {
             HttpResponse<String> polled = poll(jobId);
             assertEquals(200, polled.statusCode());
             JSONObject plan = new JSONObject(polled.body()).getJSONObject("plan");
-            assertEquals("fake", plan.getString("canonical"));
             assertEquals(1, plan.getJSONArray("cells").length());
+            assertEquals(
+                    "minecraft:stone",
+                    plan.getJSONArray("cells").getJSONObject(0).getString("block"));
+            assertTrue(plan.getString("canonical").contains("\"version\":2"));
             // Authenticated cost 0.0001 USD settles to exactly 100 microUSD.
             assertEquals(100, budget.usedMicroUsd("session", SESSION));
 
@@ -296,7 +313,7 @@ class RoundTripTest {
     void realPathMapsUpstreamRefusalToItsStatus() throws Exception {
         HttpServer fake = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 8);
         fake.createContext(
-                "/api/v1/chat/completions",
+                "/chat/completions",
                 exchange -> {
                     byte[] body = "{\"error\":\"bad key\"}".getBytes(StandardCharsets.UTF_8);
                     exchange.sendResponseHeaders(401, body.length);
@@ -321,15 +338,18 @@ class RoundTripTest {
 
     @Test
     void configParsingBounds() {
-        SidecarConfig config = SidecarConfig.parse(realConfig());
+        SidecarConfig config = SidecarConfig.parse(gson(realConfig()));
         assertEquals("test/model", config.generationModel());
         assertTrue(
                 org.junit.jupiter.api.Assertions.assertThrows(
                                 IllegalArgumentException.class,
                                 () ->
                                         SidecarConfig.parse(
-                                                new JSONObject()
-                                                        .put("generationModel", "test/model")))
+                                                gson(
+                                                        new JSONObject()
+                                                                .put(
+                                                                        "generationModel",
+                                                                        "test/model"))))
                         .getMessage()
                         .contains("generationProvider"));
         assertTrue(
@@ -337,8 +357,11 @@ class RoundTripTest {
                                 IllegalArgumentException.class,
                                 () ->
                                         SidecarConfig.parse(
-                                                realConfig()
-                                                        .put("generationPromptCapUsdPerM", -1.0)))
+                                                gson(
+                                                        realConfig()
+                                                                .put(
+                                                                        "generationPromptCapUsdPerM",
+                                                                        -1.0))))
                         .getMessage()
                         .contains("generationPromptCapUsdPerM"));
     }
