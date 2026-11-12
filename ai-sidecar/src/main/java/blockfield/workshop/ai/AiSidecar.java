@@ -107,6 +107,12 @@ public final class AiSidecar {
         }
         String key = Auth.loadKey(Path.of(keyFile));
         String baseUrl = env.get("AI_SIDECAR_PROVIDER_BASE_URL");
+        if (provider.equals(ProviderHttp.CUSTOM) && (baseUrl == null || baseUrl.isEmpty())) {
+            // A custom key sent to the gateway host would mis-bill and disclose the
+            // credential, so custom refuses startup without its own explicit base URL
+            // instead of defaulting to GATEWAY_BASE.
+            throw new IOException("AI_SIDECAR_PROVIDER_BASE_URL is required for custom");
+        }
         ProviderHttp.Transport transport =
                 ProviderHttp.Transport.forProvider(
                         provider,

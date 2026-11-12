@@ -14,6 +14,7 @@ import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -23,12 +24,19 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Provider HTTP choke point against a stub upstream: headers, taxonomy, tariff, bounds. */
 class ProviderHttpTest {
     private static final String KEY = "test-provider-key-0123456789-_AB";
+    private static final UUID SESSION = UUID.fromString("c0000000-0000-0000-0000-000000000001");
+    private static final UUID BUILDER = UUID.fromString("d0000000-0000-0000-0000-000000000001");
+
+    @TempDir Path root;
 
     private HttpServer upstream;
     private String upstreamBase;
@@ -131,6 +139,45 @@ class ProviderHttpTest {
                                                 5));
         assertEquals(402, failure.status);
         assertTrue(failure.unbilled());
+    }
+
+    @Test
+    void uncertainUpstreamFailureKeepsOnlyTheSendTimeBound() throws Exception {
+        // Review finding: a 500 without usage left certain==false, so close() never
+        // confirmed and the whole job envelope stayed charged. The provider may still
+        // have billed this exact request, so the send-time bound (the most it could
+        // cost under the owner ceilings) stays charged and only the provably unspent
+        // remainder is released.
+        status = 500;
+        payload = "{\"error\":\"boom\"}";
+        Files.writeString(
+                root.resolve("ai-limits.json"),
+                "{\"schema\":1,\"revision\":0,\"currency\":\"USD\",\"mode\":\"session\","
+                        + "\"sessions\":{\""
+                        + SESSION
+                        + "\":1000000},\"builders\":{\""
+                        + BUILDER
+                        + "\":1000000}}");
+        Budget budget = Budget.open(root.resolve("ai-limits.json"), root.resolve("ai-usage.json"));
+        try {
+            Budget.Reservation reservation =
+                    ProviderHttp.reserve(budget, SESSION, BUILDER, ProviderHttp.jobBound(64000));
+            JsonObject request = chat("high", 64000);
+            long bound =
+                    ProviderHttp.callBoundFor(
+                            ProviderHttp.requestTokens(request), 64000, 0.10, 0.20);
+            ProviderHttp providers = client();
+            try (ProviderHttp.Billing billing =
+                    providers.new Billing(reservation, receipt -> {}, budget, SESSION, BUILDER)) {
+                billing.caps(0.10, 0.20);
+                assertThrows(
+                        ProviderHttp.Failure.class,
+                        () -> billing.post("generation", "/api/v1/chat/completions", request, 5));
+            }
+            assertEquals(bound, budget.usedMicroUsd("session", SESSION));
+        } finally {
+            budget.close();
+        }
     }
 
     @Test

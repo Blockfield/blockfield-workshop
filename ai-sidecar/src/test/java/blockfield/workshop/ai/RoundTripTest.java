@@ -344,6 +344,44 @@ class RoundTripTest {
     }
 
     @Test
+    void customProviderWithoutBaseUrlRefusesStartup() throws Exception {
+        // Review finding: custom without AI_SIDECAR_PROVIDER_BASE_URL silently used
+        // GATEWAY_BASE, sending the custom bearer key to the wrong host.
+        Path keyFile = root.resolve("provider.key");
+        Files.writeString(keyFile, "custom-provider-key-0123456789-_AB");
+        java.util.Map<String, String> env =
+                java.util.Map.of(
+                        "AI_SIDECAR_PROVIDER",
+                        "custom",
+                        "AI_SIDECAR_PROVIDER_KEY_FILE",
+                        keyFile.toString());
+        IOException failure =
+                org.junit.jupiter.api.Assertions.assertThrows(
+                        IOException.class, () -> AiSidecar.selectBackend(env));
+        assertTrue(failure.getMessage().contains("AI_SIDECAR_PROVIDER_BASE_URL"));
+        // Explicit base URLs still select the custom transport; the OpenRouter
+        // default is unchanged.
+        assertTrue(
+                AiSidecar.selectBackend(
+                                java.util.Map.of(
+                                        "AI_SIDECAR_PROVIDER",
+                                        "custom",
+                                        "AI_SIDECAR_PROVIDER_KEY_FILE",
+                                        keyFile.toString(),
+                                        "AI_SIDECAR_PROVIDER_BASE_URL",
+                                        "https://custom.example"))
+                        != null);
+        assertTrue(
+                AiSidecar.selectBackend(
+                                java.util.Map.of(
+                                        "AI_SIDECAR_PROVIDER",
+                                        "openrouter",
+                                        "AI_SIDECAR_PROVIDER_KEY_FILE",
+                                        keyFile.toString()))
+                        != null);
+    }
+
+    @Test
     void backendSelectionAndLedgerEnv() throws Exception {
         assertTrue(AiSidecar.selectBackend(java.util.Map.of()) == null);
         assertTrue(

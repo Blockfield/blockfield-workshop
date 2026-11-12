@@ -890,7 +890,17 @@ final class ProviderHttp {
                 // OpenRouter rejects a bad key (401) or missing credit (402) before routing to a
                 // model, so nothing was charged; other statuses and timeouts may still be billed.
                 if (refused.receipt == null) {
-                    if (refused.unbilled()) certain = true;
+                    if (refused.unbilled()) {
+                        certain = true;
+                    } else {
+                        // Unknown billing outcome: the provider may still have billed this
+                        // exact request, so keep the send-time bound (the most it could cost
+                        // under the owner ceilings) and release only the provably unspent
+                        // remainder on close. Like WorkshopAiBudget.confirm, only a settled
+                        // amount releases funds; the accumulation never under-charges a retry.
+                        confirmed = confirmed.add(BigDecimal.valueOf(bound, 6));
+                        certain = true;
+                    }
                     throw refused;
                 }
                 response = refused.receipt;
