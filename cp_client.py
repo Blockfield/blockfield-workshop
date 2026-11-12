@@ -40,6 +40,7 @@ import re
 import socket
 import sys
 import time
+import uuid
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -986,7 +987,7 @@ RENEWED_KEYS = ("BLOCKFIELD_CP_AGENT_TOKEN", "BLOCKFIELD_CP_GATE_TOKEN")
 
 def renew_at(issued: float, expires: float) -> float:
     """~7 days before expiry, or a quarter of a short (test) lifetime."""
-    return expires - min(RENEW_MAX_LEAD_S, (expires - issued) / 4)
+    return expires - min(RENEW_MAX_LEAD_S, max(0.0, expires - issued) / 4)
 
 
 def _epoch(text: str) -> float:
@@ -1040,9 +1041,20 @@ class CredentialRenewer:
         state = self._read()
         state[key] = {"token": token, "base": _sha256(self.original[key])}
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.state_file.with_name(f".{self.state_file.name}.{os.getpid()}.tmp")
+        self._write(state)
+
+    def _forget(self, key: str) -> None:
+        state = self._read()
+        if state.pop(key, None) is not None:
+            self._write(state)
+
+    def _write(self, state: dict) -> None:
+        # Unique per write: overlapping deploys share the volume and often the pid.
+        temp = self.state_file.with_name(
+            f".{self.state_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         try:
-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(canonical(state))
                 handle.flush()
@@ -1052,7 +1064,11 @@ class CredentialRenewer:
             temp.unlink(missing_ok=True)
 
     def _http(self, method: str, path: str, token: str) -> tuple[int, dict | None]:
-        opener = urllib.request.build_opener(_NoRedirect)
+        # Never send the bearer through an http proxy (same as _UrllibTransport).
+        proxies = {k: v for k, v in urllib.request.getproxies().items() if k != "http"}
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler(proxies), _NoRedirect
+        )
         request = urllib.request.Request(
             self.base_url + path,
             data=b"" if method == "POST" else None,
@@ -1094,25 +1110,33 @@ class CredentialRenewer:
 
     def _step(self, key: str) -> float:
         token = self.tokens[key]
+        just_confirmed = False
         if key in self.pending:
             status, _ = self._call("POST", "/v2/credentials/renew/confirm", token)
             # 404: nothing pending for this token; 401: /v2/me below falls back.
             if status not in (200, 401, 404):
                 return RENEW_RETRY_S
             self.pending.discard(key)
+            just_confirmed = status == 200
         status, me = self._call("GET", "/v2/me", token)
         env = self.original[key]
-        if status == 401 and token != env:
+        # Right after a confirmed renewal a 401 is replication lag: the env token is revoked.
+        if status == 401 and token != env and not just_confirmed:
             print(
                 f"cp: {key} persisted credential rejected, using env", file=sys.stderr
             )
             self._adopt(key, env)
+            self._forget(key)  # else a restart would adopt the rejected successor again
             return 0.0
         if status != 200 or not isinstance(me, dict):
             return RENEW_RETRY_S
         if not me.get("issuedAt") or not me.get("expiresAt"):
             return RENEW_MAX_SLEEP_S  # CP without renewal support: check back hourly
-        due = renew_at(_epoch(me["issuedAt"]), _epoch(me["expiresAt"]))
+        try:
+            due = renew_at(_epoch(me["issuedAt"]), _epoch(me["expiresAt"]))
+        except (ValueError, TypeError, AttributeError):
+            print(f"cp: {key} unusable credential dates", file=sys.stderr)
+            return RENEW_RETRY_S
         now = self._now()
         if now < due:
             return max(1.0, min(RENEW_MAX_SLEEP_S, due - now))

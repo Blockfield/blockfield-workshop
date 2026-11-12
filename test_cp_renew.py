@@ -106,6 +106,35 @@ class CredentialRenewerTest(unittest.TestCase):
         self.assertEqual(r.token(KEY), "next-env")
         r.tick()
         self.assertEqual(r.token(KEY), "env")
+        # The rejected successor must not come back after a restart.
+        self.assertNotIn(KEY, json.loads(self.state.read_text()))
+        self.assertEqual(self.renewer(cp).token(KEY), "env")
+
+    def test_401_right_after_a_confirmed_renewal_keeps_the_successor(self):
+        self.renewer(FakeCp(NOW, NOW, self.state))._persist(KEY, "next-env")
+        cp = FakeCp(NOW, NOW + 30 * DAY, self.state)
+        base = cp
+        lag = lambda m, p, t: (401, None) if p == "/v2/me" else base(m, p, t)  # noqa: E731
+        r = CredentialRenewer(
+            "https://cp.test", self.state, {KEY: "env"}, call=lag, now=lambda: self.now
+        )
+        r.tick()
+        self.assertEqual(r.token(KEY), "next-env")
+        self.assertEqual(r.due[KEY], NOW + 30)
+
+    def test_skewed_dates_renew_at_expiry_and_garbage_retries(self):
+        self.assertEqual(renew_at(100, 50), 50)
+        r = self.renewer(lambda m, p, t: (200, {"issuedAt": "x", "expiresAt": "y"}))
+        r.tick()
+        self.assertEqual(r.due[KEY], NOW + 30)
+
+    def test_writes_never_share_a_temp_file(self):
+        r = self.renewer(FakeCp(NOW, NOW, self.state))
+        r._persist(KEY, "a")
+        r._persist(KEY, "b")
+        self.assertEqual(
+            [p.name for p in self.state.parent.iterdir()], [self.state.name]
+        )
 
     def test_cp_without_renewal_support_is_checked_hourly(self):
         calls = []
