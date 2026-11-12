@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.math.BigDecimal;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -20,12 +21,15 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
 /**
- * Workshop AI sidecar skeleton (server#321 U-W1): health, auth, stub generate/jobs/transcribe and
- * the idempotency store per {@code docs/ai-sidecar-contract.md}. No provider code moves in this
- * unit; the stub backend completes every job immediately with an empty plan.
+ * Workshop AI sidecar (server#321): health, auth, generate/jobs/transcribe and the idempotency
+ * store per {@code docs/ai-sidecar-contract.md}. U-AI1 owns the money ledger ({@link Budget}) and
+ * the provider clients ({@link ProviderHttp}, single-shot generation); the stub backend completes
+ * jobs with an empty plan until provider keys are configured, and the tool loop, STT and the mod
+ * call-site cutover follow in U-AI2.
  */
 public final class AiSidecar {
     static final int MAX_BODY = 64 << 20;
@@ -39,14 +43,31 @@ public final class AiSidecar {
     private final Clock clock;
     private final IdempotencyStore idempotency;
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
+    private static final Logger LOGGER = Logger.getLogger(AiSidecar.class.getName());
 
-    /** A completed stub plan with its creation time; jobs older than the idempotency window 404. */
+    /**
+     * Null selects the stub backend (no outbound traffic): every job completes immediately with an
+     * empty plan. Set when provider keys are configured; the single-shot generation path is the
+     * moved provider client, the loop follows in U-AI2.
+     */
+    private final ProviderHttp providers;
+
+    /** Null disables the money ledger (dev default); set when a policy file is configured. */
+    private final Budget budget;
+
+    /** A completed plan with its creation time; jobs older than the idempotency window 404. */
     private record Job(JSONObject plan, long storedAt) {}
 
     AiSidecar(String secret, Clock clock) {
+        this(secret, clock, null, null);
+    }
+
+    AiSidecar(String secret, Clock clock, ProviderHttp providers, Budget budget) {
         this.secret = secret;
         this.clock = clock;
         this.idempotency = new IdempotencyStore(clock);
+        this.providers = providers;
+        this.budget = budget;
     }
 
     public static void main(String[] args) throws Exception {
@@ -55,8 +76,76 @@ public final class AiSidecar {
         Path keyFile =
                 Path.of(env("AI_SIDECAR_KEY_FILE", "/data/blockfield-workshop/ai-sidecar.key"));
         String secret = Auth.loadKey(keyFile);
-        HttpServer server = start(bind, port, secret, Clock.systemUTC());
-        System.out.println("ai-sidecar listening on " + bind + ":" + server.getAddress().getPort());
+        ProviderHttp providers = selectBackend();
+        Budget budget = openLedger();
+        HttpServer server = start(bind, port, secret, Clock.systemUTC(), providers, budget);
+        System.out.println("listening on " + bind + ":" + server.getAddress().getPort());
+    }
+
+    /**
+     * Backend from env-referenced key files (no secret values in config): {@code
+     * AI_SIDECAR_PROVIDER} is {@code stub} (default), {@code openrouter}, {@code vercel-gateway} or
+     * {@code custom}; {@code AI_SIDECAR_PROVIDER_BASE_URL} overrides the default base URL; the key
+     * comes from {@code AI_SIDECAR_PROVIDER_KEY_FILE}. Unknown provider or missing key file fails
+     * startup, never the first request.
+     */
+    static ProviderHttp selectBackend() throws IOException {
+        return selectBackend(Map.copyOf(System.getenv()));
+    }
+
+    static ProviderHttp selectBackend(Map<String, String> env) throws IOException {
+        String provider = env.getOrDefault("AI_SIDECAR_PROVIDER", "stub");
+        if (provider.equals("stub")) {
+            return null;
+        }
+        if (!ProviderHttp.validProvider(provider)) {
+            throw new IOException("unknown AI_SIDECAR_PROVIDER: " + provider);
+        }
+        String keyFile = env.get("AI_SIDECAR_PROVIDER_KEY_FILE");
+        if (keyFile == null || keyFile.isEmpty()) {
+            throw new IOException("AI_SIDECAR_PROVIDER_KEY_FILE is required for " + provider);
+        }
+        String key = Auth.loadKey(Path.of(keyFile));
+        String baseUrl = env.get("AI_SIDECAR_PROVIDER_BASE_URL");
+        if (provider.equals(ProviderHttp.CUSTOM) && (baseUrl == null || baseUrl.isEmpty())) {
+            // A custom key sent to the gateway host would mis-bill and disclose the
+            // credential, so custom refuses startup without its own explicit base URL
+            // instead of defaulting to GATEWAY_BASE.
+            throw new IOException("AI_SIDECAR_PROVIDER_BASE_URL is required for custom");
+        }
+        ProviderHttp.Transport transport =
+                ProviderHttp.Transport.forProvider(
+                        provider,
+                        baseUrl != null && !baseUrl.isEmpty()
+                                ? baseUrl
+                                : provider.equals(ProviderHttp.OPENROUTER)
+                                        ? ProviderHttp.OPENROUTER_BASE
+                                        : ProviderHttp.GATEWAY_BASE);
+        return new ProviderHttp(
+                new ProviderHttp.Backend(key, transport), ProviderHttp.defaultHttpClient());
+    }
+
+    /**
+     * Money ledger on a sidecar volume: {@code AI_SIDECAR_POLICY_FILE} enables it (the admin policy
+     * the controller deploys); {@code AI_SIDECAR_LEDGER_FILE} defaults to {@code ai-usage.json}
+     * next to the policy. Absent policy file means no ledger (dev default).
+     */
+    static Budget openLedger() throws IOException {
+        return openLedger(Map.copyOf(System.getenv()));
+    }
+
+    static Budget openLedger(Map<String, String> env) throws IOException {
+        String policy = env.get("AI_SIDECAR_POLICY_FILE");
+        if (policy == null || policy.isEmpty()) {
+            return null;
+        }
+        Path policyFile = Path.of(policy);
+        String ledger = env.get("AI_SIDECAR_LEDGER_FILE");
+        Path ledgerFile =
+                ledger != null && !ledger.isEmpty()
+                        ? Path.of(ledger)
+                        : policyFile.resolveSibling("ai-usage.json");
+        return Budget.open(policyFile, ledgerFile);
     }
 
     static String env(String name, String fallback) {
@@ -65,7 +154,27 @@ public final class AiSidecar {
     }
 
     static HttpServer start(String bind, int port, String secret, Clock clock) throws IOException {
-        AiSidecar app = new AiSidecar(secret, clock);
+        return start(bind, port, secret, clock, null, null);
+    }
+
+    static HttpServer start(
+            String bind,
+            int port,
+            String secret,
+            Clock clock,
+            ProviderHttp providers,
+            Budget budget)
+            throws IOException {
+        AiSidecar app = new AiSidecar(secret, clock, providers, budget);
+        if (providers == null) {
+            LOGGER.info("ai-sidecar: stub backend (no outbound AI traffic)");
+        } else if (budget == null) {
+            LOGGER.warning(
+                    "ai-sidecar: provider configured without a ledger; serving stub plans until"
+                            + " AI_SIDECAR_POLICY_FILE is set");
+        } else {
+            LOGGER.info("ai-sidecar: provider backend with ledger");
+        }
         HttpServer server = HttpServer.create(new InetSocketAddress(bind, port), 128);
         server.createContext("/health", app::onHealth);
         server.createContext("/v1/generate", app::onGenerate);
@@ -103,8 +212,8 @@ public final class AiSidecar {
             byte[] body = readBody(exchange);
             JSONObject request = parse(body);
             key = uuid(request, "requestId", true);
-            uuid(request, "session", false);
-            uuid(request, "builder", false);
+            UUID sessionId = UUID.fromString(uuid(request, "session", false));
+            UUID builderId = UUID.fromString(uuid(request, "builder", false));
             String prompt = string(request, "prompt");
             if (prompt.isEmpty()) {
                 throw new HttpError(400, "request", "invalid_request", "prompt must be non-empty");
@@ -138,7 +247,15 @@ public final class AiSidecar {
                             hash,
                             () -> {
                                 String jobId = UUID.randomUUID().toString();
-                                jobs.put(jobId, new Job(stubPlan(), clock.millis()));
+                                JSONObject plan;
+                                try {
+                                    plan = runGenerate(request, sessionId, builderId);
+                                } catch (RuntimeException e) {
+                                    throw e;
+                                } catch (Exception e) {
+                                    throw new GenerateFailed(e);
+                                }
+                                jobs.put(jobId, new Job(plan, clock.millis()));
                                 return json(200, new JSONObject().put("jobId", jobId));
                             });
             send(
@@ -150,6 +267,11 @@ public final class AiSidecar {
                     exchange,
                     409,
                     envelope("request", "conflict", 409, "requestId reused with a different body"));
+        } catch (GenerateFailed e) {
+            sendGenerateFailed(exchange, key, e.getCause());
+        } catch (ProviderHttp.Failure e) {
+            int status = failureStatus(e);
+            send(exchange, status, envelope(e.phase, e.category, status, e.getMessage()));
         } catch (HttpError e) {
             send(exchange, e.status, e.envelope());
         } catch (Exception e) {
@@ -157,6 +279,68 @@ public final class AiSidecar {
                 idempotency.forget(key); // internal is not final: a same-key retry re-executes.
             }
             send(exchange, 500, envelope("unknown", "internal", 500, "internal error"));
+        }
+    }
+
+    /**
+     * Runs inside the idempotency supplier, so a retried request never reserves twice: the first
+     * execution stores the jobId and the replay returns it. Stub plans cost nothing (bound 0); real
+     * generations reserve the job envelope up front and settle the exact cost.
+     */
+    private JSONObject runGenerate(JSONObject request, UUID sessionId, UUID builderId)
+            throws Exception {
+        if (providers == null || budget == null) {
+            // Stub backend (or unconfigured ledger): free empty plan, no reservation.
+            Budget.Reservation reservation = null;
+            if (budget != null) {
+                reservation = ProviderHttp.reserve(budget, sessionId, builderId, 0);
+            }
+            try {
+                return stubPlan();
+            } finally {
+                if (reservation != null) {
+                    reservation.confirm(BigDecimal.ZERO);
+                }
+            }
+        }
+        SidecarConfig config;
+        try {
+            config = SidecarConfig.parse(request.getJSONObject("config"));
+        } catch (IllegalArgumentException invalid) {
+            throw new HttpError(
+                    400, "request", "invalid_request", "config: " + invalid.getMessage());
+        }
+        Budget.Reservation reservation =
+                ProviderHttp.reserve(
+                        budget,
+                        sessionId,
+                        builderId,
+                        ProviderHttp.jobBound(ProviderHttp.SINGLE_TOKENS));
+        JSONObject dims = request.getJSONObject("dims");
+        int timeout = generateTimeout(request, dims);
+        String system = systemPrompt(request);
+        String user = userPrompt(request);
+        com.google.gson.JsonObject chat =
+                ProviderHttp.chatRequest(
+                        config.generationModel(),
+                        config.generationProvider(),
+                        config.generationPromptCapUsdPerM(),
+                        config.generationCompletionCapUsdPerM(),
+                        system,
+                        user,
+                        config.effort(),
+                        ProviderHttp.SINGLE_TOKENS);
+        ProviderHttp.Billing billing =
+                providers.new Billing(reservation, receipt -> {}, budget, sessionId, builderId);
+        billing.caps(config.generationPromptCapUsdPerM(), config.generationCompletionCapUsdPerM());
+        try (ProviderHttp.Billing ignored = billing) {
+            com.google.gson.JsonObject response =
+                    billing.post("generation", providers.chatPath(), chat, timeout);
+            String content = ProviderHttp.messageContent(response);
+            if (content == null || content.isBlank()) {
+                throw new ProviderHttp.Failure("generation", "invalid_response", 0);
+            }
+            return parsePlan(content);
         }
     }
 
@@ -168,8 +352,8 @@ public final class AiSidecar {
             byte[] body = readBody(exchange);
             JSONObject request = parse(body);
             key = uuid(request, "requestId", true);
-            uuid(request, "session", false);
-            uuid(request, "builder", false);
+            UUID sessionId = UUID.fromString(uuid(request, "session", false));
+            UUID builderId = UUID.fromString(uuid(request, "builder", false));
             String wav = string(request, "wav");
             if (wav.isEmpty()) {
                 throw new HttpError(
@@ -189,7 +373,31 @@ public final class AiSidecar {
                     idempotency.use(
                             idempotencyKey,
                             hash,
-                            () -> json(200, new JSONObject().put("text", STUB_TEXT)));
+                            () -> {
+                                // STT moves in U-AI2; the stub transcript costs nothing but still
+                                // flows through the ledger when enabled, so replays stay free.
+                                Budget.Reservation reservation = null;
+                                try {
+                                    if (budget != null) {
+                                        reservation =
+                                                ProviderHttp.reserve(
+                                                        budget, sessionId, builderId, 0);
+                                    }
+                                    return json(200, new JSONObject().put("text", STUB_TEXT));
+                                } catch (RuntimeException e) {
+                                    throw e;
+                                } catch (Exception e) {
+                                    throw new GenerateFailed(e);
+                                } finally {
+                                    if (reservation != null) {
+                                        try {
+                                            reservation.confirm(BigDecimal.ZERO);
+                                        } catch (IOException confirmed) {
+                                            throw new GenerateFailed(confirmed);
+                                        }
+                                    }
+                                }
+                            });
             send(
                     exchange,
                     stored.status(),
@@ -199,6 +407,8 @@ public final class AiSidecar {
                     exchange,
                     409,
                     envelope("request", "conflict", 409, "requestId reused with a different body"));
+        } catch (GenerateFailed e) {
+            sendGenerateFailed(exchange, key, e.getCause());
         } catch (HttpError e) {
             send(exchange, e.status, e.envelope());
         } catch (Exception e) {
@@ -324,12 +534,113 @@ public final class AiSidecar {
         }
     }
 
+    /**
+     * Unchecked carrier for checked failures escaping the idempotency suppliers (the suppliers
+     * cannot throw checked exceptions, and the ledger/billing mapping must survive the trip).
+     */
+    static final class GenerateFailed extends RuntimeException {
+        GenerateFailed(Throwable cause) {
+            super(cause);
+        }
+    }
+
+    /** Maps an unwrapped supplier failure; ledgers stay closed, internals stay opaque. */
+    private void sendGenerateFailed(HttpExchange exchange, String key, Throwable cause)
+            throws IOException {
+        if (cause instanceof Budget.BudgetExhausted) {
+            send(exchange, 402, envelope("budget", "exhausted", 402, "AI budget exhausted"));
+        } else if (cause instanceof Budget.BudgetBlocked) {
+            send(exchange, 403, envelope("budget", "blocked", 403, "AI budget blocked"));
+        } else {
+            if (cause instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            if (key != null) {
+                idempotency.forget(key); // internal is not final: a same-key retry re-executes.
+            }
+            send(exchange, 500, envelope("unknown", "internal", 500, "internal error"));
+        }
+    }
+
     private static JSONObject stubPlan() {
         return new JSONObject()
                 .put("cells", new JSONArray())
                 .put("canonical", "stub")
                 .put("demolishVolume", 0)
                 .put("warnings", new JSONArray().put(STUB_WARNING));
+    }
+
+    /**
+     * Single-shot instruction for the moved provider client: the mod keeps sending its validated
+     * palette/dims, the sidecar frames them. Prompt engineering and the tool loop move in U-AI2.
+     */
+    private static String systemPrompt(JSONObject request) {
+        JSONObject dims = request.getJSONObject("dims");
+        return "Blockfield builder: reply with a single plan JSON object only"
+                + " {cells:[{x,y,z,block,match,writes[]}],canonical,demolishVolume,warnings[]},"
+                + " no prose. Volume "
+                + dims.getInt("x")
+                + "x"
+                + dims.getInt("y")
+                + "x"
+                + dims.getInt("z")
+                + "; palette "
+                + request.getJSONArray("palette").toString()
+                + "; mode "
+                + request.getString("mode")
+                + ".";
+    }
+
+    private static String userPrompt(JSONObject request) {
+        String prompt = request.getString("prompt");
+        if (request.has("fill")) {
+            return prompt + "\nFill request: " + request.getJSONObject("fill").toString();
+        }
+        return prompt;
+    }
+
+    private static int generateTimeout(JSONObject request, JSONObject dims) {
+        int deadline = request.optInt("deadlineSeconds", DEFAULT_DEADLINE_SECONDS);
+        if (deadline < 60) {
+            return Math.max(1, deadline);
+        }
+        return ProviderHttp.generationTimeoutSeconds(
+                deadline, dims.getInt("x"), dims.getInt("y"), dims.getInt("z"));
+    }
+
+    /** Provider plan text to the contract plan shape; the mod re-validates it before apply. */
+    private static JSONObject parsePlan(String content) {
+        try {
+            com.google.gson.JsonObject plan =
+                    com.google.gson.JsonParser.parseString(content).getAsJsonObject();
+            if (!plan.has("cells") || !plan.get("cells").isJsonArray()) {
+                throw new ProviderHttp.Failure("generation", "invalid_plan", 0);
+            }
+            return new JSONObject(plan.toString());
+        } catch (com.google.gson.JsonParseException | JSONException invalid) {
+            throw new ProviderHttp.Failure("generation", "invalid_plan", 0);
+        }
+    }
+
+    /** Contract error mapping: upstream statuses pass through, sidecar faults stay 5xx. */
+    private static int failureStatus(ProviderHttp.Failure failure) {
+        return switch (failure.category) {
+            case "http" -> failure.status;
+            case "timeout" -> 504;
+            case "budget_unavailable", "budget_ledger_unavailable" -> 503;
+            case "transport",
+                    "invalid_response",
+                    "invalid_json",
+                    "invalid_plan",
+                    "invalid_merge",
+                    "invalid_symmetry",
+                    "invalid_billing_schema",
+                    "billing_cost_outside_bounds",
+                    "billing_bound_exceeded",
+                    "unsupported_generation_tariff" ->
+                    502;
+            default -> 500;
+        };
     }
 
     // HTTP plumbing.

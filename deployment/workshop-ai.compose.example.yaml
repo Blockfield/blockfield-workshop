@@ -39,8 +39,19 @@ services:
       AI_SIDECAR_BIND: 0.0.0.0
       AI_SIDECAR_PORT: 8101
       AI_SIDECAR_KEY_FILE: /keys/ai-sidecar.key
+      # U-AI1 ledger + provider clients. Uncomment at approved enablement; the owner
+      # supplies the key files' contents out of band (never in this file):
+      # AI_SIDECAR_PROVIDER: openrouter
+      # AI_SIDECAR_PROVIDER_KEY_FILE: /keys/openrouter.key
+      # AI_SIDECAR_POLICY_FILE: /keys/ai-limits.json
+      # AI_SIDECAR_LEDGER_FILE: /data/blockfield-workshop/ai-usage.json
     volumes:
       - type: bind
         source: /srv/minecraft/workshop/data/blockfield-workshop
         target: /keys
         read_only: true
+      # Ledger read-write volume (uncomment with AI_SIDECAR_LEDGER_FILE above):
+      # - type: bind
+      #   source: /srv/minecraft/workshop/data/blockfield-workshop
+      #   target: /data/blockfield-workshop
+      #   read_only: false
