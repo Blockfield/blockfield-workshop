@@ -51,7 +51,7 @@ jobs:
     # a verdict on an older SHA) skips `check`, so the gate fails closed.
     # Always exits 0: denial is expressed through the outputs, and the bot's
     # own `bot-review` commit status blocks merge.
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 5
     if: github.event_name == 'pull_request_review' && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved'
     outputs:
@@ -108,7 +108,7 @@ jobs:
     # Same gate as bot-gate: a non-approving or non-bot review must not start
     # a runner here either. Push, manual-dispatch and reusable-call runs always run.
     if: github.event_name != 'pull_request_review' || (github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved')
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 10
     # Only decide reads Actions data; check runs PR code and keeps the narrow token.
     permissions:
@@ -142,7 +142,7 @@ jobs:
     # off review events.
     needs: [bot-gate, decide]
     if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || (needs.bot-gate.outputs.verdict == 'permit' && needs.bot-gate.outputs.sha_match == 'true')) && needs.decide.outputs.tested != 'true'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
