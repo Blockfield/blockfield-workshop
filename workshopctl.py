@@ -173,6 +173,24 @@ def build_controller(
     controller.gate_reporter = cp_client.GateReporter.from_env(
         env, base_url=cp_config.base_url if cp_config is not None else None
     )
+    controller.cp_renewer = None
+    base = (env.get("BLOCKFIELD_CP_URL") or "").strip().rstrip("/")
+    tokens = {key: env.get(key) or "" for key in cp_client.RENEWED_KEYS}
+    if base and any(value.strip() for value in tokens.values()):
+        renewer = cp_client.CredentialRenewer(
+            base, directory / "cp_credentials.json", tokens
+        )
+        for key, holder in (
+            ("BLOCKFIELD_CP_AGENT_TOKEN", controller.cp_client),
+            ("BLOCKFIELD_CP_GATE_TOKEN", controller.gate_reporter),
+        ):
+            transport = getattr(holder, "transport", None)
+            if transport is not None and renewer.token(key):
+                transport.token = renewer.token(key)
+                renewer.listeners[key] = lambda token, t=transport: setattr(
+                    t, "token", token
+                )
+        controller.cp_renewer = renewer
     return controller, backend
 
 

@@ -109,6 +109,9 @@ def run_loop(controller, stop, env=os.environ):
                     cp.sync(controller)
             except Exception as error:  # cp must never block reconciliation
                 print(f"entrypoint: cp pass failed: {error!r}", file=sys.stderr)
+            renewer = getattr(controller, "cp_renewer", None)
+            if renewer is not None:
+                renewer.tick()  # never raises: each key logs and retries
             result = controller.step()
             deadline = time.monotonic() + follow
             while (
