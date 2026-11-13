@@ -35,12 +35,12 @@ permissions:
   contents: read
   pull-requests: read # bot-gate reads blockfield-review-bot verdicts on the head SHA
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
   # A review must never cancel the run it gates.
   cancel-in-progress: false
 jobs:
   bot-gate:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'bot-gate (skipped review)' || 'bot-gate' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'bot-gate (skipped review)' || 'bot-gate' }}
     # Enforcing: `check` runs on a PR head only when this job reports
     # verdict=permit with sha_match=true for the CURRENT head SHA, resolved
     # from the API at gate runtime (a push may have landed after the
@@ -53,7 +53,7 @@ jobs:
     # own `bot-review` commit status blocks merge.
     runs-on: tenki-standard-autoscale
     timeout-minutes: 5
-    if: github.event_name == 'pull_request_review' && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved'
+    if: github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name == github.repository && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved'
     outputs:
       verdict: ${{ steps.gate.outputs.verdict }}
       sha_match: ${{ steps.gate.outputs.sha_match }}
@@ -104,10 +104,10 @@ jobs:
             echo "sha=$HEAD_SHA"
           } >> "$GITHUB_OUTPUT"
   decide:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'decide (skipped review)' || 'decide' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'decide (skipped review)' || 'decide' }}
     # Same gate as bot-gate: a non-approving or non-bot review must not start
     # a runner here either. Push, manual-dispatch and reusable-call runs always run.
-    if: github.event_name != 'pull_request_review' || (github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved')
+    if: github.event_name != 'pull_request_review' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved')
     runs-on: tenki-standard-autoscale
     timeout-minutes: 10
     # Only decide reads Actions data; check runs PR code and keeps the narrow token.
@@ -133,7 +133,7 @@ jobs:
           tested=$(scripts/ci-same-tree.sh check.yml next)
           echo "tested=$tested" >> "$GITHUB_OUTPUT"
   check:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'check (skipped review)' || 'check' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'check (skipped review)' || 'check' }}
     # Main pushes, maintainer dispatches and reusable-workflow calls always
     # run; PR heads run only on a gate permit for the exact head SHA.
     # Main pushes additionally skip re-verification when a green run already
