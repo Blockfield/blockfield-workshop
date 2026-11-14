@@ -1798,7 +1798,7 @@ class StateAndWorkshopGameClientTests(unittest.TestCase):
                 now_ms=NOW_MS + 61_000,
                 ready_ttl_ms=60_000,
             ),
-            (None, False),
+            (None, None),
         )
         self.assertEqual(
             parse_game_activity(

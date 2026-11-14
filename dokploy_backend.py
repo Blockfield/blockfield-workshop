@@ -184,7 +184,7 @@ class DokployBackend:
         doc = self._require_state_reporter().doc("game-desired")
         return parse_game_desired(doc, allowed_profiles={"workshop", "test"})
 
-    def _read_ready(self, *, refresh: bool = False) -> tuple[dict | None, bool]:
+    def _read_ready(self, *, refresh: bool = False) -> tuple[dict | None, bool | None]:
         doc = self._require_state_reporter().doc("game-ready", refresh=refresh)
         return parse_game_ready(
             doc,
@@ -238,6 +238,8 @@ class DokployBackend:
         else:
             corrupt = False
         ready, alive = self._read_ready()
+        if alive is None:
+            raise RuntimeError("workshop readiness unknown")
         if not alive:
             return []
         if corrupt:
@@ -283,6 +285,8 @@ class DokployBackend:
     def workshop_saves_held(self):
         """Hot snapshot: flush chunks and hold autosave off via CP agent ops."""
         _, alive = self._read_ready(refresh=True)
+        if alive is None:
+            raise RuntimeError("workshop readiness unknown")
         if not alive:
             yield
             return
@@ -296,7 +300,7 @@ class DokployBackend:
             "stop",
             expires_in_s=max(1, min(300, int(self.stop_timeout))),
         )
-        while self._read_ready(refresh=True)[1]:
+        while self._read_ready(refresh=True)[1] is not False:
             if self._clock() >= deadline:
                 raise TimeoutError(timeout_message)
             self._sleep(self.poll)
@@ -308,7 +312,12 @@ class DokployBackend:
         self._stop_and_wait("workshop still running after CP stop")
 
     def fence_pending_starts(self) -> None:
-        if self._read_ready(refresh=True)[1]:
+        deadline = self._clock() + self.stop_timeout
+        while (alive := self._read_ready(refresh=True)[1]) is None:
+            if self._clock() >= deadline:
+                raise TimeoutError("cannot determine workshop readiness")
+            self._sleep(self.poll)
+        if alive:
             self._stop_and_wait("cannot fence the workshop backend")
 
     def export_limbo(self, job: str) -> None:

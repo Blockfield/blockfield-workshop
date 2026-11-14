@@ -754,15 +754,15 @@ def parse_game_ready(
     allowed_profiles: set[str],
     now_ms: int | None = None,
     ready_ttl_ms: int | None = DEFAULT_READY_TTL_MS,
-) -> tuple[dict | None, bool]:
-    """Validate CP ``game-ready`` state doc; returns ``(ready, running_and_fresh)``."""
+) -> tuple[dict | None, bool | None]:
+    """Validate CP ``game-ready`` state doc; returns ``(ready, running)``; unknown is ``None``."""
     if not isinstance(doc, dict):
-        return None, False
+        return None, None
     data = doc.get("value") if "value" in doc else doc
     if not isinstance(data, dict):
-        return None, False
+        return None, None
     if data.get("schema") != 1 or type(data.get("running")) is not bool:
-        return None, False
+        return None, None
     running = data["running"]
     profile = data.get("profile")
     release = data.get("release")
@@ -775,26 +775,27 @@ def parse_game_ready(
     )
     try:
         if profile not in allowed_profiles:
-            return None, False
+            return None, None
         if not isinstance(release, str) or not release.strip():
-            return None, False
+            return None, None
         if generation is not None and str(uuid.UUID(generation)) != generation:
-            return None, False
+            return None, None
         if profile == "game":
             if session is not None:
-                return None, False
+                return None, None
         elif str(uuid.UUID(session)) != session:
-            return None, False
+            return None, None
         if type(updated) is not int:
-            return None, False
+            return None, None
     except (ValueError, TypeError, AttributeError):
-        return None, False
+        return None, None
     fresh = True
     if ready_ttl_ms is not None and now_ms is not None:
         age = now_ms - updated
         fresh = -5000 <= age <= ready_ttl_ms
-    alive = bool(running and fresh)
-    if not alive:
+    if not fresh:
+        return None, None
+    if not running:
         return None, False
     return {
         "profile": profile,

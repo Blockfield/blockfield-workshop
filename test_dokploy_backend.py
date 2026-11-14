@@ -70,6 +70,7 @@ class DokployBackendTests(unittest.TestCase):
             game_client=self.game_client,
         )
         self.goal = Goal("workshop", RELEASE, str(uuid4()))
+        self.ready(str(uuid4()), self.goal.session, running=False)
 
     def _advance(self, seconds):
         self.clock[0] += seconds
@@ -123,9 +124,28 @@ class DokployBackendTests(unittest.TestCase):
         self.backend.start(self.goal)
         gen = self.reporter.docs["game-desired"]["generation"]
         self.ready(gen, self.goal.session, age_ms=61_000)
-        self.assertEqual(self.backend.observe(), [])
+        with self.assertRaisesRegex(RuntimeError, "readiness unknown"):
+            self.backend.observe()
         self.ready(gen, self.goal.session, running=False)
         self.assertEqual(self.backend.observe(), [])
+
+    def test_unknown_readiness_never_means_stopped(self):
+        for kind in ("missing", "stale"):
+            with self.subTest(kind=kind):
+                if kind == "missing":
+                    self.reporter.docs.pop("game-ready", None)
+                else:
+                    self.ready(str(uuid4()), self.goal.session, age_ms=61_000)
+                with self.assertRaisesRegex(RuntimeError, "readiness unknown"):
+                    self.backend.observe()
+                with self.assertRaisesRegex(RuntimeError, "readiness unknown"):
+                    with self.backend.workshop_saves_held():
+                        self.fail("must not snapshot")
+                with self.assertRaises(TimeoutError):
+                    self.backend.fence_pending_starts()
+                self._stop_goes_dark = False
+                with self.assertRaises(TimeoutError):
+                    self.backend._stop_and_wait("unknown")
 
     def test_unconfigured_cp_clients_fail_closed(self):
         bare = DokployBackend(
@@ -253,7 +273,8 @@ class DokployBackendTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.backend.stop(Process(Goal("game", RELEASE), True))
         self.ready(None, None, profile="game")
-        self.assertEqual(self.backend.observe(), [])
+        with self.assertRaisesRegex(RuntimeError, "readiness unknown"):
+            self.backend.observe()
         self.reporter.put("game-desired", {"schema": 1, "profile": "bad"})
         self.ready(str(uuid4()), str(uuid4()))
         observed = self.backend.observe()
@@ -335,6 +356,18 @@ class LifecycleIntegrationTests(unittest.TestCase):
             now_ms=lambda: self.now_ms[0],
             state_reporter=self.reporter,
             game_client=self.game_client,
+        )
+        self.reporter.put(
+            "game-ready",
+            {
+                "schema": 1,
+                "profile": "workshop",
+                "generation": str(uuid4()),
+                "session": str(uuid4()),
+                "release": RELEASE,
+                "running": False,
+                "updatedAt": self.backend._now_ms(),
+            },
         )
         self.controller = Controller(
             root / "state", self.backend, releases={RELEASE: release_record()}
@@ -442,6 +475,18 @@ class DeployWebhookTests(unittest.TestCase):
         )
         self.backend._sleep = mock.Mock()
         self.goal = Goal("workshop", RELEASE, str(uuid4()))
+        self.reporter.put(
+            "game-ready",
+            {
+                "schema": 1,
+                "profile": "workshop",
+                "generation": str(uuid4()),
+                "session": str(uuid4()),
+                "release": RELEASE,
+                "running": False,
+                "updatedAt": self.backend._now_ms(),
+            },
+        )
         opener = mock.patch("urllib.request.OpenerDirector.open")
         self.open = opener.start()
         self.addCleanup(opener.stop)
@@ -585,6 +630,18 @@ class ShadowRunTests(unittest.TestCase):
             min_free_bytes=0,
             state_reporter=self.reporter,
             game_client=self.game_client,
+        )
+        self.reporter.put(
+            "game-ready",
+            {
+                "schema": 1,
+                "profile": "workshop",
+                "generation": str(uuid4()),
+                "session": str(uuid4()),
+                "release": RELEASE,
+                "running": False,
+                "updatedAt": self.backend._now_ms(),
+            },
         )
         self.controller = Controller(
             root / "state",
