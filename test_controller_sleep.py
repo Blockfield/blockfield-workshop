@@ -13,8 +13,8 @@ import unittest.mock
 from pathlib import Path
 from uuid import uuid4
 
+import cp_fixtures
 from controller import (
-    ACTIVITY_FILE,
     SLEEP_MESSAGE,
     Controller,
     Goal,
@@ -32,10 +32,14 @@ class SleepBackend(FakeBackend):
     def __init__(self):
         super().__init__()
         self.generation = None
+        self._activity = None
 
     def readiness_generation(self, profile):
         assert profile == "workshop"
         return self.generation
+
+    def activity(self):
+        return self._activity
 
 
 class SleepTests(unittest.TestCase):
@@ -53,13 +57,12 @@ class SleepTests(unittest.TestCase):
             gate_file=self.dir / "gate.json",
             public_file=self.dir / "public.json",
             admin_dir=self.dir / "admin",
-            inbox_dir=self.dir / "inbox",
             idle_sleep_s=60.0,
             workshop_data_dir=self.data,
             now=lambda: self.clock[0],
             releases=catalog(),
         )
-        (self.dir / "inbox").mkdir()
+        self.controller.state_reporter = cp_fixtures.Reporter()
         self.goal = Goal("workshop", "v1.0.0", str(uuid4()))
         self.controller.request(str(uuid4()), self.goal, 0)
         self.controller.step()
@@ -77,40 +80,17 @@ class SleepTests(unittest.TestCase):
         return int(self.clock[0] * 1000)
 
     def write_activity(self, generation=GENERATION, players=0, busy=False, age_ms=0):
-        (self.data / ACTIVITY_FILE).write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "generation": generation,
-                    "players": players,
-                    "busy": busy,
-                    "updatedAt": self.now_ms() - age_ms,
-                }
-            )
-        )
-
-    def put(self, kind, **fields):
-        request_id = str(uuid4())
-        document = {
+        self.backend._activity = {
             "schema": 1,
-            "id": request_id,
-            "kind": kind,
-            "actor": {"draslId": DRASL, "name": "Nether"},
-            "createdAt": self.now_ms(),
-            **fields,
+            "generation": generation,
+            "players": players,
+            "busy": busy,
+            "updatedAt": self.now_ms() - age_ms,
         }
-        path = self.dir / "inbox" / f"{request_id}.json"
-        path.write_text(json.dumps(document))
-        return request_id
 
-    def process(self):
+    def apply(self, kind, actor=ADMIN, **fields):
         with contextlib.redirect_stderr(self.log):
-            return self.controller.process_inbox(now_ms=self.now_ms())
-
-    def result(self, request_id):
-        return json.loads(
-            (self.dir / "admin" / "results" / f"{request_id}.json").read_text()
-        )
+            return cp_fixtures.apply(self.controller, kind, actor, **fields)
 
     def sleep(self):
         """Idle steps until the editor sleeps; returns the sleeping state."""
@@ -164,7 +144,8 @@ class SleepTests(unittest.TestCase):
         self.assertEqual(gate["backends"]["workshop"]["gate"], "sleeping")
         public = json.loads((self.dir / "public.json").read_text())
         self.assertEqual(public["workshop"]["mode"], "sleeping")
-        status = json.loads((self.dir / "admin" / "status.json").read_text())
+        self.controller.flush_reports()
+        status = self.controller.state_reporter.docs["status"]
         self.assertEqual((status["phase"], status["gate"]), ("sleeping", "sleeping"))
 
     def test_activity_resets_the_timer(self):
@@ -191,45 +172,45 @@ class SleepTests(unittest.TestCase):
     def test_stale_missing_or_broken_activity_never_sleeps(self):
         cases = {
             "stale": lambda: self.write_activity(age_ms=121_000),
-            "missing": lambda: (self.data / ACTIVITY_FILE).unlink(missing_ok=True),
-            "invalid json": lambda: (self.data / ACTIVITY_FILE).write_text("{nope"),
-            "wrong schema": lambda: (self.data / ACTIVITY_FILE).write_text(
-                json.dumps(
-                    {
-                        "schema": 2,
-                        "generation": GENERATION,
-                        "players": 0,
-                        "busy": False,
-                        "updatedAt": self.now_ms(),
-                    }
-                )
+            "missing": lambda: setattr(self.backend, "_activity", None),
+            "invalid type": lambda: setattr(self.backend, "_activity", "not-a-dict"),
+            "wrong schema": lambda: setattr(
+                self.backend,
+                "_activity",
+                {
+                    "schema": 2,
+                    "generation": GENERATION,
+                    "players": 0,
+                    "busy": False,
+                    "updatedAt": self.now_ms(),
+                },
             ),
-            "bad types": lambda: (self.data / ACTIVITY_FILE).write_text(
-                json.dumps(
-                    {
-                        "schema": 1,
-                        "generation": GENERATION,
-                        "players": "none",
-                        "busy": 0,
-                        "updatedAt": "now",
-                    }
-                )
+            "bad types": lambda: setattr(
+                self.backend,
+                "_activity",
+                {
+                    "schema": 1,
+                    "generation": GENERATION,
+                    "players": "none",
+                    "busy": 0,
+                    "updatedAt": "now",
+                },
             ),
-            "future": lambda: (self.data / ACTIVITY_FILE).write_text(
-                json.dumps(
-                    {
-                        "schema": 1,
-                        "generation": GENERATION,
-                        "players": 0,
-                        "busy": False,
-                        "updatedAt": self.now_ms() + 300_000,
-                    }
-                )
+            "future": lambda: setattr(
+                self.backend,
+                "_activity",
+                {
+                    "schema": 1,
+                    "generation": GENERATION,
+                    "players": 0,
+                    "busy": False,
+                    "updatedAt": self.now_ms() + 300_000,
+                },
             ),
         }
         for name, make in cases.items():
             with self.subTest(name=name):
-                (self.data / ACTIVITY_FILE).unlink(missing_ok=True)
+                self.backend._activity = None
                 for _ in range(3):
                     self.advance(61)
                     make()
@@ -237,19 +218,25 @@ class SleepTests(unittest.TestCase):
                 self.assertIsNone(self.controller.status()["idleSince"], name)
         self.assertEqual(self.backend.events, [])
 
-    def test_broken_activity_path_never_sleeps(self):
-        (self.data / ACTIVITY_FILE).unlink(missing_ok=True)
-        (self.data / ACTIVITY_FILE).symlink_to(self.dir / "state" / "state.json")
-        for _ in range(3):
-            self.advance(61)
-            self.assertEqual(self.controller.step()["phase"], "workshop")
-        self.assertEqual(self.backend.events, [])
-        (self.data / ACTIVITY_FILE).unlink()
-        (self.data / ACTIVITY_FILE).write_bytes(b"x" * 16385)
-        for _ in range(3):
-            self.advance(61)
-            self.assertEqual(self.controller.step()["phase"], "workshop")
-        self.assertEqual(self.backend.events, [])
+    def test_state_reporter_activity_fallback_still_drives_idle(self):
+        # When backend.activity isn't exposed, controller reads game-activity
+        # from state_reporter.doc("game-activity").
+        self.backend._activity = None
+        self.backend.activity = None
+        activity = {
+            "schema": 1,
+            "generation": GENERATION,
+            "players": 0,
+            "busy": False,
+            "updatedAt": self.now_ms(),
+        }
+        self.controller.state_reporter.put("game-activity", activity)
+        self.controller.step()
+        self.advance(61)
+        self.controller.state_reporter.put(
+            "game-activity", {**activity, "updatedAt": self.now_ms()}
+        )
+        self.assertEqual(self.controller.step()["phase"], "sleeping")
 
     def test_unknown_readiness_generation_never_sleeps(self):
         self.backend.generation = None
@@ -284,16 +271,19 @@ class SleepTests(unittest.TestCase):
             self.assertIsNone(state.get("idleSince"))
         self.assertNotIn("stop", backend.events)
 
-    def test_inbox_backlog_blocks_sleep(self):
-        request_id = self.put("message", message="hello")
+    def test_cp_pending_backlog_blocks_sleep(self):
+        self.controller.set_members([dict(ADMIN)])
+        pending = [True]
+        self.controller.cp_client = unittest.mock.Mock(has_pending=lambda: pending[0])
         self.write_activity()
         self.controller.step()
         self.advance(61)
         self.write_activity()
         self.assertEqual(self.controller.step()["phase"], "workshop")
         self.assertIsNone(self.controller.status()["idleSince"])
-        self.assertEqual(self.process(), 1)
-        self.assertTrue(self.result(request_id)["ok"])
+        pending[0] = False
+        result = self.apply("message", message="hello")
+        self.assertTrue(result["ok"])
         state = self.sleep()
         self.assertEqual(state["phase"], "sleeping")
 
@@ -337,9 +327,8 @@ class SleepTests(unittest.TestCase):
         self.assertEqual(self.backend.events, ["save", "stop"])
         # Game rolled on while asleep: wake keeps the approved digest.
         self.backend.processes[0] = Process(Goal("game", "v2.0.0"), True)
-        request_id = self.put("wake")
-        self.assertEqual(self.process(), 1)
-        result = self.result(request_id)
+        request_id = str(uuid4())
+        result = self.apply("wake", operation_id=request_id)
         self.assertEqual(
             (result["ok"], result["payload"]),
             (
@@ -388,9 +377,7 @@ class SleepTests(unittest.TestCase):
     def test_wake_is_idempotent_when_awake_or_starting(self):
         self.controller.set_members([dict(ADMIN)])
         revision = self.controller.status()["revision"]
-        request_id = self.put("wake")
-        self.assertEqual(self.process(), 1)
-        result = self.result(request_id)
+        result = self.apply("wake")
         self.assertTrue(result["ok"])
         self.assertEqual(result["payload"]["phase"], "workshop")
         self.assertIsNone(result["revision"])
@@ -403,9 +390,7 @@ class SleepTests(unittest.TestCase):
         self.controller.step()
         self.assertEqual(self.controller.status()["phase"], "STARTING")
         starts = self.backend.events.count("start")
-        request_id = self.put("wake")
-        self.process()
-        result = self.result(request_id)
+        result = self.apply("wake")
         self.assertEqual((result["ok"], result["payload"]["phase"]), (True, "STARTING"))
         self.assertFalse(result["payload"]["started"])
         self.assertEqual(self.backend.events.count("start"), starts)
@@ -413,12 +398,8 @@ class SleepTests(unittest.TestCase):
     def test_repeated_wake_while_starting_is_single_start(self):
         self.controller.set_members([dict(ADMIN)])
         self.sleep()
-        first = self.put("wake")
-        self.process()
-        self.assertTrue(self.result(first)["ok"])
-        second = self.put("wake")
-        self.process()
-        result = self.result(second)
+        self.assertTrue(self.apply("wake")["ok"])
+        result = self.apply("wake")
         self.assertEqual(
             (result["ok"], result["payload"]["phase"]), (True, "REQUESTED")
         )
@@ -464,20 +445,7 @@ class SleepTests(unittest.TestCase):
         self.assertEqual(record["leg"]["state"], "starting")
 
     def test_wake_rejects_strangers(self):
-        request_id = str(uuid4())
-        (self.dir / "inbox" / f"{request_id}.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "id": request_id,
-                    "kind": "wake",
-                    "actor": {"draslId": "0" * 32, "name": "Stranger"},
-                    "createdAt": self.now_ms(),
-                }
-            )
-        )
-        self.process()
-        result = self.result(request_id)
+        result = self.apply("wake", actor={"draslId": "0" * 32, "name": "Stranger"})
         self.assertFalse(result["ok"])
         self.assertIn("member", result["error"])
 
@@ -490,19 +458,13 @@ class SleepTests(unittest.TestCase):
             ("mode", {"profile": "test", "expectedRevision": 99}),
         ):
             with self.subTest(kind=kind):
-                request_id = self.put(kind, **fields)
-                self.process()
-                result = self.result(request_id)
+                result = self.apply(kind, **fields)
                 self.assertFalse(result["ok"], kind)
                 self.assertEqual(result["error"], SLEEP_MESSAGE, kind)
         self.assertEqual(self.controller.status()["phase"], "sleeping")
         # Offline-safe kinds still work.
-        request_id = self.put("message", message="note")
-        self.process()
-        self.assertTrue(self.result(request_id)["ok"])
-        request_id = self.put("members", members=[dict(ADMIN)])
-        self.process()
-        self.assertTrue(self.result(request_id)["ok"])
+        self.assertTrue(self.apply("message", message="note")["ok"])
+        self.assertTrue(self.apply("members", members=[dict(ADMIN)])["ok"])
 
     def test_sleeping_gate_carries_acl_for_proxy(self):
         self.controller.set_members([dict(ADMIN)])
@@ -564,7 +526,6 @@ class CliWakeTests(unittest.TestCase):
         (self.root / "controller/releases.json").write_text(json.dumps(catalog()))
         self.data = self.root / "workshop-data"
         self.data.mkdir()
-        (self.root / "inbox").mkdir()
         self.environment = unittest.mock.patch.dict(
             os.environ,
             {
@@ -594,8 +555,6 @@ class CliWakeTests(unittest.TestCase):
                     str(self.root / "public" / "public.json"),
                     "--admin-dir",
                     str(self.root / "admin"),
-                    "--inbox-dir",
-                    str(self.root / "inbox"),
                     *argv,
                 ],
                 lambda: self.backend,
@@ -603,17 +562,13 @@ class CliWakeTests(unittest.TestCase):
         return code, json.loads(out.getvalue()) if out.getvalue() else err.getvalue()
 
     def write_activity(self):
-        (self.data / ACTIVITY_FILE).write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "generation": GENERATION,
-                    "players": 0,
-                    "busy": False,
-                    "updatedAt": int(time.time() * 1000),
-                }
-            )
-        )
+        self.backend._activity = {
+            "schema": 1,
+            "generation": GENERATION,
+            "players": 0,
+            "busy": False,
+            "updatedAt": int(time.time() * 1000),
+        }
 
     def test_wake_starts_the_same_sleeping_session(self):
         self.assertEqual(self.ctl("request", "game", "--release", "v1.0.0")[0], 0)

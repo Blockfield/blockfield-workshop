@@ -95,21 +95,26 @@ class DockerBackendTests(unittest.TestCase):
         self.assertEqual(selected["modeId"], "training")
         self.backend.maps.validate_test.assert_called_with(sha, "training")
         self.ready(
-            "workshop",
+            "test",
             generation=selected["generation"],
             session=session,
             release="v1.0.0",
         )
-        ready = self.data["workshop"] / READY_FILE
-        document = json.loads(ready.read_bytes()) | {"profile": "test"}
-        ready.write_text(json.dumps(document))
-        self.assertEqual(set(document), {"profile", "generation", "session", "release"})
+        document = self.reporter.docs["game-ready"]
+        self.assertEqual(
+            {k: document[k] for k in ("profile", "generation", "session", "release")},
+            {
+                "profile": "test",
+                "generation": selected["generation"],
+                "session": session,
+                "release": "v1.0.0",
+            },
+        )
         self.assertEqual(
             self.backend.observe(),
             [Process(Goal("game", "v1.0.0"), True), Process(goal, True)],
         )
-        path = self.lock / "workshop/profile.json"
-        path.write_text(json.dumps(selected | {"modeId": "unknown"}))
+        self.reporter.put("game-desired", selected | {"modeId": "unknown"})
         observed = self.backend.observe()
         self.assertTrue(observed[0].ready)
         self.assertFalse(observed[1].ready)
@@ -168,6 +173,11 @@ class DockerBackendTests(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
+        import cp_fixtures
+
+        self.reporter = cp_fixtures.Reporter()
+        self.game_client = cp_fixtures.FakeGameClient()
+        self.now_ms = 1_700_000_000_000
         self.backend = DockerBackend(
             {
                 "game": App("bf-game", self.data["game"]),
@@ -178,6 +188,10 @@ class DockerBackendTests(unittest.TestCase):
             stop_timeout=0.5,
             poll=0.01,
             min_free_bytes=0,
+            ready_ttl_ms=60_000,
+            now_ms=lambda: self.now_ms,
+            state_reporter=self.reporter,
+            game_client=self.game_client,
         )
 
     def save(self):
@@ -205,6 +219,18 @@ class DockerBackendTests(unittest.TestCase):
         self.java(pid, service["container"])
 
     def ready(self, profile, **document):
+        if profile in {"workshop", "test"}:
+            self.reporter.put(
+                "game-ready",
+                {
+                    "schema": 1,
+                    "profile": profile,
+                    "running": True,
+                    "updatedAt": self.now_ms,
+                    **document,
+                },
+            )
+            return
         (self.data[profile] / READY_FILE).write_text(
             json.dumps({"profile": profile, **document})
         )
@@ -236,7 +262,6 @@ class DockerBackendTests(unittest.TestCase):
                 GAME_IMAGE,
                 "bf-workshop",
             ],
-            ["docker", "exec", WORKSHOP_CID, "rcon-cli", "save-all", "flush"],
             ["pgrep", "-f", JAVA_PATTERN],
             ["docker", "inspect", "--format", "{{.Image}}", GAME_CID],
             [
@@ -299,6 +324,7 @@ class DockerBackendTests(unittest.TestCase):
                 "bf-workshop",
             ],
             ["docker", "service", "scale", "--detach", "other=1"],
+            ["docker", "exec", WORKSHOP_CID, "rcon-cli", "save-all", "flush"],
             ["docker", "exec", GAME_CID, "rcon-cli", "op", "Nether"],
             ["docker", "exec", "bf-game", "rcon-cli", "save-all", "flush"],
             ["docker", "exec", GAME_CID, "sh", "-c", "id"],
@@ -424,49 +450,55 @@ class DockerBackendTests(unittest.TestCase):
 
     def test_native_export_command_is_one_canonical_job_not_arbitrary_rcon(self):
         job = str(uuid4())
-        self.assertTrue(
-            self.backend.allowed(
-                [
-                    "docker",
-                    "exec",
-                    WORKSHOP_CID,
-                    "rcon-cli",
-                    "bf",
-                    "workshop",
-                    "export-limbo",
-                    job,
-                ]
-            )
-        )
+        for argv in (
+            [
+                "docker",
+                "exec",
+                WORKSHOP_CID,
+                "rcon-cli",
+                "bf",
+                "workshop",
+                "export-limbo",
+                job,
+            ],
+            [
+                "docker",
+                "exec",
+                WORKSHOP_CID,
+                "rcon-cli",
+                "bf",
+                "workshop",
+                "import-schematic",
+                job,
+                "lobby.schem",
+            ],
+        ):
+            self.assertFalse(self.backend.allowed(argv))
+        self.backend.maps = mock.Mock(limbo=mock.Mock(jobs=self.lock / "limbo-jobs"))
         for bad in ("../job", job.upper(), job + " extra"):
-            self.assertFalse(
-                self.backend.allowed(
-                    [
-                        "docker",
-                        "exec",
-                        WORKSHOP_CID,
-                        "rcon-cli",
-                        "bf",
-                        "workshop",
-                        "export-limbo",
-                        bad,
-                    ]
-                )
-            )
-        self.assertFalse(
-            self.backend.allowed(
-                [
-                    "docker",
-                    "exec",
-                    WORKSHOP_CID,
-                    "rcon-cli",
-                    "bf",
-                    "workshop",
-                    "import-schematic",
-                    job,
-                    "lobby.schem",
-                ]
-            )
+            with self.assertRaises(ValueError):
+                self.backend.export_limbo(bad)
+        self.assertEqual(self.game_client.calls, [])
+        with mock.patch.object(self.backend, "_check_workshop_mounts"):
+            self.load()
+            spec = self.state["services"]["bf-workshop"]["spec"]
+            spec["Env"] = ["BLOCKFIELD_WORKSHOP_EXPORT_DIR=/limbo-jobs"]
+            spec["Mounts"] = [
+                {
+                    "Type": "bind",
+                    "Source": str(self.lock / "limbo-jobs"),
+                    "Target": "/limbo-jobs",
+                    "ReadOnly": False,
+                }
+            ]
+            self.save()
+            self.running("game")
+            self.running("workshop")
+            self.backend.start(Goal("workshop", "v1.0.0", str(uuid4())))
+            self.backend.export_limbo(job)
+        self.assertEqual(
+            self.game_client.calls,
+            [("export-limbo", job, 60, None)],
         )
 
     def test_legacy_game_is_adopted_only_with_readiness(self):
@@ -566,14 +598,12 @@ class DockerBackendTests(unittest.TestCase):
         self.running("game")
         self.ready("workshop", generation=None, session=session, release="v1.0.0")
         self.backend.start(Goal("workshop", "v1.0.0", session))
-        selection = json.loads((self.lock / "workshop/profile.json").read_text())
+        selection = self.reporter.docs["game-desired"]
         self.assertEqual(
             (selection["profile"], selection["session"], selection["release"]),
             ("workshop", session, "v1.0.0"),
         )
-        self.assertEqual(
-            oct((self.lock / "workshop/profile.json").stat().st_mode & 0o777), "0o644"
-        )
+        self.assertFalse((self.lock / "workshop/profile.json").exists())
         self.assertFalse((self.data["workshop"] / READY_FILE).exists())
         self.assertIn(
             ["docker", "service", "scale", "--detach", "bf-workshop=1"], self.calls()
@@ -721,58 +751,53 @@ class DockerBackendTests(unittest.TestCase):
     def test_save_requires_success_and_live_snapshot_pauses_autosave(self):
         with self.backend.workshop_saves_held():
             pass
-        self.assertFalse(any(call[1] == "exec" for call in self.calls()))
+        self.assertEqual(self.game_client.calls, [])
         self.running("workshop")
         with self.assertRaises(OSError):
             with self.backend.workshop_saves_held():
                 raise OSError("copy failed")
         self.assertEqual(
-            [call[4:] for call in self.calls() if call[1] == "exec"],
-            [["save-on"], ["save-off"], ["save-all", "flush"], ["save-on"]],
+            [call[0] for call in self.game_client.calls],
+            ["save-on", "save-off", "save-flush", "save-on"],
         )
-        for response in ("", "Saving failed", "Saved the game"):
-            self.load()
-            self.state["rcon"]["save-all flush"] = response
-            self.save()
-            process = Process(Goal("workshop", "v1.0.0", str(uuid4())), True)
-            if response == "Saved the game":
-                self.backend.save_and_freeze(process)
-            else:
-                with self.assertRaises(RuntimeError):
-                    self.backend.save_and_freeze(process)
+        process = Process(Goal("workshop", "v1.0.0", str(uuid4())), True)
+        self.backend.save_and_freeze(process)
+        self.assertEqual(self.game_client.calls[-1][0], "save-flush")
+        self.game_client.responses.append(RuntimeError("save failed"))
+        with self.assertRaises(RuntimeError):
+            self.backend.save_and_freeze(process)
 
     def test_live_snapshot_restores_autosave_after_rcon_failures(self):
         self.running("workshop")
-        off = "Automatic saving is now disabled"
-        on = "Automatic saving is now enabled"
+        ok = {"state": "effective", "code": "ok", "output": "ok"}
         for responses in (
-            [on, TimeoutError("save-off timed out"), on],
-            [on, "", on],
-            [on, off, TimeoutError("flush timed out"), on],
-            [on, off, "Saving failed", on],
-            [on, off, None, on],
-            ["", on],
+            [ok, TimeoutError("save-off timed out"), ok],
+            [ok, RuntimeError("save-off failed"), ok],
+            [ok, ok, TimeoutError("flush timed out"), ok],
+            [ok, ok, RuntimeError("save failed"), ok],
+            [RuntimeError("initial save-on failed"), ok],
         ):
             with self.subTest(responses=responses):
-                with mock.patch.object(
-                    self.backend, "_rcon", side_effect=responses
-                ) as rcon:
-                    with self.assertRaises((RuntimeError, TimeoutError)):
-                        with self.backend.workshop_saves_held():
-                            self.fail("must not copy an unflushed world")
-                    self.assertEqual(
-                        rcon.call_args_list[-1], mock.call("workshop", "save-on")
-                    )
-        for response in (None, "", TimeoutError("restore timed out")):
-            with self.subTest(response=response):
-                with mock.patch.object(
-                    self.backend,
-                    "_rcon",
-                    side_effect=[on, off, "Saved the game", response, response],
-                ):
-                    with self.assertRaises((RuntimeError, TimeoutError)):
-                        with self.backend.workshop_saves_held():
-                            pass
+                self.game_client.calls.clear()
+                self.game_client.responses = list(responses)
+                if len(responses) == 2:
+                    # Failure during initial save-on happens before save-off, so no restore needed.
+                    self.game_client.responses = [responses[0]]
+                with self.assertRaises((RuntimeError, TimeoutError)):
+                    with self.backend.workshop_saves_held():
+                        self.fail("must not copy an unflushed world")
+                if len(responses) > 2:
+                    self.assertEqual(self.game_client.calls[-1][0], "save-on")
+        for failure in (
+            RuntimeError("save-on failed"),
+            TimeoutError("restore timed out"),
+        ):
+            with self.subTest(failure=failure):
+                self.game_client.calls.clear()
+                self.game_client.responses = [ok, ok, ok, failure, failure]
+                with self.assertRaises((RuntimeError, TimeoutError)):
+                    with self.backend.workshop_saves_held():
+                        pass
 
     def test_fence_scales_unselected_app(self):
         (self.lock / "profile.json").write_text(
@@ -857,9 +882,7 @@ class DockerBackendTests(unittest.TestCase):
         )
         self.running("workshop")
         self.backend.start(Goal("workshop", "v1.0.0", session))
-        generation = json.loads((self.lock / "workshop/profile.json").read_text())[
-            "generation"
-        ]
+        generation = self.reporter.docs["game-desired"]["generation"]
         self.ready("workshop", generation=generation, session=session, release="v1.0.0")
         controller = Controller(
             Path(self.temp.name) / "controller", self.backend, releases=catalog()
@@ -870,30 +893,24 @@ class DockerBackendTests(unittest.TestCase):
         test = Goal("test", "v1.0.0", session, sha)
         controller.request(str(uuid4()), test, 1)
         self.assertEqual(controller.step()["phase"], "STARTING")
-        selection = json.loads((self.lock / "workshop/profile.json").read_text())
+        selection = self.reporter.docs["game-desired"]
         self.assertEqual((selection["profile"], selection["candidate"]), ("test", sha))
         self.assertEqual(extracted, [(sha, self.data["workshop"] / "test-candidate")])
         self.assertEqual(
             self.backend.observe(),
             [Process(Goal("game", "v1.0.0"), True), Process(test, False)],
         )
-        (self.data["workshop"] / READY_FILE).write_text(
-            json.dumps(
-                {
-                    "profile": "test",
-                    "generation": selection["generation"],
-                    "session": session,
-                    "release": "v1.0.0",
-                }
-            )
+        self.ready(
+            "test",
+            generation=selection["generation"],
+            session=session,
+            release="v1.0.0",
         )
         self.assertEqual(controller.step()["gate"], "testers")
 
         controller.request(str(uuid4()), Goal("game", "v1.0.0"), 2)
         self.assertEqual(controller.step()["phase"], "STARTING")
-        generation = json.loads((self.lock / "workshop/profile.json").read_text())[
-            "generation"
-        ]
+        generation = self.reporter.docs["game-desired"]["generation"]
         self.ready("workshop", generation=generation, session=session, release="v1.0.0")
         self.assertEqual(controller.step()["gate"], "builders")
         calls = self.calls()

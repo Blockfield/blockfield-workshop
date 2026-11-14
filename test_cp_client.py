@@ -82,11 +82,19 @@ class FakeTransport:
         self.acks.append(body)
         return b"{}"
 
-    def get_events(self, url, timeout):
+    def stream_events(self, url, idle_s):
         self.events_calls += 1
         if self.fail_events_once and self.events_calls == 1:
             raise SnapshotRequired("cp snapshot required")
-        return 200, list(self.event_frames)
+        return list(self.event_frames)
+
+
+def drive(client, controller):
+    """One pushed delivery: read the stream (snapshot first when asked), then sync."""
+    if not client.read_stream():
+        client.sync(controller)  # takes the snapshot the stream asked for
+        client.read_stream()
+    return client.sync(controller)
 
 
 def snapshot_doc(cursor=0):
@@ -116,7 +124,6 @@ class CPClientTests(unittest.TestCase):
             gate_file=self.dir / "gate.json",
             public_file=self.dir / "public.json",
             admin_dir=self.dir / "admin",
-            inbox_dir=self.dir / "inbox",
             releases=catalog(),
         )
         self.controller.set_members([ADMIN])
@@ -137,25 +144,6 @@ class CPClientTests(unittest.TestCase):
 
     def test_config_disabled_without_env(self):
         self.assertIsNone(CPConfig.from_env({}))
-
-    def test_legacy_inbox_applies_spoofed_members(self):
-        """E4 contrast: the file inbox trusts list shape, not grant authority."""
-        forged = [
-            dict(ADMIN),
-            {"draslId": STRANGER, "name": "Stranger", "role": "admin"},
-        ]
-        self.controller._apply(
-            str(uuid4()),
-            {
-                "kind": "members",
-                "actor": {"draslId": STRANGER, "name": "Stranger"},
-                "members": forged,
-            },
-        )
-        self.assertEqual(
-            {m["draslId"] for m in self.controller.members()},
-            {ADMIN["draslId"].replace("-", "").lower(), STRANGER},
-        )
 
     def test_spoofed_members_rejected(self):
         forged = [
@@ -186,7 +174,7 @@ class CPClientTests(unittest.TestCase):
             snapshot_doc(),
             [frame(members_op({"draslId": STRANGER, "name": "Stranger"}, forged), 1)],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.members(), [ADMIN])
         self.assertEqual(transport.acks[0]["state"], "rejected")
@@ -195,7 +183,7 @@ class CPClientTests(unittest.TestCase):
         newcomer = {"draslId": STRANGER, "name": "Stranger", "role": "builder"}
         envelope = frame(members_op(ADMIN, [ADMIN, newcomer]), 1)
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(len(self.controller.members()), 2)
         # CP advances the durable cursor across contiguous receipts in state
@@ -229,7 +217,7 @@ class CPClientTests(unittest.TestCase):
                 )
             ],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result["applied"], 0)
         self.assertEqual(self.controller.message, self.controller.default_message)
 
@@ -244,7 +232,7 @@ class CPClientTests(unittest.TestCase):
                 )
             ],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual((result["applied"], result["rejected"]), (0, 1))
         self.assertEqual(transport.acks[0]["state"], "rejected")
         self.assertEqual(transport.acks[0]["result"], "stale_generation")
@@ -260,7 +248,7 @@ class CPClientTests(unittest.TestCase):
                 )
             ],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual((result["applied"], result["rejected"]), (0, 1))
 
     def test_hash_mismatch_rejected(self):
@@ -274,7 +262,7 @@ class CPClientTests(unittest.TestCase):
                 )
             ],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual((result["applied"], result["rejected"]), (0, 1))
         self.assertEqual(self.controller.message, self.controller.default_message)
 
@@ -283,7 +271,7 @@ class CPClientTests(unittest.TestCase):
             snapshot_doc(),
             [frame({"kind": "map-create", "actor": ADMIN, "target": "*"}, 1)],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual((result["applied"], result["rejected"]), (0, 1))
 
     def test_epoch_mismatch_refetches_snapshot(self):
@@ -297,7 +285,9 @@ class CPClientTests(unittest.TestCase):
             ],
             fail_events_once=True,
         )
-        result = self.client(transport).sync(self.controller)
+        client = self.client(transport)
+        self.assertEqual(drive(client, self.controller)["applied"], 0)
+        result = drive(client, self.controller)
         self.assertEqual(result["applied"], 1)
         self.assertEqual(transport.events_calls, 2)
         self.assertEqual(self.controller.message, "hi")
@@ -307,7 +297,7 @@ class CPClientTests(unittest.TestCase):
             {"kind": "message", "actor": ADMIN, "message": "hi", "target": "*"}, 1
         )
         transport = FakeTransport(snapshot_doc(), [envelope, envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result["applied"], 1)
         self.assertEqual(self.controller.message, "hi")
 
@@ -315,7 +305,7 @@ class CPClientTests(unittest.TestCase):
         envelope = frame(members_op(ADMIN, [ADMIN]), 1)
         transport = FakeTransport(snapshot_doc(), [envelope])
         client = self.client(transport)
-        self.assertEqual(client.sync(self.controller)["applied"], 1)
+        self.assertEqual(drive(client, self.controller)["applied"], 1)
         # Simulate a restart after a lost cursor advance: same op id, still terminal.
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         state["cursor"] = 0
@@ -323,7 +313,7 @@ class CPClientTests(unittest.TestCase):
         transport.event_frames = [envelope]
         before = list(self.controller.members())
         client = self.client(transport)  # fresh process: no in-memory cursor
-        result = client.sync(self.controller)
+        result = drive(client, self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
         self.assertEqual(list(self.controller.members()), before)
 
@@ -332,7 +322,7 @@ class CPClientTests(unittest.TestCase):
             {"kind": "message", "actor": ADMIN, "message": "yo", "target": "*"}, 1
         )
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result["applied"], 1)
         received = transport.acks[0]
         self.assertEqual(received["state"], "received")
@@ -350,7 +340,7 @@ class CPClientTests(unittest.TestCase):
             executable=False,
         )
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.message, self.controller.default_message)
         self.assertEqual(transport.acks[0]["state"], "rejected")
@@ -390,7 +380,7 @@ class CPClientTests(unittest.TestCase):
             [ADMIN, {"draslId": "a" * 32, "name": "Helper", "role": "builder"}]
         )
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(self.controller.message, "Целевое сообщение *")
 
@@ -404,7 +394,7 @@ class CPClientTests(unittest.TestCase):
                 )
             ],
         )
-        self.client(transport).sync(self.controller)
+        drive(self.client(transport), self.controller)
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         self.assertEqual(
             (state["epoch"], state["generation"], state["cursor"]),
@@ -439,12 +429,12 @@ class CPClientTests(unittest.TestCase):
                 return {"kind": "cancel"}
 
         stub = GateHeldController()
-        first = self.client(transport).sync(stub)
+        first = drive(self.client(transport), stub)
         self.assertEqual(stub.applies, 1)
         self.assertEqual(first, {"applied": 0, "rejected": 0, "acked": 0})
         self.assertEqual(transport.acks, [])
         # Same frame redelivered (cursor held): no re-apply, progress re-ACKed.
-        second = self.client(transport).sync(stub)
+        second = drive(self.client(transport), stub)
         self.assertEqual(stub.applies, 1)
         self.assertEqual(second, {"applied": 0, "rejected": 0, "acked": 0})
         self.assertEqual(
@@ -453,7 +443,7 @@ class CPClientTests(unittest.TestCase):
         )
         # Once the leg is delivered, the replay converges on effective.
         stub.pending = False
-        third = self.client(transport).sync(stub)
+        third = drive(self.client(transport), stub)
         self.assertEqual(stub.applies, 1)
         self.assertEqual(third, {"applied": 0, "rejected": 0, "acked": 1})
         self.assertEqual(
@@ -469,7 +459,7 @@ class CPClientTests(unittest.TestCase):
         transport = FakeTransport(
             snapshot_doc(), [frame(members_op(ADMIN, only_builders), 1)]
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.members(), [ADMIN])
 
@@ -482,20 +472,20 @@ class CPClientTests(unittest.TestCase):
             "target": "*",
         }
         transport = FakeTransport(doc, [frame(stranger, 1)])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.message, self.controller.default_message)
         mine = frame(
             {"kind": "message", "actor": ADMIN, "message": "yo", "target": "*"}, 2
         )
-        result = self.client(FakeTransport(doc, [mine])).sync(self.controller)
+        result = drive(self.client(FakeTransport(doc, [mine])), self.controller)
         self.assertEqual(result["applied"], 1)
         self.assertEqual(self.controller.message, "yo")
 
     def test_sse_timeout_keeps_parsed_frames(self):
         import socket
 
-        from cp_client import _read_sse
+        from cp_client import _iter_sse
 
         lines = [b'data: {"a": 1}\n', b"\n", b'data: {"b": 2}\n', b"\n"]
 
@@ -510,7 +500,7 @@ class CPClientTests(unittest.TestCase):
                     return line
                 raise socket.timeout("timed out")
 
-        self.assertEqual(_read_sse(Stub(), timeout=5.0), [{"a": 1}, {"b": 2}])
+        self.assertEqual(list(_iter_sse(Stub())), [{"a": 1}, {"b": 2}])
 
     def test_oversize_snapshot_is_explicit_error(self):
         from cp_client import MAX_SNAPSHOT_BYTES, _read_capped
@@ -532,9 +522,11 @@ class CPClientTests(unittest.TestCase):
             )
 
     def test_oversize_sse_frame_is_explicit_error(self):
-        from cp_client import _read_sse
+        from cp_client import _iter_sse
 
-        big = b"data: " + b"x" * 70000 + b"\n"
+        from cp_client import MAX_FRAME_BYTES
+
+        big = b"data: " + b"x" * (MAX_FRAME_BYTES + 10) + b"\n"
 
         class Stub:
             def __init__(self):
@@ -545,7 +537,7 @@ class CPClientTests(unittest.TestCase):
                 return big if self.calls == 1 else b""
 
         with self.assertRaisesRegex(ValueError, "exceeds"):
-            _read_sse(Stub(), timeout=5.0)
+            list(_iter_sse(Stub()))
 
     def test_apply_runtime_error_rejected_and_advances(self):
         from unittest import mock
@@ -569,7 +561,7 @@ class CPClientTests(unittest.TestCase):
         with mock.patch.object(
             self.controller, "apply_cp_operation", side_effect=flaky
         ):
-            result = self.client(transport).sync(self.controller)
+            result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 1, "acked": 2})
         self.assertEqual(self.controller.message, "b")
 
@@ -583,11 +575,11 @@ class CPClientTests(unittest.TestCase):
         with mock.patch.object(
             self.controller, "apply_cp_operation", side_effect=BlockingIOError("busy")
         ):
-            result = self.client(transport).sync(self.controller)
+            result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         self.assertEqual(state["cursor"], 0)
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
 
     def test_frame_without_operation_id_rejected(self):
@@ -596,7 +588,7 @@ class CPClientTests(unittest.TestCase):
         )
         del envelope["operationId"]
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result["applied"], 0)
         self.assertEqual(self.controller.message, self.controller.default_message)
 
@@ -629,7 +621,7 @@ class CPClientTests(unittest.TestCase):
         client = CPClient(
             config, self.dir / "state", transport=transport, now_ms=lambda: NOW_MS
         )
-        result = client.sync(self.controller)
+        result = drive(client, self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(calls["n"], 2)
         self.assertEqual(self.controller.message, "hi")
@@ -660,7 +652,7 @@ class CPClientTests(unittest.TestCase):
         client = CPClient(
             config, self.dir / "state", transport=transport, now_ms=lambda: NOW_MS
         )
-        result = client.sync(self.controller)
+        result = drive(client, self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(calls["n"], 2)
 
@@ -675,7 +667,7 @@ class CPClientTests(unittest.TestCase):
             1,
         )
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(self.controller.message, "hub news")
 
@@ -690,7 +682,7 @@ class CPClientTests(unittest.TestCase):
             1,
         )
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.message, self.controller.default_message)
         self.assertEqual(transport.acks[0]["state"], "rejected")
@@ -698,7 +690,7 @@ class CPClientTests(unittest.TestCase):
     def test_missing_target_rejected(self):
         envelope = frame({"kind": "message", "actor": ADMIN, "message": "hi"}, 1)
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.message, self.controller.default_message)
 
@@ -708,7 +700,7 @@ class CPClientTests(unittest.TestCase):
             snapshot_doc(),
             [frame(members_op(ADMIN, [ADMIN, newcomer], target="other-resource"), 1)],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.members(), [ADMIN])
 
@@ -720,7 +712,7 @@ class CPClientTests(unittest.TestCase):
         transport = FakeTransport(
             snapshot_doc(), [frame(members_op(ADMIN, entries, target="hub"), 1)]
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual(self.controller.members(), [ADMIN])
 
@@ -730,7 +722,7 @@ class CPClientTests(unittest.TestCase):
             snapshot_doc(),
             [frame(members_op(ADMIN, [ADMIN, newcomer], target="hub"), 1)],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(len(self.controller.members()), 2)
 
@@ -753,7 +745,7 @@ class CPClientTests(unittest.TestCase):
                 ),
             ],
         )
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 2, "rejected": 0, "acked": 2})
         self.assertEqual(self.controller.message, "hello")
 
@@ -767,7 +759,7 @@ class CPClientTests(unittest.TestCase):
             result = self.controller.apply_cp_operation(
                 str(uuid4()), members_op(ADMIN, [ADMIN, newcomer]), [ADMIN]
             )
-        self.assertEqual(result, {"kind": "members", "count": 2})
+        self.assertEqual(result, {"kind": "members", "payload": {"count": 2}})
         self.assertEqual(len(self.controller.members()), 2)
 
     def test_https_required_for_cp_url(self):
@@ -1002,7 +994,7 @@ class CPClientTests(unittest.TestCase):
             raise CPHttpError("acks", 503)
 
         transport.post_json = boom
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 1, "acked": 0})
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         self.assertEqual(state["cursor"], 0)
@@ -1057,7 +1049,7 @@ class CPClientTests(unittest.TestCase):
                     acks_url, body, timeout
                 )
                 with self.assertRaises(CPHttpError) as ctx:
-                    self.client(transport).sync(self.controller)
+                    drive(self.client(transport), self.controller)
                 self.assertEqual(ctx.exception.status, 503)
                 state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
                 self.assertEqual(state["cursor"], 0)
@@ -1072,7 +1064,7 @@ class CPClientTests(unittest.TestCase):
                     os.environ[var] = value
 
     def test_malformed_block_stops_read_keeps_prefix(self):
-        from cp_client import _read_sse
+        from cp_client import _iter_sse
 
         first = frame(
             {"kind": "message", "actor": ADMIN, "message": "a", "target": "*"}, 1
@@ -1100,10 +1092,10 @@ class CPClientTests(unittest.TestCase):
                     return line + b"\n"
                 return b""
 
-        frames = _read_sse(StubResponse(), timeout=5.0)
+        frames = list(_iter_sse(StubResponse()))
         self.assertEqual(frames, [first])
         transport = FakeTransport(snapshot_doc(), frames)
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(self.controller.message, "a")
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
@@ -1130,7 +1122,7 @@ class CPClientTests(unittest.TestCase):
 
         transport.post_json = flaky_post
         with self.assertRaises(CPHttpError):
-            self.client(transport).sync(self.controller)
+            drive(self.client(transport), self.controller)
         receipts = json.loads((self.dir / "state" / "cp_receipts.json").read_bytes())
         self.assertEqual(receipts[envelope["operationId"]]["state"], "effective")
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
@@ -1138,7 +1130,7 @@ class CPClientTests(unittest.TestCase):
         # Second pass: the stored receipt re-sends ACKs; cancel must not run
         # again (it would raise "nothing to cancel" and record rejected).
         transport.post_json = orig_post
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
 
     def test_failed_gate_report_blocks_effective_ack(self):
@@ -1157,7 +1149,7 @@ class CPClientTests(unittest.TestCase):
         )
         envelope = frame(op, 1)
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         # Held: applied locally, nothing ACKed, cursor unmoved.
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
         self.assertEqual(transport.acks, [])
@@ -1180,7 +1172,7 @@ class CPClientTests(unittest.TestCase):
             "https://cp.invalid", "gate-token", transport=gate
         )
         members_before = list(self.controller.members())
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 1})
         self.assertEqual(
             [ack["state"] for ack in transport.acks],
@@ -1220,7 +1212,7 @@ class CPClientTests(unittest.TestCase):
                 return {"kind": "cancel"}
 
         stub = FlakyController()
-        first = self.client(transport).sync(stub)
+        first = drive(self.client(transport), stub)
         self.assertEqual(stub.applies, 1)
         self.assertEqual(first, {"applied": 0, "rejected": 1, "acked": 1})
         self.assertEqual([ack["state"] for ack in transport.acks], ["rejected"])
@@ -1229,7 +1221,7 @@ class CPClientTests(unittest.TestCase):
         state = json.loads((self.dir / "state" / "cp_state.json").read_bytes())
         self.assertEqual(state["cursor"], 1)
         # Retry: the frame is consumed (cursor advanced), the op never runs again.
-        second = self.client(transport).sync(stub)
+        second = drive(self.client(transport), stub)
         self.assertEqual(stub.applies, 1)
         self.assertEqual(second, {"applied": 0, "rejected": 0, "acked": 0})
 
@@ -1276,7 +1268,7 @@ class CPClientTests(unittest.TestCase):
         envelope = frame({"kind": "cancel", "actor": ADMIN, "target": "*"}, 1)
         transport = FakeTransport(snapshot_doc(), [envelope])
         with mock.patch("controller.atomic_write", side_effect=fail_pending):
-            result = self.client(transport).sync(self.controller)
+            result = drive(self.client(transport), self.controller)
         # Held, not rejected: nothing ACKed, cursor unmoved, ERROR visible,
         # rollback never re-applied (no fence of the restored backend).
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
@@ -1289,7 +1281,7 @@ class CPClientTests(unittest.TestCase):
         # no second fence), stages the committed closed leg, and converges
         # effective without running cancel again.
         transport.event_frames = [envelope]
-        second = self.client(transport).sync(self.controller)
+        second = drive(self.client(transport), self.controller)
         self.assertEqual(second, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(
             [ack["state"] for ack in transport.acks],
@@ -1342,7 +1334,7 @@ class CPClientTests(unittest.TestCase):
 
         with mock.patch.object(CPClient, "_store_receipt", autospec=True) as store:
             store.side_effect = fail_terminal
-            result = self.client(transport).sync(self.controller)
+            result = drive(self.client(transport), self.controller)
         # No raise, no ACKs, cursor held: the cancel committed exactly once.
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
         self.assertEqual(transport.acks, [])
@@ -1353,7 +1345,7 @@ class CPClientTests(unittest.TestCase):
         # Healed retry: the same frame is a no-op for the same cancel op id
         # (no second fence), then ACKs effective and advances.
         transport.event_frames = [envelope]
-        second = self.client(transport).sync(self.controller)
+        second = drive(self.client(transport), self.controller)
         self.assertEqual(second, {"applied": 1, "rejected": 0, "acked": 1})
         self.assertEqual(
             [ack["state"] for ack in transport.acks],
@@ -1381,7 +1373,7 @@ class CPClientTests(unittest.TestCase):
         )
         envelope = frame(op, 1)
         transport = FakeTransport(snapshot_doc(), [envelope])
-        result = self.client(transport).sync(self.controller)
+        result = drive(self.client(transport), self.controller)
         self.assertEqual(result, {"applied": 0, "rejected": 0, "acked": 0})
         receipts = json.loads((self.dir / "state" / "cp_receipts.json").read_bytes())
         marker = receipts[envelope["operationId"]].get("gate")
@@ -1409,7 +1401,7 @@ class CPClientTests(unittest.TestCase):
         state["cursor"] = 0
         (self.dir / "state" / "cp_state.json").write_bytes(json.dumps(state).encode())
         transport.event_frames = [envelope]
-        held = self.client(transport).sync(self.controller)
+        held = drive(self.client(transport), self.controller)
         self.assertEqual(held, {"applied": 0, "rejected": 0, "acked": 0})
         self.assertEqual(
             [ack["state"] for ack in transport.acks],
@@ -1586,6 +1578,257 @@ class GateReporterTests(unittest.TestCase):
         self.assertEqual(
             reporter._url(), "http://127.0.0.1:9/v2/settings/gate/workshop"
         )
+
+
+class StateAndWorkshopGameClientTests(unittest.TestCase):
+    def test_state_reporter_get_doc_and_stream(self):
+        import threading
+        from cp_client import StateReporter
+
+        gets = []
+        puts = []
+
+        class StubTransport:
+            def __init__(self):
+                self.docs = {
+                    "game-ready": {
+                        "name": "game-ready",
+                        "seq": 2,
+                        "value": {
+                            "profile": "workshop",
+                            "generation": str(uuid4()),
+                            "session": str(uuid4()),
+                            "release": "v1.0.0",
+                            "running": True,
+                            "updatedAt": NOW_MS,
+                        },
+                    }
+                }
+
+            def get_json(self, url, timeout, cap=None):
+                gets.append((url, timeout, cap))
+                return json.dumps({"documents": self.docs}).encode()
+
+            def put_json(self, url, body, timeout):
+                puts.append((url, body, timeout))
+                return b"{}"
+
+            def stream_events(self, url, idle_s):
+                gets.append((url, idle_s, "stream"))
+                return [
+                    {
+                        "name": "game-desired",
+                        "seq": 5,
+                        "value": {
+                            "schema": 1,
+                            "profile": "workshop",
+                            "generation": str(uuid4()),
+                            "session": str(uuid4()),
+                            "release": "v1.0.0",
+                        },
+                    }
+                ]
+
+        transport = StubTransport()
+        reporter = StateReporter("https://cp.invalid", transport)
+        reporter.put("status", {"phase": "workshop"})
+        self.assertEqual(puts[0][0], "https://cp.invalid/v2/workshop/state/status")
+        self.assertEqual(puts[0][1], {"value": {"phase": "workshop"}})
+
+        docs = reporter.get(("game-ready", "game-desired"))
+        self.assertIn("game-ready", docs)
+        self.assertEqual(len(gets), 1)
+        # Cached hit skips network unless refresh=True.
+        self.assertIsNotNone(reporter.doc("game-ready"))
+        self.assertEqual(len(gets), 1)
+        reporter.doc("game-ready", refresh=True)
+        self.assertEqual(len(gets), 2)
+
+        wake = threading.Event()
+        self.assertTrue(reporter.read_state_stream(wake=wake))
+        self.assertTrue(wake.is_set())
+        self.assertIsNotNone(reporter.doc("game-desired"))
+
+    def test_workshop_game_client_from_env_and_command(self):
+        from cp_client import WorkshopGameClient
+
+        self.assertIsNone(WorkshopGameClient.from_env({}))
+        gen = str(uuid4())
+        op_id = str(uuid4())
+        job = str(uuid4())
+
+        class StubTransport:
+            def __init__(self, settled):
+                self.settled = settled
+                self.posts = []
+
+            def post_json(self, url, body, timeout):
+                self.posts.append((url, body))
+                return json.dumps({"operationId": op_id}).encode()
+
+            def stream_events(self, url, idle_s):
+                self.stream_url = url
+                return list(self.settled)
+
+        transport = StubTransport(
+            [
+                {
+                    "operationId": op_id,
+                    "status": "settled",
+                    "state": "effective",
+                    "code": "ok",
+                    "output": "saved",
+                }
+            ]
+        )
+        client = WorkshopGameClient.from_env(
+            {
+                "BLOCKFIELD_CP_URL": "https://cp.invalid",
+                "BLOCKFIELD_CP_GATE_TOKEN": "gate-tok",
+                "BLOCKFIELD_CP_WORKSHOP_GAME_GENERATION": gen,
+                "BLOCKFIELD_CP_WORKSHOP_GAME_CONSUMER_ID": "ws-game",
+            },
+            transport=transport,
+        )
+        event = client.command("export-limbo", job=job, expires_in_s=90)
+        self.assertEqual(event["output"], "saved")
+        url, body = transport.posts[0]
+        self.assertEqual(url, "https://cp.invalid/v2/workshop/game")
+        self.assertEqual(
+            (body["gameOp"], body["job"], body["consumerId"], body["generation"]),
+            ("export-limbo", job, "ws-game", gen),
+        )
+        self.assertEqual(
+            transport.stream_url, f"https://cp.invalid/v2/workshop/game/{op_id}/events"
+        )
+
+        # Rejected settlement raises RuntimeError.
+        bad = WorkshopGameClient(
+            "https://cp.invalid",
+            "ws-game",
+            gen,
+            StubTransport(
+                [
+                    {
+                        "operationId": op_id,
+                        "status": "settled",
+                        "state": "rejected",
+                        "code": "rcon_error",
+                        "output": "boom",
+                    }
+                ]
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "save-flush.*rejected"):
+            bad.command("save-flush")
+
+        # Expired wait raises TimeoutError.
+        ticks = iter([0.0, 100.0])
+        timed_out = WorkshopGameClient(
+            "https://cp.invalid",
+            "ws-game",
+            gen,
+            StubTransport([]),
+            clock=lambda: next(ticks),
+        )
+        with self.assertRaises(TimeoutError):
+            timed_out.command("stop", expires_in_s=10)
+
+    def test_game_state_parsers_and_cp_saves_held(self):
+        from cp_client import (
+            cp_saves_held,
+            parse_game_activity,
+            parse_game_desired,
+            parse_game_ready,
+        )
+
+        gen = str(uuid4())
+        session = str(uuid4())
+        desired_doc = {
+            "name": "game-desired",
+            "value": {
+                "schema": 1,
+                "profile": "workshop",
+                "generation": gen,
+                "session": session,
+                "release": "v1.0.0",
+            },
+        }
+        self.assertEqual(
+            parse_game_desired(desired_doc, allowed_profiles={"workshop", "test"})[
+                "release"
+            ],
+            "v1.0.0",
+        )
+        self.assertIsNone(
+            parse_game_desired(
+                {"schema": 1, "selected": None}, allowed_profiles={"workshop"}
+            )
+        )
+        with self.assertRaises(ValueError):
+            parse_game_desired(
+                {"schema": 1, "profile": "game", "generation": gen, "release": "v1"},
+                allowed_profiles={"workshop"},
+            )
+
+        ready_doc = {
+            "name": "game-ready",
+            "value": {
+                "schema": 1,
+                "profile": "workshop",
+                "generation": gen,
+                "session": session,
+                "release": "v1.0.0",
+                "running": True,
+                "updatedAt": NOW_MS,
+            },
+        }
+        ready, alive = parse_game_ready(
+            ready_doc,
+            allowed_profiles={"workshop"},
+            now_ms=NOW_MS + 10_000,
+            ready_ttl_ms=60_000,
+        )
+        self.assertTrue(alive)
+        self.assertEqual(ready["generation"], gen)
+        self.assertEqual(
+            parse_game_ready(
+                ready_doc,
+                allowed_profiles={"workshop"},
+                now_ms=NOW_MS + 61_000,
+                ready_ttl_ms=60_000,
+            ),
+            (None, None),
+        )
+        self.assertEqual(
+            parse_game_activity(
+                {
+                    "name": "game-activity",
+                    "value": {
+                        "schema": 1,
+                        "generation": gen,
+                        "players": 0,
+                        "busy": False,
+                        "updatedAt": NOW_MS,
+                    },
+                }
+            )["generation"],
+            gen,
+        )
+        self.assertIsNone(parse_game_activity({"schema": 2}))
+
+        calls = []
+
+        class StubGame:
+            def command(self, op, **_kwargs):
+                calls.append(op)
+                if op == "save-off":
+                    raise RuntimeError("save-off failed")
+
+        with self.assertRaises(RuntimeError):
+            with cp_saves_held(StubGame()):
+                pass
+        self.assertEqual(calls, ["save-on", "save-off", "save-on"])
 
 
 if __name__ == "__main__":

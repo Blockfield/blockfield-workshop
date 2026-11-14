@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Container entry point for the Workshop controller (stdlib only).
 
-Own event loop: inbox polling plus a reconcile step every
-BF_STEP_INTERVAL_S seconds (default 15), following a transition in flight
-with the same bounded budget as ``workshopctl step``. No systemd unit,
+Own event loop: a reconcile step every BF_STEP_INTERVAL_S seconds (default
+15), following a transition in flight with the same bounded budget as
+``workshopctl step``. Workshop operations arrive over the control-plane
+agent stream (a thread holds the SSE connection open) and wake the loop at
+once; controller documents go back to CP after each pass. No systemd unit,
 Docker schedule or helper runs this loop.
 
 Health: GET /healthz on loopback BF_HEALTH_PORT (default 8080) reports the
@@ -91,20 +93,23 @@ def make_handler(controller_getter, tick_getter):
 
 
 def run_loop(controller, stop, env=os.environ):
-    """One reconcile pass, then bounded following; returns when stop is set."""
+    """One reconcile pass, then bounded following; returns when stop is set.
+
+    Waits between passes on the CP wake event (a pushed frame), the step
+    interval, or stop, whichever comes first.
+    """
     interval = _positive_float(env, "BF_STEP_INTERVAL_S", 15)
     follow = _non_negative_float(env, "BF_STEP_FOLLOW_S", 12)
     poll = _positive_float(env, "BF_STEP_POLL_S", 2)
+    cp = getattr(controller, "cp_client", None)
+    wake = getattr(cp, "wake", None) or stop
     while not stop.is_set():
         tick = time.time()
         run_loop.tick = tick
+        if wake is not stop:
+            wake.clear()
         try:
             try:
-                controller.process_inbox()
-            except Exception as error:  # inbox must never block reconciliation
-                print(f"entrypoint: inbox pass failed: {error!r}", file=sys.stderr)
-            try:
-                cp = getattr(controller, "cp_client", None)
                 if cp is not None:
                     cp.sync(controller)
             except Exception as error:  # cp must never block reconciliation
@@ -123,7 +128,10 @@ def run_loop(controller, stop, env=os.environ):
                 result = controller.step()
         except Exception as error:
             print(f"entrypoint: step failed: {error!r}", file=sys.stderr)
-        stop.wait(interval)
+        flush = getattr(controller, "flush_reports", None)
+        if callable(flush):
+            flush()  # never raises: undelivered documents stay staged
+        wake.wait(interval)
 
 
 run_loop.tick = 0.0
@@ -135,11 +143,34 @@ def main(env=os.environ) -> int:
         env, workshopctl.backend_factory_from_name(backend_name, env)
     )
     stop = threading.Event()
+    cp = getattr(controller, "cp_client", None)
+
+    def shutdown(_signal, _frame):
+        stop.set()
+        if cp is not None:
+            cp.wake.set()
+
     for name in ("SIGTERM", "SIGINT"):
         try:
-            signal.signal(getattr(signal, name), lambda _n, _f: stop.set())
+            signal.signal(getattr(signal, name), shutdown)
         except (AttributeError, OSError, ValueError):
             pass
+    try:
+        # Initial catalog for CP readers; afterwards map operations re-export.
+        controller.export_maps()
+    except Exception as error:
+        print(f"entrypoint: map export failed: {error!r}", file=sys.stderr)
+    if cp is not None:
+        threading.Thread(target=cp.run_stream, args=(stop,), daemon=True).start()
+    state_reporter = getattr(controller, "state_reporter", None)
+    if state_reporter is not None and callable(
+        getattr(state_reporter, "run_state_stream", None)
+    ):
+        threading.Thread(
+            target=state_reporter.run_state_stream,
+            args=(stop, cp.wake if cp is not None else None),
+            daemon=True,
+        ).start()
     port = int(env.get("BF_HEALTH_PORT", 8080))
     server = HTTPServer(
         ("127.0.0.1", port), make_handler(lambda: controller, lambda: run_loop.tick)

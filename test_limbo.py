@@ -1,5 +1,6 @@
 """Limbo derivatives bind one accepted Anvil version; activation never controls the proxy."""
 
+import cp_fixtures
 from release_fixtures import catalog
 
 import hashlib
@@ -237,11 +238,9 @@ class LimboTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 metadata(broken)
 
-    def test_controller_inbox_export_requires_one_ready_workshop_without_profile_switch(
+    def test_controller_cp_export_requires_one_ready_workshop_without_profile_switch(
         self,
     ):
-        import time
-
         version = self.version()
         adapter = self.adapter()
         backend = FakeBackend()
@@ -250,7 +249,6 @@ class LimboTests(unittest.TestCase):
             backend,
             maps=self.store,
             admin_dir=self.root / "admin",
-            inbox_dir=self.root / "inbox",
             releases=catalog(),
         )
         with self.assertRaisesRegex(ValueError, "ready workshop"):
@@ -280,23 +278,8 @@ class LimboTests(unittest.TestCase):
         export.side_effect = produce
         backend.export_limbo = export
         control.set_members([ACTOR | {"role": "admin"}])
-        request_id = str(uuid4())
-        control.inbox_dir.mkdir()
-        (control.inbox_dir / f"{request_id}.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "id": request_id,
-                    "createdAt": int(time.time() * 1000),
-                    "actor": ACTOR,
-                    "kind": "limbo-export",
-                    "versionDigest": version,
-                }
-            )
-        )
-        self.assertEqual(control.process_inbox(), 1)
-        result = json.loads(
-            (control.admin_dir / "results" / f"{request_id}.json").read_bytes()
+        result = cp_fixtures.apply(
+            control, "limbo-export", ACTOR, versionDigest=version
         )
         self.assertTrue(result["ok"], result)
         export.assert_called_once()

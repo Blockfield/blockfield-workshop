@@ -1,32 +1,20 @@
-"""Workshop lifecycle without docker.sock or a Dokploy API token.
+"""Workshop lifecycle over CP events/state without docker.sock or RCON.
 
-Mechanism (owner decision 2026-10-30): the server release CI owns the fixed
-GHCR tag (``<repository>:approved``) — it moves the tag to the verified
-release with its own GITHUB_TOKEN after release verification passes, then
-triggers the Workshop app redeploy through the app's Dokploy webhook. This
-backend never moves tags. start() persists the verified selection
-(profile.json) and clears the READY file, then POSTs the Workshop app's
-deploy webhook when WORKSHOP_DEPLOY_WEBHOOK_URL is set, so a stopped
-editor restarts without a manual deploy; unset keeps the manual-deploy
-behaviour. save/stop/status go through direct private-network RCON plus the mod's READY
-file. The approved release is read back from the running Workshop (READY +
-selection) for reporting only. No docker CLI, no Dokploy API token, no
-GitHub credentials at all: only the Workshop's own RCON password plus,
-optionally, the deploy webhook URL (both secrets, never logged).
-
-The old DockerBackend stays authoritative (see docs/OPERATIONS.md); this
-module is staged beside it and shares the controller Backend protocol, the
-profile.json selection schema and the READY-file contract.
+Mechanism (coordination#64): the server release CI owns the approved image tag
+and triggers the Workshop app redeploy when released. start() writes the
+verified desired selection to CP state (``game-desired``), then POSTs the
+Workshop app's Dokploy deploy webhook when WORKSHOP_DEPLOY_WEBHOOK_URL is set.
+Readiness/activity come from CP state (``game-ready`` / ``game-activity``) over
+SSE, and save/stop/export-limbo dispatch to the Workshop game CP consumer
+via ``POST /v2/workshop/game`` + SSE settlement. Never touches Game.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
 import socket
-import struct
 import time
 import urllib.error
 import urllib.request
@@ -34,11 +22,22 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from controller import Goal, Process, atomic_write
+from controller import Goal, Process
+from cp_client import (
+    DEFAULT_READY_TTL_MS,
+    GateReporter,
+    StateReporter,
+    WorkshopGameClient,
+    _NoRedirect,
+    _check_cp_url,
+    cp_saves_held,
+    parse_game_activity,
+    parse_game_desired,
+    parse_game_ready,
+)
 
 logger = logging.getLogger(__name__)
 
-READY_FILE = ".blockfield-ready.json"
 UNKNOWN_SESSION = "00000000-0000-0000-0000-000000000000"
 
 DEPLOY_WEBHOOK_ENV = "WORKSHOP_DEPLOY_WEBHOOK_URL"
@@ -47,36 +46,6 @@ DEPLOY_WEBHOOK_TIMEOUT_S = 10.0
 DEPLOY_WEBHOOK_ATTEMPTS = 3
 DEPLOY_WEBHOOK_RETRY_DELAY_S = 2.0
 DEPLOY_WEBHOOK_RESPONSE_CAP = 65536
-
-
-class RconError(RuntimeError):
-    """Private-network RCON command failed; never carries the password."""
-
-
-def read_secret(
-    *,
-    value: str | None,
-    env: str,
-    file_env: str,
-    what: str,
-    error: type = RconError,
-) -> str:
-    """Credential from an explicit value, env var or secret file (first line)."""
-    if value:
-        return value
-    direct = os.environ.get(env, "").strip()
-    if direct:
-        return direct
-    path = os.environ.get(file_env, "").strip()
-    if path:
-        try:
-            with open(path, encoding="utf-8") as handle:
-                secret = handle.readline().strip()
-        except OSError as exc:
-            raise error(f"{what} secret file unreadable") from exc
-        if secret:
-            return secret
-    raise error(f"{what} credential is not configured")
 
 
 def _webhook_not_sent(error: BaseException) -> bool:
@@ -92,8 +61,6 @@ def _webhook_not_sent(error: BaseException) -> bool:
 
 def _post_deploy_webhook(url: str, timeout_s: float = DEPLOY_WEBHOOK_TIMEOUT_S) -> None:
     """POST one Dokploy deploy webhook; raise without ever carrying the URL."""
-    from cp_client import _NoRedirect
-
     opener = urllib.request.build_opener(_NoRedirect)
     request = urllib.request.Request(url, data=b"", method="POST")
     try:
@@ -110,201 +77,80 @@ def _post_deploy_webhook(url: str, timeout_s: float = DEPLOY_WEBHOOK_TIMEOUT_S) 
         raise RuntimeError(f"deploy webhook answered http {status}")
 
 
-class RconClient:
-    """Minimal Source RCON over TCP on the private network (stdlib only)."""
-
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        *,
-        password: str | None = None,
-        timeout: float = 10.0,
-    ):
-        if not host or not (0 < port < 65536):
-            raise ValueError("RCON needs a private-network host and port")
-        self.host, self.port = host, port
-        self._password = read_secret(
-            value=password,
-            env="BF_WORKSHOP_RCON_PASSWORD",
-            file_env="BF_WORKSHOP_RCON_PASSWORD_FILE",
-            what="workshop RCON",
-            error=RconError,
-        )
-        self.timeout = timeout
-        self._socket: socket.socket | None = None
-
-    def _packet(self, request_id: int, kind: int, body: bytes) -> bytes:
-        return (
-            struct.pack("<iii", 4 + 4 + len(body) + 2, request_id, kind)
-            + body
-            + b"\x00\x00"
-        )
-
-    def _read_exact(self, count: int) -> bytes:
-        assert self._socket is not None
-        chunks = []
-        while sum(map(len, chunks)) < count:
-            chunk = self._socket.recv(count - sum(map(len, chunks)))
-            if not chunk:
-                raise RconError("RCON connection closed mid-packet")
-            chunks.append(chunk)
-        return b"".join(chunks)
-
-    def _read_packet(self) -> tuple[int, bytes]:
-        (size,) = struct.unpack("<i", self._read_exact(4))
-        if not 10 <= size <= 1 << 20:
-            raise RconError("RCON answered with a malformed packet")
-        payload = self._read_exact(size)
-        request_id, _kind = struct.unpack("<ii", payload[:8])
-        return request_id, payload[8:-2]
-
-    def connect(self) -> None:
-        """TCP + auth; raises RconError without leaking the password."""
-        try:
-            self._socket = socket.create_connection(
-                (self.host, self.port), timeout=self.timeout
-            )
-            self._socket.settimeout(self.timeout)
-            self._socket.sendall(self._packet(1, 3, self._password.encode()))
-            request_id, _ = self._read_packet()
-        except RconError:
-            self.close()
-            raise
-        except Exception as error:
-            self.close()
-            raise RconError(f"RCON connect failed: {type(error).__name__}") from error
-        if request_id == -1:
-            self.close()
-            raise RconError("RCON rejected the password")
-
-    def command(self, *words: str) -> str:
-        """Run one trusted console command; at most 64 response packets.
-
-        The command goes out under request id 1, followed by a re-auth
-        fence under id 2. A real Java answers every command packet under
-        its own id and the fence with an empty body, but never echoes an
-        empty drain marker (it answers the empty command with error text
-        instead), so the fence reply marks the end of the output.
-        """
-        if self._socket is None:
-            self.connect()
-        try:
-            assert self._socket is not None
-            self._socket.sendall(self._packet(1, 2, " ".join(words).encode()))
-            self._socket.sendall(self._packet(2, 3, self._password.encode()))
-            parts = []
-            for _ in range(64):
-                request_id, body = self._read_packet()
-                if request_id == -1:
-                    raise RconError("RCON session was refused mid-command")
-                if request_id == 2:
-                    # Fence reply: output drained, fence itself has no output.
-                    break
-                if request_id != 1:
-                    raise RconError("RCON answered with an unknown request id")
-                parts.append(body)
-            else:
-                raise RconError("RCON flooded the response budget")
-            # shortcut: multi-packet truncation at 64 chunks; raise the budget when commands need it.
-            return b"".join(parts).decode("utf-8", "replace")
-        except RconError:
-            self.close()
-            raise
-        except Exception as error:
-            self.close()
-            raise RconError(f"RCON command failed: {type(error).__name__}") from error
-
-    def close(self) -> None:
-        if self._socket is not None:
-            try:
-                self._socket.close()
-            except OSError:
-                pass
-            self._socket = None
-
-    def __enter__(self) -> "RconClient":
-        self.connect()
-        return self
-
-    def __exit__(self, *ignored) -> None:
-        self.close()
-
-
 class DokployBackend:
-    """Workshop-only lifecycle beside the release-owned approved tag.
-
-    Observes the mod's READY file plus an RCON liveness probe (TCP connect,
-    no auth), saves through ``save-all flush`` and stops through RCON
-    ``stop``. start() persists the verified selection and clears the
-    READY file — the :approved rollout itself is the server release CI's
-    job — then POSTs the Workshop app's Dokploy deploy webhook when
-    WORKSHOP_DEPLOY_WEBHOOK_URL is set, so a stopped editor restarts
-    without a manual deploy; unset keeps the manual-deploy path. The
-    approved release is read back from the running Workshop for
-    reporting only. Never touches Game: observe() reports Workshop/test
-    only, so Game reads as unavailable.
-    """
+    """Workshop-only lifecycle using CP state & agent events plus deploy webhook."""
 
     def __init__(
         self,
         *,
         data: Path,
         lock_dir: Path,
-        rcon_host: str,
-        rcon_port: int,
-        rcon_password: str | None = None,
         releases: dict | None = None,
         maps=None,
         stop_timeout: float = 300.0,
         poll: float = 2.0,
         min_free_bytes: int = 2 << 30,
+        ready_ttl_ms: int | None = DEFAULT_READY_TTL_MS,
         sleep=time.sleep,
         clock=time.monotonic,
+        now_ms=None,
+        state_reporter: StateReporter | None = None,
+        game_client: WorkshopGameClient | None = None,
     ):
         self.data = Path(data)
         self.lock_dir = Path(lock_dir)
-        self.rcon_host = rcon_host
-        self.rcon_port = rcon_port
-        self.rcon_password = rcon_password
         self.releases = dict(releases) if releases else {}
         self.maps = maps
         self.stop_timeout = stop_timeout
         self.poll = poll
         self.min_free_bytes = min_free_bytes
+        self.ready_ttl_ms = ready_ttl_ms
         self._sleep = sleep
         self._clock = clock
+        self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self.state_reporter = state_reporter
+        self.game_client = game_client
 
     @classmethod
     def from_env(cls, env=os.environ, **overrides) -> "DokployBackend":
-        """Build from BF_ env; the secret stays in env vars or secret files."""
+        """Build from BF_ / BLOCKFIELD_CP_ env; secrets stay in env vars or files."""
         import releases as release_catalog
 
         releases_path = env.get("BF_RELEASES_FILE")
+        extra = dict(overrides)
+        if "state_reporter" not in extra or "game_client" not in extra:
+            gate = GateReporter.from_env(env)
+            if gate is not None:
+                extra.setdefault(
+                    "state_reporter", StateReporter(gate.base_url, gate.transport)
+                )
+                extra.setdefault(
+                    "game_client",
+                    WorkshopGameClient.from_env(
+                        env, base_url=gate.base_url, transport=gate.transport
+                    ),
+                )
+        ttl_raw = (env.get("BF_WORKSHOP_READY_TTL_S") or "").strip()
+        if ttl_raw and "ready_ttl_ms" not in extra:
+            extra["ready_ttl_ms"] = int(float(ttl_raw) * 1000)
         return cls(
             data=Path(env.get("BF_WORKSHOP_DATA", "/srv/minecraft/workshop/data")),
             lock_dir=Path(env.get("BF_LOCK_DIR", "/srv/minecraft/backend-lock")),
-            rcon_host=env.get("BF_WORKSHOP_RCON_HOST", "blockfield-workshop"),
-            rcon_port=int(env.get("BF_WORKSHOP_RCON_PORT", "25575")),
             releases=release_catalog.load_catalog(
                 Path(releases_path) if releases_path else None
             ),
-            **overrides,
+            **extra,
         )
 
-    def _rcon(self) -> RconClient:
-        return RconClient(self.rcon_host, self.rcon_port, password=self.rcon_password)
+    def _require_state_reporter(self) -> StateReporter:
+        if self.state_reporter is None:
+            raise RuntimeError("CP state reporter is not configured")
+        return self.state_reporter
 
-    def _alive(self) -> bool:
-        """TCP liveness probe: java accepts RCON connections without auth."""
-        try:
-            probe = socket.create_connection(
-                (self.rcon_host, self.rcon_port), timeout=5.0
-            )
-        except OSError:
-            return False
-        with probe:
-            return True
+    def _require_game_client(self) -> WorkshopGameClient:
+        if self.game_client is None:
+            raise RuntimeError("CP Workshop game client is not configured")
+        return self.game_client
 
     def preflight(self, goal: Goal) -> None:
         if goal.profile == "game":
@@ -335,62 +181,34 @@ class DokployBackend:
         return release_catalog.resolve(self.releases, release)["imageDigest"]
 
     def selection(self) -> dict | None:
-        path = self.lock_dir / "workshop" / "profile.json"
-        if path.is_symlink():
-            raise ValueError("invalid profile.json")
-        try:
-            data = json.loads(path.read_bytes()[:16384])
-        except FileNotFoundError:
-            return None
-        if (
-            not isinstance(data, dict)
-            or data.get("schema") != 1
-            or data.get("profile") not in {"workshop", "test"}
-            or not isinstance(data.get("release"), str)
-            or not data["release"]
-        ):
-            raise ValueError("invalid profile.json")
-        UUID(data.get("generation"))
-        if data.get("session") is not None:
-            UUID(data["session"])
-        return data
+        doc = self._require_state_reporter().doc("game-desired")
+        return parse_game_desired(doc, allowed_profiles={"workshop", "test"})
+
+    def _read_ready(self, *, refresh: bool = False) -> tuple[dict | None, bool | None]:
+        doc = self._require_state_reporter().doc("game-ready", refresh=refresh)
+        return parse_game_ready(
+            doc,
+            allowed_profiles={"workshop", "test"},
+            now_ms=self._now_ms(),
+            ready_ttl_ms=self.ready_ttl_ms,
+        )
 
     def readiness(self) -> dict | None:
-        try:
-            data = json.loads((self.data / READY_FILE).read_bytes()[:16384])
-        except (OSError, ValueError):
+        ready, alive = self._read_ready()
+        return ready if alive else None
+
+    def readiness_generation(self, profile: str) -> str | None:
+        if profile not in {"workshop", "test"}:
             return None
-        if not isinstance(data, dict) or set(data) != {
-            "profile",
-            "generation",
-            "session",
-            "release",
-        }:
-            return None
-        try:
-            if data["profile"] not in {"workshop", "test"}:
-                return None
-            if not isinstance(data["release"], str) or not data["release"].strip():
-                return None
-            if (
-                data["generation"] is not None
-                and str(UUID(data["generation"])) != data["generation"]
-            ):
-                return None
-            if str(UUID(data["session"])) != data["session"]:
-                return None
-        except (ValueError, TypeError, AttributeError):
-            return None
-        return data
+        ready = self.readiness()
+        generation = ready.get("generation") if ready else None
+        return generation if isinstance(generation, str) and generation else None
+
+    def activity(self) -> dict | None:
+        return parse_game_activity(self._require_state_reporter().doc("game-activity"))
 
     def _ready_matches(self, ready: dict, expected: dict) -> bool:
-        """Whether the attested READY file is the selected backend.
-
-        profile/generation/session compare strictly; release accepts either
-        name of the same verified catalog record (the image's build tag vs
-        the approval's image digest). Without a catalog binding both names
-        the backend is not ready.
-        """
+        """Whether the CP game-ready doc matches the selected backend."""
         if (
             ready.get("profile") != expected.get("profile")
             or ready.get("generation") != expected.get("generation")
@@ -419,16 +237,13 @@ class DokployBackend:
             corrupt = True
         else:
             corrupt = False
-        alive = self._alive()
+        ready, alive = self._read_ready()
+        if alive is None:
+            raise RuntimeError("workshop readiness unknown")
         if not alive:
-            # Stopped backends report nothing, mirroring the scaled-to-zero
-            # service: a stale selection or READY file is not a process.
-            # Corrupt selection with no living java stays invisible too;
-            # recovery is explicit, never an invented unknown backend.
             return []
         if corrupt:
             return [Process(Goal("workshop", "unknown", UNKNOWN_SESSION), False)]
-        ready = self.readiness()
         if selected is None:
             selected, expected = ready, ready
         else:
@@ -464,102 +279,55 @@ class DokployBackend:
     def save_and_freeze(self, process: Process) -> None:
         if process.goal.profile == "game":
             raise ValueError("Workshop controller cannot save or stop Game")
-        with self._rcon() as rcon:
-            result = rcon.command("save-all", "flush")
-        if "Saved the game" not in result:
-            raise RuntimeError(f"save-all did not confirm success: {result[:300]}")
-
-    @staticmethod
-    def _save_on_confirmed(result: str) -> bool:
-        return any(
-            message in result
-            for message in (
-                "Automatic saving is now enabled",
-                "Saving is already turned on",
-            )
-        )
+        self._require_game_client().command("save-flush")
 
     @contextmanager
     def workshop_saves_held(self):
-        """Hot snapshot: flush chunks and hold autosave off while the copy runs, so builders stay
-        connected. A stopped editor has nothing to hold. Entry re-enables autosave first: a
-        previous failed save-on (or a kill mid-snapshot) otherwise leaves it off silently and the
-        next save-off accepts "already turned off" as success."""
-        if not self._alive():
+        """Hot snapshot: flush chunks and hold autosave off via CP agent ops."""
+        _, alive = self._read_ready(refresh=True)
+        if alive is None:
+            raise RuntimeError("workshop readiness unknown")
+        if not alive:
             yield
             return
-        with self._rcon() as rcon:
-            try:
-                if not self._save_on_confirmed(rcon.command("save-on")):
-                    raise RuntimeError("save-on did not confirm autosave enabled")
-                result = rcon.command("save-off")
-                if not any(
-                    message in result
-                    for message in (
-                        "Automatic saving is now disabled",
-                        "Saving is already turned off",
-                    )
-                ):
-                    raise RuntimeError("save-off did not confirm autosave disabled")
-                result = rcon.command("save-all", "flush")
-                if "Saved the game" not in result:
-                    raise RuntimeError(
-                        "save-all did not confirm success for live snapshot"
-                    )
-                yield
-            finally:
-                # A timed-out save-off may still have reached Java; retry an
-                # unconfirmed save-on once, since it likely only missed the reply.
-                try:
-                    result = rcon.command("save-on")
-                except RconError:
-                    result = rcon.command("save-on")
-                if not self._save_on_confirmed(result):
-                    result = rcon.command("save-on")
-                if not self._save_on_confirmed(result):
-                    raise RuntimeError("save-on did not confirm autosave restored")
+        with cp_saves_held(self._require_game_client()):
+            yield
 
     def _stop_and_wait(self, timeout_message: str) -> None:
-        """RCON stop, then wait dark. Shutdown tears down the reply path, so
-        a mid-command RCON error only matters if the backend stays alive; a
-        connect/auth failure retries while the TCP probe still sees the
-        backend (a booting java listens before RCON answers), bounded by
-        stop_timeout."""
-        error: RconError | None = None
+        client = self._require_game_client()
         deadline = self._clock() + self.stop_timeout
-        while self._alive():
-            try:
-                with self._rcon() as rcon:
-                    rcon.command("stop")
-                break
-            except RconError as exc:
-                error = exc
-                if not self._alive():
-                    return
-                if self._clock() >= deadline:
-                    raise TimeoutError(timeout_message) from error
-                self._sleep(self.poll)
-        while self._alive():
+        client.command(
+            "stop",
+            expires_in_s=max(1, min(300, int(self.stop_timeout))),
+        )
+        while self._read_ready(refresh=True)[1] is not False:
             if self._clock() >= deadline:
-                raise TimeoutError(timeout_message) from error
+                raise TimeoutError(timeout_message)
             self._sleep(self.poll)
 
     def stop(self, process: Process) -> None:
         if process.goal.profile == "game":
             raise ValueError("Workshop controller cannot save or stop Game")
         self.save_and_freeze(process)
-        self._stop_and_wait("workshop still running after RCON stop")
+        self._stop_and_wait("workshop still running after CP stop")
 
     def fence_pending_starts(self) -> None:
-        """No delayed old request may later start a backend when this returns.
-
-        Stop anything still alive and wait until the liveness probe goes
-        quiet. Unknown states raise. (A delayed queued Workshop deploy
-        landing after the fence still resurrects java; it then reads as
-        alive-but-unselected and fails closed.)
-        """
-        if self._alive():
+        deadline = self._clock() + self.stop_timeout
+        while (alive := self._read_ready(refresh=True)[1]) is None:
+            if self._clock() >= deadline:
+                raise TimeoutError("cannot determine workshop readiness")
+            self._sleep(self.poll)
+        if alive:
             self._stop_and_wait("cannot fence the workshop backend")
+
+    def export_limbo(self, job: str) -> None:
+        if str(UUID(job)) != job or self.maps is None or self.maps.limbo is None:
+            raise ValueError("configured native Limbo export job required")
+        self._require_game_client().command(
+            "export-limbo",
+            job=job,
+            expires_in_s=max(60, min(300, int(self.stop_timeout))),
+        )
 
     def _operation_id(self, goal: Goal) -> str:
         """Generation for this start; a retry reuses the persisted intent's."""
@@ -593,8 +361,6 @@ class DokployBackend:
         not an error — the caller keeps the manual-deploy path. The URL
         itself never appears in errors: it is a secret.
         """
-        from cp_client import _check_cp_url
-
         url = os.environ.get(DEPLOY_WEBHOOK_ENV, "").strip()
         if not url:
             path = os.environ.get(DEPLOY_WEBHOOK_FILE_ENV, "").strip()
@@ -690,14 +456,5 @@ class DokployBackend:
             document["modeId"] = goal.modeId
         selected_dir = self.lock_dir / "workshop"
         selected_dir.mkdir(exist_ok=True)
-        atomic_write(
-            selected_dir / "profile.json",
-            json.dumps(document, sort_keys=True).encode(),
-            0o644,
-        )
-        (self.data / READY_FILE).unlink(missing_ok=True)
-        # The generation persists in profile.json first, so a retried
-        # start() for the same goal reuses it instead of minting a new one.
-        # The webhook goes out last: the persisted selection is already the
-        # durable restart intent if the POST fails.
+        self._require_state_reporter().put("game-desired", document)
         self._trigger_deploy_webhook()

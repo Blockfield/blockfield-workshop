@@ -338,9 +338,7 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
 
     def test_controller_starts_when_the_key_directory_is_unusable(self):
         """The sidecar key is optional: an unsafe key dir is logged, and the
-        controller (wake, inbox, gate) still starts."""
-        inbox = self.dir / "inbox"
-        inbox.mkdir()
+        controller (wake, CP operations, gate) still starts."""
         directory = self.base / "blockfield-workshop"
         directory.mkdir(parents=True)
         os.chmod(directory, 0o777)
@@ -351,7 +349,6 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
                 gate_file=self.dir / "gate.json",
                 public_file=self.dir / "public.json",
                 admin_dir=self.dir / "admin",
-                inbox_dir=inbox,
                 workshop_data_dir=self.base,
                 releases=catalog(),
             )
@@ -385,8 +382,6 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
         )
 
     def test_controller_init_ensures_key(self):
-        inbox = self.dir / "inbox"
-        inbox.mkdir()
         before = None
         for _ in range(2):
             Controller(
@@ -395,7 +390,6 @@ class EnsureAiSidecarKeyTests(unittest.TestCase):
                 gate_file=self.dir / "gate.json",
                 public_file=self.dir / "public.json",
                 admin_dir=self.dir / "admin",
-                inbox_dir=inbox,
                 workshop_data_dir=self.base,
                 releases=catalog(),
             )

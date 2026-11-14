@@ -10,7 +10,7 @@ workshopctl request workshop --session <uuid> [--release vX.Y.Z|sha256:<digest>]
 workshopctl request game [--release vX.Y.Z|sha256:<digest>] [--recover]
 workshopctl target       # last approved release target (kept while Game is off)
 workshopctl members [draslId:name[:role[:mapId+mapId...]] ...]
-workshopctl step | status | cancel | wake      # step applies the site admin inbox first
+workshopctl step | status | cancel | wake      # site/proxy/CI operations arrive over CP (entrypoint)
 
 
 Workshop --release is a verified published immutable server release from the
@@ -70,7 +70,6 @@ def build_controller(
     gate_file=None,
     public_file=None,
     admin_dir=None,
-    inbox_dir=None,
     releases_file=None,
     desired_file=None,
 ):
@@ -99,7 +98,6 @@ def build_controller(
         if env.get("BF_RELEASES_FILE", "")
         else directory / "releases.json"
     )
-    inbox_retired = env.get("BLOCKFIELD_CP_INGRESS", "").strip() == "1"
     controller = Controller(
         directory,
         backend,
@@ -109,9 +107,6 @@ def build_controller(
         admin_dir=Path(
             admin_dir or env.get("BF_ADMIN_DIR", "/srv/minecraft/workshop/admin")
         ),
-        inbox_dir=Path(
-            inbox_dir or env.get("BF_INBOX_DIR", "/srv/minecraft/workshop/inbox")
-        ),
         start_timeout=float(env.get("BF_START_TIMEOUT_S", 600)),
         idle_sleep_s=float(env.get("BF_WORKSHOP_IDLE_SLEEP_S", 900)),
         maps=_map_store(env, backend),
@@ -120,7 +115,6 @@ def build_controller(
         ),
         releases=release_catalog.load_catalog(releases_path),
         releases_path=releases_path,
-        inbox_retired=inbox_retired,
         desired_file=(
             Path(desired_file)
             if desired_file
@@ -165,14 +159,34 @@ def build_controller(
     import cp_client
 
     cp_config = cp_client.CPConfig.from_env(env)
-    if inbox_retired and cp_config is None:
-        raise ValueError("BLOCKFIELD_CP_INGRESS=1 needs CP agent credentials")
     controller.cp_client = (
         cp_client.CPClient(cp_config, directory) if cp_config is not None else None
     )
     controller.gate_reporter = cp_client.GateReporter.from_env(
         env, base_url=cp_config.base_url if cp_config is not None else None
     )
+    # State documents and game ops share the reporter credential
+    # (workshop.gate + workshop.report + workshop.read + workshop.game).
+    controller.state_reporter = (
+        cp_client.StateReporter(
+            controller.gate_reporter.base_url, controller.gate_reporter.transport
+        )
+        if controller.gate_reporter is not None
+        else None
+    )
+    controller.game_client = cp_client.WorkshopGameClient.from_env(
+        env,
+        base_url=controller.gate_reporter.base_url
+        if controller.gate_reporter is not None
+        else (cp_config.base_url if cp_config is not None else None),
+        transport=controller.gate_reporter.transport
+        if controller.gate_reporter is not None
+        else None,
+    )
+    if getattr(backend, "state_reporter", None) is None:
+        backend.state_reporter = controller.state_reporter
+    if getattr(backend, "game_client", None) is None:
+        backend.game_client = controller.game_client
     controller.cp_renewer = None
     base = (env.get("BLOCKFIELD_CP_URL") or "").strip().rstrip("/")
     tokens = {key: env.get(key) or "" for key in cp_client.RENEWED_KEYS}
@@ -358,9 +372,6 @@ def main(argv=None, backend_factory=None) -> int:
         "--admin-dir", default=env.get("BF_ADMIN_DIR", "/srv/minecraft/workshop/admin")
     )
     parser.add_argument(
-        "--inbox-dir", default=env.get("BF_INBOX_DIR", "/srv/minecraft/workshop/inbox")
-    )
-    parser.add_argument(
         "--releases-file",
         default=env.get("BF_RELEASES_FILE"),
         help="verified published server releases catalog (JSON); "
@@ -465,7 +476,6 @@ def main(argv=None, backend_factory=None) -> int:
             gate_file=args.gate_file,
             public_file=args.public_file,
             admin_dir=args.admin_dir,
-            inbox_dir=args.inbox_dir,
             releases_file=args.releases_file,
         )
         if args.command == "status":
@@ -554,17 +564,8 @@ def main(argv=None, backend_factory=None) -> int:
                     )
                 controller.export_maps()
         elif args.command == "step":
-            try:
-                controller.process_inbox()
-                controller.export_maps()
-            except Exception as error:  # the site inbox must never block reconciliation
-                print(f"workshopctl: inbox pass failed: {error!r}", file=sys.stderr)
-            try:
-                cp = getattr(controller, "cp_client", None)
-                if cp is not None:
-                    cp.sync(controller)
-            except Exception as error:  # cp must never block reconciliation
-                print(f"workshopctl: cp pass failed: {error!r}", file=sys.stderr)
+            # Operations arrive over the CP stream in the container loop
+            # (entrypoint.py); a manual step only reconciles.
             result = controller.step()
             # A switch in flight is followed every few seconds inside this run instead of once per 15 s timer tick:
             # the next phase (stopped, ready) is acted on almost at once. Bounded, so the timer stays the clock.
@@ -574,6 +575,7 @@ def main(argv=None, backend_factory=None) -> int:
             ):
                 time.sleep(float(env.get("BF_STEP_POLL_S", 2)))
                 result = controller.step()
+            controller.flush_reports()
         else:
             state = controller.status()
             release = args.release or (state.get("desired") or {}).get("release")

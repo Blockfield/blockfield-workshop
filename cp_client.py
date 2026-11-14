@@ -7,6 +7,13 @@ fields, ACK states ``received -> validated -> applied -> effective`` with
 terminal ``rejected``/``unknown``) is fixed by CP; this module only
 interprets the Workshop target payload (the existing inbox kinds).
 
+Every Workshop operation (coordination#64) arrives here: the site, proxy and
+release CI talk only to CP. ``run_stream`` holds the agent SSE stream open
+in a thread and queues each frame as it arrives, waking the controller loop
+at once (push, no polling); ``sync`` applies and ACKs the queued frames on
+the loop thread. ``StateReporter`` sends the controller's documents (status,
+catalogs, operation results) back to CP for the site and the release CI.
+
 The snapshot carries target-scoped settings, not a Workshop ACL: membership
 is checked against the locally stored members, which only CP members
 operations (or the operator bootstrap) can change. Release records arrive
@@ -15,20 +22,20 @@ local catalog.
 
 Trust model: frames arrive over the mutually authenticated CP channel
 (TLS + audience-bound bearer pinned to this agent id), so the payload
-actor/grantor is CP-attested -- unlike the file inbox, whose ``actor``
-field is self-asserted (E4). The payload hash is verified over canonical
+actor/grantor is CP-attested. The payload hash is verified over canonical
 JSON (sort_keys, compact separators); the CP-side Workshop producer must
 hash the same canonical form when committing the outbox row.
 
 Disabled unless ``BLOCKFIELD_CP_URL``, ``BLOCKFIELD_CP_AGENT_ID`` and
-``BLOCKFIELD_CP_AGENT_TOKEN`` are all set. The file inbox keeps working unless BLOCKFIELD_CP_INGRESS=1 retires the
-CP-covered kinds (members/message/wake/cancel); map operations stay
-inbox-only. Release records arrive in the release.select operation and are
-verified against the local catalog before merging.
+``BLOCKFIELD_CP_AGENT_TOKEN`` are all set. Release records arrive in the
+release.select operation and are verified against the local catalog before
+merging.
 """
 
 from __future__ import annotations
 
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +46,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 import uuid
 import urllib.request
@@ -50,12 +58,15 @@ from controller import CommitIncompleteError, CP_RELEASE_LIMIT, member
 AGENT_PATH = "/v2/agents/{agent}"
 SNAPSHOT_TTL_S = 3600
 EVENT_TIMEOUT_S = 5.0
-MAX_FRAME_BYTES = 65536
+# CP heartbeats every 10 s: a silent stream past this is dead, reconnect.
+STREAM_IDLE_S = 35.0
+STREAM_RETRY_MAX_S = 30.0
+# Map publish frames carry merge resolutions (CP caps the request at 1 MiB).
+MAX_FRAME_BYTES = 2 << 20
 MAX_ACL_ENTRIES = 4096
 MAX_ACL_ENTRY_BYTES = 256
 MAX_SNAPSHOT_BYTES = MAX_ACL_ENTRIES * MAX_ACL_ENTRY_BYTES
 RECEIPT_LIMIT = 500
-CP_KINDS = ("members", "message", "wake", "cancel", "release.select")
 
 
 class SnapshotRequired(Exception):
@@ -277,11 +288,11 @@ class _UrllibTransport:
     def _headers(self, accept: str) -> dict:
         return {"Authorization": f"Bearer {self.token}", "Accept": accept}
 
-    def get_json(self, url: str, timeout: float) -> bytes:
+    def get_json(
+        self, url: str, timeout: float, *, cap: int = MAX_SNAPSHOT_BYTES
+    ) -> bytes:
         request = urllib.request.Request(url, headers=self._headers("application/json"))
-        return _request_body(
-            self.opener, request, timeout, "snapshot", MAX_SNAPSHOT_BYTES
-        )
+        return _request_body(self.opener, request, timeout, "snapshot", cap)
 
     def post_json(self, url: str, body: dict, timeout: float) -> bytes:
         data = canonical(body)
@@ -309,17 +320,25 @@ class _UrllibTransport:
         )
         return _request_body(self.opener, request, timeout, "gate", MAX_FRAME_BYTES)
 
-    def get_events(self, url: str, timeout: float) -> tuple[int, list[dict]]:
+    def put_json(self, url: str, body: dict, timeout: float) -> bytes:
+        request = urllib.request.Request(
+            url,
+            data=canonical(body),
+            headers={
+                **self._headers("application/json"),
+                "Content-Type": "application/json",
+            },
+            method="PUT",
+        )
+        return _request_body(self.opener, request, timeout, "state", MAX_FRAME_BYTES)
+
+    def stream_events(self, url: str, idle_s: float):
+        """Yield frames from one long-lived SSE connection until it ends."""
         request = urllib.request.Request(
             url, headers=self._headers("text/event-stream")
         )
         try:
-            with self.opener.open(request, timeout=timeout) as response:
-                if response.status == 409:
-                    raise SnapshotRequired("cp snapshot required")
-                if not 200 <= response.status <= 299:
-                    raise CPHttpError("events", response.status)
-                return response.status, _read_sse(response, timeout)
+            response = self.opener.open(request, timeout=idle_s)
         except urllib.error.HTTPError as error:
             if error.code == 409:
                 raise SnapshotRequired("cp snapshot required") from error
@@ -328,56 +347,51 @@ class _UrllibTransport:
             except Exception:
                 pass
             raise CPHttpError("events", error.code) from error
+        with response:
+            if not 200 <= response.status <= 299:
+                raise CPHttpError("events", response.status)
+            yield from _iter_sse(response)
 
 
-def _read_sse(response, timeout: float) -> list[dict]:
-    """Read bounded SSE frames until the deadline; one JSON object per data block.
+def _iter_sse(response):
+    """Yield SSE data blocks as JSON objects until the stream ends.
 
-    A socket timeout after the last queued event ends the read with the
-    frames parsed so far instead of discarding them, and so does an
-    undecodable data block. Lines carry no
-    per-line limit (a members frame can approach MAX_FRAME_BYTES); a single
-    data block past that is an explicit error, never silent truncation.
+    A socket timeout (no heartbeat within the idle window), a resync event
+    or an undecodable data block ends the stream: the caller reconnects from
+    the durable cursor, which heals transient truncation (the cursor never
+    jumps a hole). Lines carry no per-line limit; a single data block past
+    MAX_FRAME_BYTES is an explicit error, never silent truncation.
     """
-    frames: list[dict] = []
     data: list[str] = []
     data_len = 0
-    deadline = time.monotonic() + timeout
-    total = 0
-    while time.monotonic() < deadline and len(frames) < 20:
+    event = ""
+    while True:
         try:
             line = response.readline()
         except TimeoutError:
-            break
+            return
         if not line:
-            break
-        total += len(line)
-        if total > MAX_FRAME_BYTES * 20:
-            break
+            return
         text = line.decode("utf-8", "replace").rstrip("\r\n")
         if text == "":
+            if event == "resync":
+                return
             if data:
                 try:
                     document = json.loads("\n".join(data))
                 except ValueError:
-                    # Undecodable block: stop here and keep the frames parsed
-                    # so far. The cursor never jumps a hole (the server would
-                    # 409 a jumped cursor and loop), so later frames stay
-                    # queued; the next pass re-reads them over a fresh
-                    # connection, which heals transient truncation. Receipts
-                    # of applied frames persist in the receipts file.
-                    break
+                    return
                 if isinstance(document, dict):
-                    frames.append(document)
-                data = []
-                data_len = 0
+                    yield document
+            data, data_len, event = [], 0, ""
         elif text.startswith("data:"):
             data.append(text[5:].lstrip())
             data_len += len(line)
             if data_len > MAX_FRAME_BYTES:
                 raise ValueError(f"cp frame exceeds {MAX_FRAME_BYTES} bytes")
+        elif text.startswith("event:"):
+            event = text[6:].strip()
         # "id:" (epoch:sequence) and retry/comments carry no payload here.
-    return frames
 
 
 class GateReporter:
@@ -481,6 +495,349 @@ class GateReporter:
             return self._patch(revision, leg)
 
 
+class StateReporter:
+    """Pushes controller documents to CP (``/v2/workshop/state/<name>``) and
+    reads/streams Workshop state documents (including ``game-desired``,
+    ``game-ready``, and ``game-activity``).
+
+    Rides the gate reporter's credential (scopes ``workshop.gate``,
+    ``workshop.report``, and optionally ``workshop.read``/``workshop.game``):
+    transport failures raise so the caller keeps state fail-safe and retries.
+    """
+
+    STATE_STREAM_NAMES = ("game-desired", "game-ready", "game-activity")
+
+    def __init__(self, base_url: str, transport, timeout_s: float = EVENT_TIMEOUT_S):
+        self.base_url = base_url.rstrip("/")
+        self.transport = transport
+        self.timeout_s = timeout_s
+        self._lock = threading.Lock()
+        self._docs: dict[str, dict] = {}
+        self._cursor = 0
+        self._stream_live = False
+
+    def _cache_doc(self, name: str, document: dict) -> None:
+        if not isinstance(document, dict) or not isinstance(name, str) or not name:
+            return
+        with self._lock:
+            self._docs[name] = dict(document)
+            seq = document.get("seq")
+            if type(seq) is int and seq > self._cursor:
+                self._cursor = seq
+
+    def put(self, name: str, value) -> None:
+        url = self.base_url + "/v2/workshop/state/" + urllib.parse.quote(name, safe=":")
+        raw = self.transport.put_json(url, {"value": value}, timeout=self.timeout_s)
+        parsed = None
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = None
+        if isinstance(parsed, dict) and type(parsed.get("seq")) is int:
+            self._cache_doc(
+                name,
+                {
+                    "name": name,
+                    "value": value,
+                    "revision": parsed.get("revision"),
+                    "seq": parsed["seq"],
+                    "updatedAt": int(time.time() * 1000),
+                },
+            )
+        else:
+            with self._lock:
+                self._docs[name] = {
+                    "name": name,
+                    "value": value,
+                    "updatedAt": int(time.time() * 1000),
+                }
+
+    def get(self, names: tuple[str, ...] | list[str] | None = None) -> dict[str, dict]:
+        query = ""
+        if names:
+            query = "?names=" + urllib.parse.quote(",".join(names), safe=":,")
+        url = f"{self.base_url}/v2/workshop/state{query}"
+        raw = self.transport.get_json(
+            url, timeout=self.timeout_s, cap=MAX_FRAME_BYTES * 2
+        )
+        payload = json.loads(raw)
+        documents = payload.get("documents") if isinstance(payload, dict) else None
+        if not isinstance(documents, dict):
+            raise ValueError("cp workshop state answer misses documents")
+        with self._lock:
+            if names is not None:
+                for wanted in names:
+                    if wanted not in documents:
+                        self._docs.pop(wanted, None)
+            for name, doc in documents.items():
+                if isinstance(doc, dict):
+                    self._docs[name] = dict(doc)
+                    seq = doc.get("seq")
+                    if type(seq) is int and seq > self._cursor:
+                        self._cursor = seq
+            if names is not None:
+                return {k: dict(self._docs[k]) for k in names if k in self._docs}
+            return {k: dict(v) for k, v in self._docs.items()}
+
+    def doc(self, name: str, *, refresh: bool = False) -> dict | None:
+        if refresh:
+            return self.get((name,)).get(name)
+        with self._lock:
+            cached = self._docs.get(name)
+            live = self._stream_live
+        if cached is not None or live:
+            return dict(cached) if cached is not None else None
+        return self.get((name,)).get(name)
+
+    def read_state_stream(self, wake: threading.Event | None = None) -> bool:
+        """Follow ``/v2/workshop/state/events`` SSE and cache every state update."""
+        self.get(self.STATE_STREAM_NAMES)
+        with self._lock:
+            after = self._cursor
+            self._stream_live = True
+        url = f"{self.base_url}/v2/workshop/state/events?after={after}"
+        try:
+            for item in self.transport.stream_events(url, STREAM_IDLE_S):
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                self._cache_doc(name, item)
+                if wake is not None:
+                    wake.set()
+        finally:
+            with self._lock:
+                self._stream_live = False
+        return True
+
+    def run_state_stream(
+        self, stop: threading.Event, wake: threading.Event | None = None
+    ) -> None:
+        """Hold the Workshop state SSE stream open until stop; reconnect with backoff."""
+        delay = 1.0
+        while not stop.is_set():
+            try:
+                if self.read_state_stream(wake=wake):
+                    delay = 1.0
+            except Exception as error:
+                print(f"cp: state stream failed: {error!r}", file=sys.stderr)
+            stop.wait(delay)
+            delay = min(delay * 2, STREAM_RETRY_MAX_S)
+
+
+class WorkshopGameClient:
+    """Dispatches Workshop game lifecycle ops through CP and awaits SSE settlement."""
+
+    def __init__(
+        self,
+        base_url: str,
+        consumer_id: str,
+        generation: str,
+        transport,
+        *,
+        environment: str = "prod",
+        backend: str = "game",
+        timeout_s: float = EVENT_TIMEOUT_S,
+        clock=time.monotonic,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.consumer_id = consumer_id
+        self.generation = str(uuid.UUID(generation))
+        self.transport = transport
+        self.environment = environment
+        self.backend = backend
+        self.timeout_s = timeout_s
+        self._clock = clock
+
+    @classmethod
+    def from_env(
+        cls, env=os.environ, base_url=None, transport=None
+    ) -> "WorkshopGameClient | None":
+        token = (env.get("BLOCKFIELD_CP_GATE_TOKEN") or "").strip()
+        generation = (env.get("BLOCKFIELD_CP_WORKSHOP_GAME_GENERATION") or "").strip()
+        consumer_id = (
+            env.get("BLOCKFIELD_CP_WORKSHOP_GAME_CONSUMER_ID") or "ws-game"
+        ).strip()
+        base = (base_url or env.get("BLOCKFIELD_CP_URL") or "").strip().rstrip("/")
+        if not token or not generation or not base or not consumer_id:
+            return None
+        if transport is None:
+            _check_cp_url(base)
+            transport = _UrllibTransport(token)
+        return cls(
+            base,
+            consumer_id,
+            generation,
+            transport,
+            environment=(env.get("BLOCKFIELD_CP_ENVIRONMENT") or "prod").strip(),
+            backend=(env.get("BLOCKFIELD_CP_BACKEND") or "game").strip(),
+        )
+
+    def command(
+        self,
+        game_op: str,
+        *,
+        job: str | None = None,
+        expires_in_s: int = 60,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        body: dict = {
+            "idempotencyKey": idempotency_key or str(uuid.uuid4()),
+            "environment": self.environment,
+            "backend": self.backend,
+            "consumerId": self.consumer_id,
+            "generation": self.generation,
+            "gameOp": game_op,
+            "expiresInSeconds": int(expires_in_s),
+        }
+        if job is not None:
+            body["job"] = str(uuid.UUID(job))
+        raw = self.transport.post_json(
+            f"{self.base_url}/v2/workshop/game", body, timeout=self.timeout_s
+        )
+        receipt = json.loads(raw)
+        op_id = receipt.get("operationId") if isinstance(receipt, dict) else None
+        if not isinstance(op_id, str) or not op_id:
+            raise ValueError("cp workshop.game receipt misses operationId")
+        events_url = f"{self.base_url}/v2/workshop/game/{op_id}/events"
+        deadline = self._clock() + float(expires_in_s) + 5.0
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"workshop game {game_op} timed out waiting for settlement"
+                )
+            for event in self.transport.stream_events(
+                events_url, min(STREAM_IDLE_S, max(1.0, remaining))
+            ):
+                if isinstance(event, dict) and event.get("operationId") == op_id:
+                    if event.get("state") == "effective" and event.get("code") == "ok":
+                        return event
+                    raise RuntimeError(
+                        f"workshop game {game_op} failed: state={event.get('state')} "
+                        f"code={event.get('code')} output={event.get('output')}"
+                    )
+
+
+DEFAULT_READY_TTL_MS = 60_000
+
+
+def parse_game_desired(doc: dict | None, *, allowed_profiles: set[str]) -> dict | None:
+    """Validate CP ``game-desired`` envelope or raw selection doc."""
+    if doc is None:
+        return None
+    if not isinstance(doc, dict):
+        raise ValueError("invalid game-desired state")
+    data = doc.get("value") if "value" in doc and "name" in doc else doc
+    if not isinstance(data, dict):
+        raise ValueError("invalid game-desired state")
+    if data.get("selected") is None and set(data) <= {"schema", "selected"}:
+        return None
+    if (
+        data.get("schema") != 1
+        or data.get("profile") not in allowed_profiles
+        or not isinstance(data.get("release"), str)
+        or not data["release"].strip()
+    ):
+        raise ValueError("invalid game-desired state")
+    uuid.UUID(data.get("generation"))
+    if data.get("session") is not None:
+        uuid.UUID(data["session"])
+    return dict(data)
+
+
+def parse_game_ready(
+    doc: dict | None,
+    *,
+    allowed_profiles: set[str],
+    now_ms: int | None = None,
+    ready_ttl_ms: int | None = DEFAULT_READY_TTL_MS,
+) -> tuple[dict | None, bool | None]:
+    """Validate CP ``game-ready`` state doc; returns ``(ready, running)``; unknown is ``None``."""
+    if not isinstance(doc, dict):
+        return None, None
+    data = doc.get("value") if "value" in doc else doc
+    if not isinstance(data, dict):
+        return None, None
+    if data.get("schema") != 1 or type(data.get("running")) is not bool:
+        return None, None
+    running = data["running"]
+    profile = data.get("profile")
+    release = data.get("release")
+    generation = data.get("generation")
+    session = data.get("session")
+    updated = (
+        doc.get("updatedAt")
+        if type(doc.get("updatedAt")) is int
+        else data.get("updatedAt")
+    )
+    try:
+        if profile not in allowed_profiles:
+            return None, None
+        if not isinstance(release, str) or not release.strip():
+            return None, None
+        if generation is not None and str(uuid.UUID(generation)) != generation:
+            return None, None
+        if profile == "game":
+            if session is not None:
+                return None, None
+        elif str(uuid.UUID(session)) != session:
+            return None, None
+        if type(updated) is not int:
+            return None, None
+    except (ValueError, TypeError, AttributeError):
+        return None, None
+    fresh = True
+    if ready_ttl_ms is not None and now_ms is not None:
+        age = now_ms - updated
+        fresh = -5000 <= age <= ready_ttl_ms
+    if not fresh:
+        return None, None
+    if not running:
+        return None, False
+    return {
+        "profile": profile,
+        "generation": generation,
+        "session": session,
+        "release": release,
+    }, True
+
+
+def parse_game_activity(doc: dict | None) -> dict | None:
+    """Validate CP ``game-activity`` doc; None keeps the editor awake."""
+    if not isinstance(doc, dict):
+        return None
+    data = doc.get("value") if "value" in doc else doc
+    if (
+        not isinstance(data, dict)
+        or data.get("schema") != 1
+        or not isinstance(data.get("generation"), str)
+        or not data["generation"]
+        or type(data.get("players")) is not int
+        or type(data.get("busy")) is not bool
+        or type(data.get("updatedAt")) is not int
+    ):
+        return None
+    return dict(data)
+
+
+@contextmanager
+def cp_saves_held(game_client: WorkshopGameClient):
+    """Hold Workshop autosave off and flush chunks via CP agent ops during hot snapshot."""
+    game_client.command("save-on")
+    try:
+        game_client.command("save-off")
+        game_client.command("save-flush")
+        yield
+    finally:
+        try:
+            game_client.command("save-on")
+        except Exception:
+            game_client.command("save-on")
+
+
 class CPClient:
     """Durable v2 subscriber: snapshot, addressed apply, generation ACKs."""
 
@@ -496,6 +853,48 @@ class CPClient:
         self.transport = transport or _UrllibTransport(config.token)
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._state: dict | None = None
+        # Frames pushed by the stream thread, applied on the loop thread.
+        self._frames: deque = deque()
+        self._held: list = []
+        self._snapshot_due = False
+        self.wake = threading.Event()
+
+    def has_pending(self) -> bool:
+        return bool(self._frames or self._held)
+
+    def run_stream(self, stop: threading.Event) -> None:
+        """Hold the agent SSE stream open until stop; reconnect with backoff."""
+        delay = 1.0
+        while not stop.is_set():
+            try:
+                if self.read_stream():
+                    delay = 1.0
+            except Exception as error:
+                print(f"cp: event stream failed: {error!r}", file=sys.stderr)
+            stop.wait(delay)
+            delay = min(delay * 2, STREAM_RETRY_MAX_S)
+
+    def read_stream(self) -> bool:
+        """One SSE connection from the durable cursor; queue frames as they
+        arrive and wake the loop. False when a snapshot must come first (the
+        loop thread takes it in sync)."""
+        state = self._load_state()
+        epoch, cursor = state.get("epoch"), state.get("cursor")
+        if not epoch or type(cursor) is not int or self._snapshot_due:
+            self._snapshot_due = True
+            self.wake.set()
+            return False
+        try:
+            for frame in self.transport.stream_events(
+                self.config.events_url(epoch, cursor), STREAM_IDLE_S
+            ):
+                self._frames.append(frame)
+                self.wake.set()
+        except SnapshotRequired:
+            self._snapshot_due = True
+            self.wake.set()
+            return False
+        return True
 
     @property
     def _state_file(self) -> Path:
@@ -720,7 +1119,7 @@ class CPClient:
             delivered["seq"] == marker["seq"] and delivered["nonce"] == marker["nonce"]
         )
 
-    def _nack(self, frame, state) -> tuple[int, int]:
+    def _nack(self, frame, state, controller=None) -> tuple[int, int]:
         """Best-effort rejected receipt for an unauthenticatable frame.
 
         Returns (rejected, acked). The local cursor advances only past a
@@ -743,6 +1142,7 @@ class CPClient:
             )
         except OSError:
             return 0, 0
+        _report_result(controller, operation_id, error=ValueError(result))
         try:
             self._post_ack(frame, "rejected", result)
         except Exception:
@@ -774,11 +1174,16 @@ class CPClient:
                     raise
 
     def sync(self, controller) -> dict:
-        """One bounded pass: snapshot if needed, apply addressed frames, ACK.
+        """One pass over the frames the stream pushed: apply, ACK, report.
 
         Never raises for per-operation failures; a transport failure raises
-        so the caller can log it without blocking reconciliation.
+        so the caller can log it without blocking reconciliation. Frames a
+        pass must hold (lock contention, undelivered gate leg) stay queued
+        for the next pass.
         """
+        if self._snapshot_due:
+            self._snapshot_due = False
+            self.snapshot()
         state = self._ensure_state()
         pending = state.get("releases") or []
         if pending:
@@ -789,25 +1194,17 @@ class CPClient:
                 # release.select operation carries its own ACK, so a bad
                 # snapshot entry must not block other operations.
                 pass
-        try:
-            _, frames = self.transport.get_events(
-                self.config.events_url(state["epoch"], state["cursor"]),
-                timeout=self.config.poll_timeout_s,
-            )
-        except SnapshotRequired:
-            state = self.snapshot()
-            _, frames = self.transport.get_events(
-                self.config.events_url(state["epoch"], state["cursor"]),
-                timeout=self.config.poll_timeout_s,
-            )
+        frames, self._held = self._held, []
+        while self._frames:
+            frames.append(self._frames.popleft())
         applied = rejected = acked = 0
-        for frame in frames:
+        for index, frame in enumerate(frames):
             operation, state = self._validated_operation(frame, state, controller)
             if operation is None:
                 # Unauthenticatable frame (foreign audience, stale generation
                 # or epoch, expired, hash mismatch): never execute, but still
                 # nack by envelope id so the stream can move on.
-                delta_rejected, delta_acked = self._nack(frame, state)
+                delta_rejected, delta_acked = self._nack(frame, state, controller)
                 rejected += delta_rejected
                 acked += delta_acked
                 continue
@@ -894,11 +1291,12 @@ class CPClient:
                 # store itself can fail after a commit — thread 4507741042 —
                 # so the hold must not depend on one succeeding here.)
                 break
-            except Exception:
+            except Exception as error:
                 # Rejected, cursor advances: schema violations and permanent
                 # local I/O failures (anything but lock contention) alike. A
                 # terminal receipt is stored first, so a same-op retry replays
                 # instead of re-applying a never-started op.
+                _report_result(controller, operation_id, error=error)
                 try:
                     self._store_receipt(
                         operation_id,
@@ -916,6 +1314,7 @@ class CPClient:
                 rejected += 1
                 acked += 1
             else:
+                _report_result(controller, operation_id, result)
                 # Fail-closed gate delivery: a members/gate op whose leg is
                 # still undelivered is never ACKed effective. Hold the cursor
                 # and retry the whole pass later (like lock contention above),
@@ -976,7 +1375,21 @@ class CPClient:
                 acked += 1
             state["cursor"] = max(state["cursor"], sequence)
             self._store_state()
+        else:
+            index = len(frames)
+        # Held frames (and everything after them) retry on the next pass.
+        self._held = frames[index:]
+        flush = getattr(controller, "flush_reports", None)
+        if callable(flush):
+            flush()
         return {"applied": applied, "rejected": rejected, "acked": acked}
+
+
+def _report_result(controller, operation_id, outcome=None, error=None) -> None:
+    """Stage the site-facing result of one operation (controller.cp_result)."""
+    report = getattr(controller, "cp_result", None)
+    if callable(report):
+        report(operation_id, outcome, error)
 
 
 RENEW_MAX_LEAD_S = 7 * 86400

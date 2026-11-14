@@ -1,12 +1,12 @@
 """Map candidates: workshop snapshot -> review -> publish/reject -> rollback."""
 
+import cp_fixtures
 from release_fixtures import catalog
 
 import json
 import os
 import shutil
 import tempfile
-import time
 import zipfile
 import unittest
 from contextlib import contextmanager
@@ -232,20 +232,14 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.publish("0" * 32, ACTOR)
 
-    def test_inbox_kinds_reach_the_store_and_export_for_the_site(self):
-        state, admin, inbox = (
-            self.root / "state",
-            self.root / "admin",
-            self.root / "inbox",
-        )
-        inbox.mkdir()
+    def test_cp_map_operations_reach_the_store_and_export_for_the_site(self):
+        state, admin = self.root / "state", self.root / "admin"
         controller = Controller(
             state,
             FakeBackend(),
             gate_file=self.root / "gate.json",
             public_file=self.root / "public.json",
             admin_dir=admin,
-            inbox_dir=inbox,
             maps=self.store,
             releases=catalog(),
         )
@@ -254,22 +248,12 @@ class CandidateTests(unittest.TestCase):
         controller.step()
         controller.backend.ready(Goal(**controller.status()["desired"]))
         controller.step()
-        request_id = str(uuid4())
-        document = {
-            "schema": 1,
-            "id": request_id,
-            "kind": "candidate",
-            "mapId": "konstaxa",
-            "actor": ACTOR,
-            "createdAt": int(time.time() * 1000),
-        }
-        (inbox / f"{request_id}.json").write_text(json.dumps(document))
-        self.assertEqual(controller.process_inbox(), 1)
-        self.assertTrue(
-            json.loads((admin / "results" / f"{request_id}.json").read_text())["ok"]
-        )
+        result = cp_fixtures.apply(controller, "candidate", ACTOR, mapId="konstaxa")
+        self.assertTrue(result["ok"], result)
         exported = json.loads((admin / "candidates.json").read_text())
         self.assertEqual(exported["candidates"][0]["author"], ACTOR)
+        reported = controller.state_reporter.docs["candidates"]
+        self.assertEqual(reported, exported)
 
 
 class ChownTreeRaceTests(unittest.TestCase):
