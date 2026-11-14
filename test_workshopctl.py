@@ -4,7 +4,6 @@ import io
 import json
 import os
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -80,8 +79,6 @@ class WorkshopctlTests(unittest.TestCase):
                     str(self.root / "public" / "public.json"),
                     "--admin-dir",
                     str(self.root / "admin"),
-                    "--inbox-dir",
-                    str(self.root / "inbox"),
                     *argv,
                 ],
                 lambda: self.backend,
@@ -175,101 +172,74 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertEqual((code, state["phase"]), (0, "STARTING"))
         self.assertIn("fence", self.backend.events)
 
-    def test_step_applies_inbox_before_reconcile(self):
+    def test_step_reconciles_and_flushes_cp_state(self):
         self.ctl("request", "game", "--release", "v1.0.0")
-        self.ctl("request", "game", "--release", "v1.0.0")
-        self.ctl("step")
-        self.ready_editor()
-        request_id = str(uuid4())
-        (self.root / "inbox").mkdir()
-        (self.root / "inbox" / f"{request_id}.json").write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "id": request_id,
-                    "kind": "mode",
-                    "actor": {"draslId": DRASL, "name": "Nether"},
-                    "createdAt": int(time.time() * 1000),
-                    "profile": "workshop",
-                    "expectedRevision": 1,
-                }
-            )
-        )
-        code, state = self.ctl("step")
-        self.assertEqual(
-            (code, state["phase"], state["operation"]), (0, "STARTING", request_id)
-        )
-        self.assertTrue(
-            json.loads(
-                (self.root / "admin" / "results" / f"{request_id}.json").read_text()
-            )["ok"]
-        )
-        self.assertEqual(
-            json.loads((self.root / "admin" / "status.json").read_text())["phase"],
-            "STARTING",
-        )
+        reported = []
 
-    def test_inbox_failure_does_not_block_reconcile(self):
-        self.ctl("request", "game", "--release", "v1.0.0")
-        original = workshopctl.Controller.process_inbox
+        class StubStateReporter:
+            def __init__(self, base_url, transport):
+                self.base_url = base_url
+                self.transport = transport
 
-        def broken(controller):
-            raise RecursionError("boom")
+            def put(self, name, value):
+                reported.append((name, value))
 
-        workshopctl.Controller.process_inbox = broken
-        self.addCleanup(setattr, workshopctl.Controller, "process_inbox", original)
-        code, state = self.ctl("step")
-        self.assertEqual((code, state["phase"]), (0, "STARTING"))
-        gate = json.loads((self.root / "gate/gate.json").read_bytes())
-        self.assertEqual(gate["backends"]["game"]["gate"], "public")
+        class StubGateReporter:
+            base_url = "https://cp.invalid"
+            transport = mock.Mock()
 
-    def test_step_runs_cp_sync_when_configured(self):
-        self.ctl("request", "game", "--release", "v1.0.0")
-        calls = []
+            @classmethod
+            def from_env(cls, env, base_url=None):
+                return cls()
 
-        class FakeSync:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def sync(self, controller):
-                calls.append(controller)
-                return {"applied": 0, "rejected": 0, "acked": 0}
+            def report(self, leg):
+                reported.append(("gate", leg))
 
         with (
             mock.patch.dict(
                 os.environ,
                 {
                     "BLOCKFIELD_CP_URL": "https://cp.invalid",
-                    "BLOCKFIELD_CP_AGENT_ID": "workshop-test",
-                    "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                    "BLOCKFIELD_CP_GATE_TOKEN": "gate-tok",
                 },
             ),
-            mock.patch("cp_client.CPClient", FakeSync),
+            mock.patch("cp_client.GateReporter", StubGateReporter),
+            mock.patch("cp_client.StateReporter", StubStateReporter),
         ):
             code, state = self.ctl("step")
         self.assertEqual((code, state["phase"]), (0, "STARTING"))
-        self.assertEqual(len(calls), 1)
+        self.assertTrue(any(name == "status" for name, _ in reported))
 
     def test_cp_failure_does_not_block_reconcile(self):
         self.ctl("request", "game", "--release", "v1.0.0")
 
-        class BrokenSync:
+        class BrokenReporter:
+            base_url = "https://cp.invalid"
+            transport = mock.Mock()
+
             def __init__(self, *args, **kwargs):
                 pass
 
-            def sync(self, controller):
-                raise RecursionError("boom")
+            @classmethod
+            def from_env(cls, env, base_url=None):
+                return cls()
+
+            def report(self, leg):
+                raise RuntimeError("gate down")
+
+            def put(self, name, value):
+                raise RuntimeError("state down")
 
         with (
             mock.patch.dict(
                 os.environ,
                 {
                     "BLOCKFIELD_CP_URL": "https://cp.invalid",
-                    "BLOCKFIELD_CP_AGENT_ID": "workshop-test",
-                    "BLOCKFIELD_CP_AGENT_TOKEN": "t",
+                    "BLOCKFIELD_CP_GATE_TOKEN": "gate-tok",
                 },
             ),
-            mock.patch("cp_client.CPClient", BrokenSync),
+            mock.patch("cp_client.GateReporter", BrokenReporter),
+            mock.patch("cp_client.StateReporter", BrokenReporter),
         ):
             code, state = self.ctl("step")
         self.assertEqual((code, state["phase"]), (0, "STARTING"))
@@ -458,7 +428,7 @@ class WorkshopctlTests(unittest.TestCase):
         self.assertIsNone(result["expectedHead"])
         self.assertFalse((self.root / "active/custom_arena/head.json").exists())
         self.assertEqual(source.read_bytes(), b"source retained")
-        catalog = json.loads((self.root / "admin/maps.json").read_bytes())["maps"]
+        catalog = workshopctl._map_store(os.environ, self.backend).catalog()
         self.assertEqual(
             next(
                 entry["kind"] for entry in catalog if entry["mapId"] == "custom_arena"
@@ -622,7 +592,6 @@ class WorkshopctlTests(unittest.TestCase):
             gate_file=str(self.root / "gate" / "gate.json"),
             public_file=str(self.root / "public" / "public.json"),
             admin_dir=str(self.root / "admin"),
-            inbox_dir=str(self.root / "inbox"),
         )
         controller, _ = workshopctl.build_controller(
             dict(os.environ), lambda: self.backend, **kwargs
@@ -644,7 +613,6 @@ class WorkshopctlTests(unittest.TestCase):
             gate_file=str(self.root / "gate" / "gate.json"),
             public_file=str(self.root / "public" / "public.json"),
             admin_dir=str(self.root / "admin"),
-            inbox_dir=str(self.root / "inbox"),
         )
         controller, _ = workshopctl.build_controller(
             dict(os.environ), lambda: self.backend, **kwargs
@@ -717,7 +685,6 @@ class WorkshopctlTests(unittest.TestCase):
             gate_file=str(self.root / "gate" / "gate.json"),
             public_file=str(self.root / "public" / "public.json"),
             admin_dir=str(self.root / "admin"),
-            inbox_dir=str(self.root / "inbox"),
         )
         controller, _ = workshopctl.build_controller(
             dict(os.environ), lambda: self.backend, **kwargs

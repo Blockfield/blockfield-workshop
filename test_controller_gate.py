@@ -363,9 +363,11 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.public("game")["mode"], "game")
 
     def test_unobserved_game_preserves_status_game_entry(self):
-        # Site admin reads status.json, not the gate: an unobserved Game with
+        # Site admin reads status via CP state: an unobserved Game with
         # a preserved public entry must still report game/public there, or the
         # admin shows "readiness unconfirmed" while a match runs (site#82).
+        import cp_fixtures
+
         controller = Controller(
             self.dir / "state2",
             self.backend,
@@ -374,6 +376,7 @@ class GateTests(unittest.TestCase):
             admin_dir=self.dir / "admin",
             releases=catalog(),
         )
+        controller.state_reporter = cp_fixtures.Reporter()
         self.backend.processes = []
         controller.gate_file.write_text(
             json.dumps(
@@ -404,7 +407,8 @@ class GateTests(unittest.TestCase):
         controller.request(str(uuid4()), self.goal, 0)
         self.backend.fail_start = True
         self.assertEqual(controller.step()["phase"], "ERROR")
-        status = json.loads((self.dir / "admin" / "status.json").read_text())
+        controller.flush_reports()
+        status = controller.state_reporter.docs["status"]
         self.assertEqual(
             status["game"], {"phase": "game", "gate": "public", "release": None}
         )

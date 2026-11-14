@@ -1,10 +1,10 @@
 """Real controller session preparation and offline imports, without starting a backend."""
 
+import cp_fixtures
 from release_fixtures import catalog
 
 import json
 import tempfile
-import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -168,9 +168,10 @@ class WorkshopSessionTests(unittest.TestCase):
             / "world/region/r.0.0.mca"
         )
         dirty.write_bytes(b"previous unsaved edits")
+        self.controller.state_reporter = cp_fixtures.Reporter()
         self.controller.export_maps()
-        catalog_path = self.root / "admin/maps.json"
-        catalog_before = json.loads(catalog_path.read_bytes())
+        self.controller.flush_reports()
+        catalog_before = self.controller.state_reporter.docs["maps"]
         copy_id = str(uuid4())
         with mock.patch.object(
             self.store, "checkout", side_effect=OSError("ENOSPC injected")
@@ -182,7 +183,8 @@ class WorkshopSessionTests(unittest.TestCase):
         self.assertEqual(self.backend.events, [])
         self.assertIsNone(self.store.session(copy_id))
         self.controller.export_maps()
-        self.assertEqual(json.loads(catalog_path.read_bytes()), catalog_before)
+        self.controller.flush_reports()
+        self.assertEqual(self.controller.state_reporter.docs["maps"], catalog_before)
 
         self.request(copy_id, ["lobby"])
         self.make_ready()
@@ -190,7 +192,8 @@ class WorkshopSessionTests(unittest.TestCase):
         self.assertEqual(self.controller.status()["phase"], "workshop")
         self.assertEqual(dirty.read_bytes(), b"previous unsaved edits")
         self.controller.export_maps()
-        catalog = json.loads(catalog_path.read_bytes())
+        self.controller.flush_reports()
+        catalog = self.controller.state_reporter.docs["maps"]
         self.assertIn(copy_id, {session["id"] for session in catalog["sessions"]})
         for entry in catalog["maps"]:
             self.assertIn("snapshots", entry)
@@ -268,19 +271,17 @@ class WorkshopSessionTests(unittest.TestCase):
         )
 
 
-class GitInboxTests(unittest.TestCase):
+class GitCpTests(unittest.TestCase):
     def setUp(self):
         WorkshopSessionTests.setUp(self)
-        self.inbox = self.root / "inbox"
-        self.inbox.mkdir()
         self.controller = Controller(
             self.root / "state",
             self.backend,
             maps=self.store,
             admin_dir=self.root / "admin",
-            inbox_dir=self.inbox,
             releases=catalog(),
         )
+        self.controller.state_reporter = cp_fixtures.Reporter()
         self.builder = {"draslId": "b" * 32, "name": "Builder"}
         self.admin = {"draslId": "a" * 32, "name": "Admin"}
         self.controller.set_members(
@@ -297,19 +298,8 @@ class GitInboxTests(unittest.TestCase):
     make_ready = WorkshopSessionTests.make_ready
 
     def send(self, kind, *, actor=None, **fields):
-        request_id = str(uuid4())
-        document = {
-            "schema": 1,
-            "id": request_id,
-            "kind": kind,
-            "actor": self.builder if actor is None else actor,
-            "createdAt": int(time.time() * 1000),
-            **fields,
-        }
-        (self.inbox / f"{request_id}.json").write_text(json.dumps(document))
-        self.assertEqual(self.controller.process_inbox(), 1)
-        return json.loads(
-            (self.root / "admin/results" / f"{request_id}.json").read_text()
+        return cp_fixtures.apply(
+            self.controller, kind, self.builder if actor is None else actor, **fields
         )
 
     def head(self):
@@ -879,7 +869,7 @@ class GitInboxTests(unittest.TestCase):
         ):
             result = self.send(**{"mapId": "arena", **removed})
             self.assertFalse(result["ok"])
-            self.assertIn("unknown kind", result["error"])
+            self.assertIn("unsupported cp operation kind", result["error"])
 
     def test_review_target_and_force_cannot_be_replaced_on_publish(self):
         self.region.write_bytes(b"edit")
@@ -1003,7 +993,8 @@ class GitInboxTests(unittest.TestCase):
         original = self.store.session(self.session["id"])
         newer = self.new_session()
         self.controller.export_maps()
-        catalog = json.loads((self.root / "admin/maps.json").read_text())
+        self.controller.flush_reports()
+        catalog = self.controller.state_reporter.docs["maps"]
         self.assertEqual(catalog["sessionsTotal"], 2)
         self.assertIsNone(catalog["sessionsNext"])
         first = self.send("sessions", offset=0, limit=1)
@@ -1113,15 +1104,6 @@ class GitInboxTests(unittest.TestCase):
         )
         self.assertFalse(big_publish["ok"])
         self.assertIn("unknown candidate", big_publish["error"])
-        big_candidate = self.send(
-            "candidate",
-            mapId="arena",
-            workingCopyId=self.session["id"],
-            note="oversized envelope",
-            resolutions=choices,
-        )
-        self.assertFalse(big_candidate["ok"])
-        self.assertIn("too large", big_candidate["error"])
         self.assertEqual(self.backend.events, [])
         self.assertEqual(self.store.versions.head("arena"), self.heads["arena"])
 

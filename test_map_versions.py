@@ -1,12 +1,13 @@
 """Map history, coherent SSD activation and isolated editable copies; no live backend."""
 
+import cp_fixtures
+
 from release_fixtures import catalog as release_catalog_fixture
 
 import json
 import os
 import shutil
 import stat
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -354,14 +355,12 @@ class MapVersionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sidecar"):
             self.candidate()
 
-    def test_real_inbox_snapshot_accept_and_targeted_rollback_export_history(self):
-        inbox, admin = self.root / "inbox", self.root / "admin"
-        inbox.mkdir()
+    def test_cp_snapshot_accept_and_targeted_rollback_export_history(self):
+        admin = self.root / "admin"
         controller = Controller(
             self.root / "state",
             FakeBackend(),
             admin_dir=admin,
-            inbox_dir=inbox,
             maps=self.store,
             releases=release_catalog_fixture(),
         )
@@ -372,18 +371,7 @@ class MapVersionTests(unittest.TestCase):
         controller.step()
 
         def send(kind, **data):
-            request_id = str(uuid4())
-            document = {
-                "schema": 1,
-                "id": request_id,
-                "kind": kind,
-                "actor": ACTOR,
-                "createdAt": int(time.time() * 1000),
-                **data,
-            }
-            (inbox / f"{request_id}.json").write_text(json.dumps(document))
-            self.assertEqual(controller.process_inbox(), 1)
-            result = json.loads((admin / "results" / f"{request_id}.json").read_text())
+            result = cp_fixtures.apply(controller, kind, ACTOR, **data)
             self.assertTrue(result["ok"], result["error"])
 
         send("candidate", mapId="konstaxa")
@@ -402,7 +390,7 @@ class MapVersionTests(unittest.TestCase):
             versionDigest=first["baseVersion"],
             expectedHead=first["versionDigest"],
         )
-        catalog = json.loads((admin / "maps.json").read_text())["maps"]
+        catalog = controller.state_reporter.docs["maps"]["maps"]
         restored = self.store.versions.read(
             "konstaxa", catalog[0]["head"]["versionDigest"]
         )
@@ -413,12 +401,10 @@ class MapVersionTests(unittest.TestCase):
         )
         self.assertEqual(len(catalog[0]["versions"]), 3)
         copy_id = str(uuid4())
-        send(
-            "checkout",
-            mapId="konstaxa",
-            versionDigest=catalog[0]["head"]["versionDigest"],
-            workingCopyId=copy_id,
-        )
+        with controller._locked():
+            self.store.checkout(
+                "konstaxa", catalog[0]["head"]["versionDigest"], copy_id
+            )
         self.clock[0] += 1
         controller.backend.ready(Goal(**controller.status()["desired"]))
         controller.step()

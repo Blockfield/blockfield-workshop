@@ -124,29 +124,34 @@ MAP_IDS = frozenset(json.loads(Path(__file__).with_name("map_ids.json").read_tex
 # Access scopes a builder's "maps" may name: every map plus the workshop hub itself (blockfield-mod WorkshopMembers.HUB).
 SCOPE_IDS = MAP_IDS | {"hub"}
 NAME = re.compile(r"[A-Za-z0-9_]{3,16}")
-INBOX_NAME = re.compile(r"[0-9a-f-]{36}\.json")
-INBOX_MAX_BYTES = 65536
-INBOX_MERGE_MAX_BYTES = 8 << 20
-INBOX_BATCH = 20
-INBOX_TTL_MS = 10 * 60 * 1000
 CP_RELEASE_LIMIT = 256
-CP_COVERED_INBOX_KINDS = frozenset({"members", "message", "wake", "cancel"})
-CP_INBOX_RETIRED_ERROR = "inbox retired: control-plane is the mutation ingress"
-RESULTS_KEPT = 200
+# Undelivered operation results kept while CP is unreachable.
+REPORTS_KEPT = 200
+# Every Workshop operation arrives as a CP agent event (coordination#64): the
+# site, proxy and release CI talk only to the control plane.
+CP_OPERATION_KINDS = (
+    "members",
+    "message",
+    "wake",
+    "cancel",
+    "release.select",
+    "map",
+    "sessions",
+    "ai-key",
+    "mode",
+)
 # Cold Workshop (unreleased section 2): the always-on editor sleeps after 15 min
 # with no builders and no active work, and wakes on demand through the proxy/site.
-ACTIVITY_FILE = ".blockfield-activity.json"
-ACTIVITY_MAX_BYTES = 16384
 ACTIVITY_FRESH_MS = 120 * 1000
 SLEEP_MESSAGE = "Мастерская спит — запустите её"
-# Inbox kinds that need a running Workshop today; refused while sleeping.
+# Map operations that need a running Workshop today; refused while sleeping.
 # candidate/commit work asleep too: sleep already saved and stopped the editor.
 LIVE_ONLY_KINDS = {
     "limbo-export",
     "map-create",
     "map-properties",
 }
-# Workshop AI key from the site inbox: <workshop data>/blockfield-workshop/openrouter.key,
+# Workshop AI key from a CP ai-key operation: <workshop data>/blockfield-workshop/openrouter.key,
 # 0600 1000:1000. The value is write-only: it never appears in logs, results or exports.
 AI_KEY_PATTERN = re.compile(r"[\x21-\x7e]{20,2048}")
 AI_KEY_UID = 1000
@@ -564,7 +569,7 @@ AI_PROVIDER_RESERVED_IDS = frozenset(
 
 
 def ai_provider_key_names(provider_id: str) -> tuple[str, str, str]:
-    """Key file name, admin status name and inbox kind for any registry provider id."""
+    """Key file name, site status name and key kind for any registry provider id."""
     if provider_id in AI_PROVIDER_KEY_PRESETS:
         return AI_PROVIDER_KEY_PRESETS[provider_id]
     return (f"{provider_id}.key", f"{provider_id}-key.json", "ai-provider-key")
@@ -699,7 +704,6 @@ class Controller:
         public_file: Path | None = None,
         message: str = DEFAULT_MESSAGE,
         admin_dir: Path | None = None,
-        inbox_dir: Path | None = None,
         start_timeout: float = 600.0,
         idle_sleep_s: float = 900.0,
         now: Callable[[], float] | None = None,
@@ -709,10 +713,9 @@ class Controller:
         releases_path: Path | None = None,
         target_file: Path | None = None,
         desired_file: Path | None = None,
-        inbox_retired: bool = False,
     ):
         """A missed STARTING deadline restores a previous Workshop/test goal when available."""
-        # candidates.MapStore: workshop map snapshots, site review and publishing (inbox kinds below); optional.
+        # candidates.MapStore: workshop map snapshots, site review and publishing (CP map operations); optional.
         self.maps = maps
         self.start_timeout = start_timeout
         # Cold Workshop idle sleep: seconds of continuous idleness before the stable
@@ -748,23 +751,28 @@ class Controller:
         self.releases_path = Path(releases_path) if releases_path is not None else None
         self._releases_fingerprint = self._fingerprint_releases()
         self.default_message = message.strip()[:500] or DEFAULT_MESSAGE
+        # Exports the Workshop game server reads (members, session, candidates,
+        # workshop.key). The site and the release CI read CP state instead.
         self.admin_dir = Path(admin_dir) if admin_dir else None
-        self.inbox_dir = Path(inbox_dir) if inbox_dir else None
-        # S6b switch: CP-covered inbox kinds are denied closed (map ops stay).
-        self.inbox_retired = bool(inbox_retired)
         self.workshop_data_dir = (
             Path(workshop_data_dir) if workshop_data_dir is not None else None
         )
         if self.admin_dir:
-            (self.admin_dir / "results").mkdir(parents=True, exist_ok=True)
-            for path in (self.admin_dir, self.admin_dir / "results"):
-                os.chmod(path, 0o755)
+            self.admin_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.admin_dir, 0o755)
             ensure_workshop_key(self.admin_dir / "workshop.key")
+        # CP state documents (status, catalogs, op results) staged under the
+        # lock and delivered by flush_reports() outside it; the reporter is
+        # set by workshopctl.build_controller when CP is configured.
+        self.state_reporter = None
+        self._reports: dict[str, object] = {}
+        self._reported: dict[str, str] = {}
+        self._ai_keys_file = self.directory / "ai-keys.json"
         self.backend = backend
         base = self._workshop_data_base()
         if base is not None:
             # The AI sidecar is optional: an unusable key directory must not take
-            # the whole controller (wake, inbox, gate) down with it. Nothing is
+            # the whole controller (wake, CP operations, gate) down with it. Nothing is
             # written then; the sidecar must not be deployed until this passes.
             try:
                 ensure_ai_sidecar_key(base)
@@ -1348,6 +1356,7 @@ class Controller:
         )
         if self.admin_dir is not None:
             self._replace_if_changed(self.admin_dir / "session.json", session, keep=())
+        self._stage_report("session", session)
 
     def _session_selection(self, goal: Goal, session: dict | None = None) -> dict:
         session = session if session is not None else self.session()
@@ -1426,47 +1435,22 @@ class Controller:
         return None
 
     def _read_activity(self) -> dict | None:
-        """Latest mod activity report; None means not provably idle (fail-safe = awake).
+        """Latest Workshop activity report from CP/backend; None means not provably idle (fail-safe = awake)."""
+        from cp_client import parse_game_activity
 
-        The file lives in the Workshop app data dir on the host. Any problem --
-        missing, symlink, non-regular, oversized, unreadable, invalid JSON or schema
-        -- reads as activity, so a broken reporter never lets the editor sleep.
-        """
-        base = self._workshop_data_base()
-        if base is None:
-            return None
-        path = base / ACTIVITY_FILE
-        if path.is_symlink():
-            return None
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except OSError:
-            return None
-        with os.fdopen(fd, "rb") as handle:
+        probe = getattr(self.backend, "activity", None)
+        if callable(probe):
             try:
-                info = os.fstat(handle.fileno())
-            except OSError:
+                return parse_game_activity(probe())
+            except Exception:
                 return None
-            if not stat.S_ISREG(info.st_mode) or info.st_size > ACTIVITY_MAX_BYTES:
-                return None
-            data = handle.read(ACTIVITY_MAX_BYTES + 1)
-        if len(data) > ACTIVITY_MAX_BYTES:
+        reporter = getattr(self, "state_reporter", None)
+        if reporter is None:
             return None
         try:
-            document = json.loads(data)
-        except ValueError:
+            return parse_game_activity(reporter.doc("game-activity"))
+        except Exception:
             return None
-        if (
-            not isinstance(document, dict)
-            or document.get("schema") != 1
-            or not isinstance(document.get("generation"), str)
-            or not document["generation"]
-            or type(document.get("players")) is not int
-            or type(document.get("busy")) is not bool
-            or type(document.get("updatedAt")) is not int
-        ):
-            return None
-        return document
 
     def _readiness_generation(self) -> str | None:
         """Current Workshop readiness generation; None when unknown (fail-safe = awake)."""
@@ -1479,19 +1463,10 @@ class Controller:
             return None
         return generation if isinstance(generation, str) and generation else None
 
-    def _inbox_has_pending(self) -> bool:
-        """True unless the inbox provably holds no unanswered request."""
-        if not self.inbox_dir or not self.admin_dir:
-            return False
-        results = self.admin_dir / "results"
-        try:
-            names = os.listdir(self.inbox_dir)
-        except OSError:
-            return True
-        return any(
-            INBOX_NAME.fullmatch(name) and not (results / name).exists()
-            for name in names
-        )
+    def _cp_pending(self) -> bool:
+        """True while CP operations are queued but not yet applied."""
+        cp = getattr(self, "cp_client", None)
+        return cp is not None and cp.has_pending()
 
     def _activity_idle(
         self, state: dict, *, processes: list[Process] | None = None
@@ -1669,16 +1644,22 @@ class Controller:
         try:
             self._replace_if_changed(self.gate_file, gate_doc, keep=())
             self._replace_if_changed(self.public_file, public, keep=("since",))
+            members, session = self.members(), self.session()
             if self.admin_dir:
                 self._replace_if_changed(
-                    self.admin_dir / "members.json", self.members(), keep=()
+                    self.admin_dir / "members.json", members, keep=()
                 )
-                session = self.session()
                 if session is not None:
                     self._replace_if_changed(
                         self.admin_dir / "session.json", session, keep=()
                     )
-                status = {
+            self._stage_report("members", members)
+            if session is not None:
+                self._stage_report("session", session)
+            self._stage_report("ai-keys", self.ai_key_statuses())
+            self._stage_report(
+                "status",
+                {
                     "schema": 1,
                     "revision": state["revision"],
                     "operation": state.get("operation"),
@@ -1697,11 +1678,9 @@ class Controller:
                     else None,
                     "game": game_status,
                     "message": self.message,
-                    "updatedAt": int(time.time() * 1000),
-                }
-                self._replace_if_changed(
-                    self.admin_dir / "status.json", status, keep=("updatedAt",)
-                )
+                    "approvedTarget": state.get("approvedTarget"),
+                },
+            )
         except OSError:
             # The local gate never narrows: force it closed best effort (the
             # Game entry is preserved) so a narrowing change never waits on
@@ -2096,6 +2075,80 @@ class Controller:
             json.dumps(document, ensure_ascii=False, sort_keys=True).encode(),
             0o644,
         )
+
+    def _stage_report(self, name: str, value) -> None:
+        """Queue one CP state document; flush_reports() delivers it."""
+        if self.state_reporter is None:
+            return
+        self._reports[name] = value
+        results = [key for key in self._reports if key.startswith("result:")]
+        # A CP outage must not grow memory without bound: the oldest
+        # undelivered results go first (CP keeps the newest 200 anyway).
+        for key in results[: max(0, len(results) - REPORTS_KEPT)]:
+            del self._reports[key]
+
+    def flush_reports(self) -> None:
+        """Deliver staged CP documents; never raises, keeps failures staged.
+
+        Called outside the controller lock (entrypoint loop, CP sync) so a
+        slow CP never blocks reconciliation. Unchanged documents are skipped
+        by fingerprint; CP itself ignores an identical value too.
+        """
+        reporter = self.state_reporter
+        if reporter is None:
+            return
+        for name, value in list(self._reports.items()):
+            fingerprint = hashlib.sha256(
+                json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+            if self._reported.get(name) != fingerprint:
+                try:
+                    reporter.put(name, value)
+                except Exception as error:
+                    print(
+                        f"controller: cp state {name} not reported: {error!r}",
+                        file=sys.stderr,
+                    )
+                    return
+                if not name.startswith("result:"):
+                    self._reported[name] = fingerprint
+            if self._reports.get(name) is value:
+                del self._reports[name]
+
+    def cp_result(
+        self,
+        operation_id: str,
+        outcome: dict | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Stage the site-facing result of one CP operation (result:<id>).
+
+        Same envelope the site read from the old result files: ok/error, a
+        machine-readable refusal code when the failure carries one (coord#31),
+        the state revision or the operation payload.
+        """
+        result = {
+            "id": operation_id,
+            "ok": error is None,
+            "error": None if error is None else (str(error) or type(error).__name__),
+            "revision": None,
+            "doneAt": self._now_ms(),
+        }
+        code = getattr(error, "code", None)
+        if code is not None:
+            result["code"] = code
+        outcome = outcome or {}
+        revision = outcome.get("revision")
+        if type(revision) is int:
+            result["revision"] = revision
+        payload = outcome.get("payload")
+        if isinstance(payload, dict):
+            result["payload"] = payload
+            if payload.get("kind") in ("ai-key", "ai-gateway-key", "ai-provider-key"):
+                # The site reads the ai-key status flat (kind/set/last4/
+                # sha256Prefix/appliedAt) beside the uniform envelope.
+                result.update(payload)
+        self._stage_report(f"result:{operation_id}", result)
 
     def request(
         self,
@@ -2579,7 +2632,7 @@ class Controller:
         """Sleep the stable idle editor through the existing graceful save/stop path.
 
         True when the backend was stopped and the phase is now sleeping. Never sleeps
-        a transition, ERROR, test profile, pending release follow or inbox backlog;
+        a transition, ERROR, test profile, pending release follow or CP backlog;
         any missing/stale/foreign activity report keeps the editor awake.
         """
         if (
@@ -2587,7 +2640,7 @@ class Controller:
             or goal is None
             or goal.profile != "workshop"
             or state.get("releaseFollow") is not None
-            or self._inbox_has_pending()
+            or self._cp_pending()
         ):
             if state.get("idleSince") is not None:
                 state["idleSince"] = None
@@ -2776,7 +2829,7 @@ class Controller:
         return state
 
     def cancel(self, operation_id: str | None = None) -> dict:
-        """Unprivileged abort of a stuck switch (site -> inbox "cancel", no root): roll back now
+        """Unprivileged abort of a stuck switch (CP "cancel", no root): roll back now
         instead of waiting for the deadline. Only valid while a switch is actually in flight.
         With no previous stable profile (first-ever start, or a recover retry that never became
         ready) there is nothing to restore: fence anything half-started and park in ERROR so an
@@ -2835,7 +2888,7 @@ class Controller:
             )
 
     def wake(self, operation: str, actor: dict | None = None) -> dict:
-        """Idempotent wake of a sleeping editor (site/proxy inbox "wake", workshopctl wake).
+        """Idempotent wake of a sleeping editor (CP "wake" from the site or proxy, workshopctl wake).
 
         Sleeping restarts the same goal through the ordinary request path, so the next
         step starts it like any other switch (STARTING -> workshop) at the exact
@@ -2897,8 +2950,7 @@ class Controller:
 
         Records arrive in the agent snapshot or a release.select operation,
         over the mutually authenticated CP channel -- unlike releases.json,
-        which is an operator file, and unlike the inbox, whose fields are
-        self-asserted. Each record passes the same provenance validation as
+        which is an operator file. Each record passes the same provenance validation as
         the file catalog; a tag whose identity changed is refused.
         """
         if not isinstance(records, list) or len(records) > CP_RELEASE_LIMIT:
@@ -2906,11 +2958,13 @@ class Controller:
         validated = {}
         for entry in records:
             record = release_catalog.validate_release_record(entry)
-            release = record["release"]
-            known = validated.get(release, self.releases.get(release))
-            if known is not None and known != record:
-                raise ValueError("published release identity changed")
-            validated[release] = record
+            # Keyed by tag and image digest like the release CI catalog: the
+            # rollback path selects the previous release by its digest.
+            for release in (record["release"], record["imageDigest"].split("@", 1)[1]):
+                known = validated.get(release, self.releases.get(release))
+                if known is not None and known != record:
+                    raise ValueError("published release identity changed")
+                validated[release] = record
         # One commit point: a bad entry refuses the whole batch before
         # anything is mutated, persisted, or handed to the backend.
         merged = [release for release in validated if release not in self.releases]
@@ -2927,54 +2981,107 @@ class Controller:
         return merged
 
     def _apply_cp_release_select(self, operation_id: str, payload: dict) -> dict:
-        """Commit a central approved-release record; activation stays journal-bound."""
+        """Select a verified release for the Workshop (the release CI's step).
+
+        The record (when sent) merges into the catalog first. A stable editor
+        then switches to the release in its current session; a sleeping one
+        stages it and wakes onto it later. Any other phase refuses: a release
+        never forces a transition in flight.
+        """
         release = payload.get("release")
         if not isinstance(release, str) or not release:
             raise ValueError("invalid cp release selection")
         record = payload.get("record")
         if record is not None:
-            if not isinstance(record, dict) or record.get("release") != release:
+            if not isinstance(record, dict) or not _release_matches(release, record):
                 raise ValueError("cp release record does not match selection")
             self.apply_cp_releases([record])
         with self._locked():
-            resolved = self._select_release(release, self._read())
-        return {"kind": "release.select", "release": resolved["release"]}
+            state = self._read()
+            resolved = self._select_release(release, state)
+            desired = state.get("desired") or {}
+            if desired.get("release") == release:
+                return {
+                    "kind": "release.select",
+                    "revision": state["revision"],
+                    "payload": {"release": resolved["release"], "selected": False},
+                }
+            if state.get("phase") not in ("workshop", "sleeping"):
+                raise ValueError(
+                    "a release is selected only on a stable or sleeping workshop,"
+                    f" not {state.get('phase')}"
+                )
+            if desired.get("profile") != "workshop" or not desired.get("session"):
+                raise ValueError("release selection needs a current workshop session")
+            session_id = desired["session"]
+            previous = self.session()
+            archived = self.maps.session(session_id) if self.maps is not None else None
+            session = (
+                previous
+                if previous and previous.get("id") == session_id
+                else archived
+                if archived is not None
+                else {
+                    "schema": 1,
+                    "id": session_id,
+                    "maps": None,
+                    "startedAt": self._now_ms(),
+                    "startedBy": None,
+                }
+            )
+            session = {k: v for k, v in session.items() if k != "branches"}
+            state = self._request_locked(
+                operation_id,
+                Goal("workshop", release, session_id),
+                state["revision"],
+                session=session,
+                resume_only=archived is not None,
+            )
+        return {
+            "kind": "release.select",
+            "revision": state["revision"],
+            "payload": {"release": resolved["release"], "selected": True},
+        }
 
     def apply_cp_operation(
         self, operation_id: str, payload: dict, acl: list | None = None
     ) -> dict:
-        """Apply a CP-attested typed operation (unit CP-S6a).
+        """Apply a CP-attested typed operation (coordination#64).
 
         The payload actor/grantor is attested by the control plane: CP
-        authorized the human before committing the outbox row, and the
-        frame arrived over our mutually authenticated agent channel. This
-        is the opposite of the file inbox, whose ``actor`` field is
-        self-asserted and therefore never a grant authority (E4).
-        Unknown kinds are rejected, never blind-applied; map operations
-        stay inbox-only; release selection is release.select. The payload
-        target must be global or a resource this workshop serves, and scoped
-        members operations must not attest map ids.
+        authorized the issuer before committing the outbox row, and the
+        frame arrived over our mutually authenticated agent channel. The
+        actor must still be a Workshop member (admin for members and a
+        human release.select); map operations then check the actor's map
+        scope and role exactly as before. An actorless release.select comes
+        from the release CI principal; its record is verified against the
+        catalog. The payload target must be global or a resource this
+        workshop serves, and scoped members operations must not attest map
+        ids. Returns {kind, revision?, payload?, started?}.
         """
         UUID(operation_id)
         if not isinstance(payload, dict):
             raise ValueError("invalid cp operation")
         kind = payload.get("kind")
-        if kind not in ("members", "message", "wake", "cancel", "release.select"):
+        if kind not in CP_OPERATION_KINDS:
             raise ValueError(f"unsupported cp operation kind: {kind!r}"[:64])
         served = self._map_ids() | {"hub"}
         target = payload.get("target")
         if not isinstance(target, str) or (target != "*" and target not in served):
             raise ValueError("cp operation targets another resource")
+        if kind == "release.select" and "actor" not in payload:
+            return self._apply_cp_release_select(operation_id, payload)
         actor = payload.get("grantor") if kind == "members" else payload.get("actor")
         if not isinstance(actor, dict):
             raise ValueError("invalid cp actor")
         principal = member({**actor, "role": "builder"})
+        identity = {"draslId": principal["draslId"], "name": principal["name"]}
         if acl is None and kind in ("members", "release.select"):
             raise ValueError(f"cp {kind} requires a CP ACL snapshot")
         if acl is None:
             # No snapshot list (direct calls; sync always passes one): check
             # against the local members instead of skipping the check, so
-            # message/wake/cancel fail closed without an operator bootstrap.
+            # every kind fails closed without an operator bootstrap.
             acl = self.members()
         matches = [
             entry
@@ -3007,147 +3114,70 @@ class Controller:
                 # Map ids are outside any scoped grant: only a global op can attest them.
                 raise ValueError("members maps need a global target")
             self.set_members(entries)
-            return {"kind": "members", "count": len(entries)}
+            return {"kind": "members", "payload": {"count": len(entries)}}
         if kind == "message":
             self.set_message(payload.get("message"))
             return {"kind": "message"}
         if kind == "wake":
-            return self.wake(
-                operation_id,
-                {"draslId": principal["draslId"], "name": principal["name"]},
-            )
-        try:
+            woken = self.wake(operation_id, identity)
+            return {"kind": "wake", "started": woken["started"], "payload": woken}
+        if kind == "cancel":
+            try:
+                return {
+                    "kind": "cancel",
+                    "revision": self.cancel(operation_id=operation_id)["revision"],
+                }
+            except ValueError as error:
+                if "nothing to cancel" not in str(error):
+                    raise
+                # Idempotent retry: a previous pass already cancelled (its gate
+                # report may still be pending); a first-attempt no-op is a vacuous
+                # success, like a no-op wake.
+                return {"kind": "cancel", "revision": self._read()["revision"]}
+        if kind == "ai-key":
+            provider = payload.get("provider")
+            if (
+                type(provider) is not str
+                or AI_PROVIDER_ID.fullmatch(provider) is None
+                or (
+                    provider not in AI_PROVIDER_KEY_PRESETS
+                    and provider in AI_PROVIDER_RESERVED_IDS
+                )
+            ):
+                raise ValueError("invalid ai-provider-key request")
+            filename, status_name, key_kind = ai_provider_key_names(provider)
             return {
-                "kind": "cancel",
-                "revision": self.cancel(operation_id=operation_id)["revision"],
+                "kind": kind,
+                "payload": self._apply_ai_key(
+                    operation_id,
+                    payload,
+                    filename=filename,
+                    status_name=status_name,
+                    kind=key_kind,
+                ),
             }
-        except ValueError as error:
-            if "nothing to cancel" not in str(error):
-                raise
-            # Idempotent retry: a previous pass already cancelled (its gate
-            # report may still be pending); a first-attempt no-op is a vacuous
-            # success, like a no-op wake.
-            return {"kind": "cancel", "revision": self._read()["revision"]}
-
-    def process_inbox(self, now_ms: int | None = None) -> int:
-        """Apply admin requests from the site, oldest first; each one gets exactly one result file.
-
-        Returns the number of results written. Busy controller lock leaves the request for the next pass.
-        """
-        if not self.inbox_dir or not self.admin_dir:
-            return 0
-        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-        results = self.admin_dir / "results"
-        try:
-            # Separate lock: a concurrent manual step must not apply the same file twice.
-            with self._locked("inbox.lock"):
-                candidates = []
-                for name in os.listdir(self.inbox_dir):
-                    if not INBOX_NAME.fullmatch(name):
-                        continue
-                    if (results / name).exists():
-                        _remove(self.inbox_dir / name)
-                        continue
-                    try:
-                        candidates.append(
-                            (os.lstat(self.inbox_dir / name).st_mtime_ns, name)
-                        )
-                    except FileNotFoundError:
-                        pass
-                # The site renames complete files, so mtime approximates createdAt without reading every file.
-                pending = []
-                for _, name in sorted(candidates)[:INBOX_BATCH]:
-                    document, error = self._load_request(name)
-                    created = document.get("createdAt") if document else None
-                    pending.append(
-                        (created if type(created) is int else 0, name, document, error)
-                    )
-                pending.sort(key=lambda item: item[:2])
-                done = 0
-                for _, name, document, error in pending:
-                    request_id = name[: -len(".json")]
-                    actor, revision, payload = "?", None, None
-                    code = None
-                    try:
-                        if error:
-                            raise ValueError(error)
-                        actor = (
-                            member({**document.get("actor"), "role": "builder"})["name"]
-                            if isinstance(document.get("actor"), dict)
-                            else None
-                        )
-                        if actor is None:
-                            raise ValueError("invalid actor")
-                        if document.get("id") != request_id:
-                            raise ValueError("id does not match file name")
-                        if (
-                            self.inbox_retired
-                            and document.get("kind") in CP_COVERED_INBOX_KINDS
-                        ):
-                            raise ValueError(CP_INBOX_RETIRED_ERROR)
-                        # An operation already accepted (e.g. recovery step was busy) is finished, not expired.
-                        if (
-                            type(document.get("createdAt")) is not int
-                            or now_ms - document["createdAt"] > INBOX_TTL_MS
-                        ) and self.status().get("operation") != request_id:
-                            raise ValueError("request expired")
-                        applied = self._apply(request_id, document)
-                        if isinstance(applied, dict):
-                            payload = applied
-                        else:
-                            revision = applied
-                    except BlockingIOError:
-                        break
-                    except Exception as failure:
-                        error, revision = str(failure) or type(failure).__name__, None
-                        # Machine-readable refusal marker (coord#31): coded
-                        # failures (e.g. a stale working copy) carry their
-                        # code beside the human text, so the site keys its
-                        # recovery buttons off `code`, not the message.
-                        code = getattr(failure, "code", None)
-                    else:
-                        error = None
-                    result = {
-                        "id": request_id,
-                        "ok": error is None,
-                        "error": error,
-                        "revision": revision,
-                        "doneAt": now_ms,
-                    }
-                    if code is not None:
-                        result["code"] = code
-                    if payload is not None:
-                        result["payload"] = payload
-                        if isinstance(payload, dict) and payload.get("kind") in (
-                            "ai-key",
-                            "ai-gateway-key",
-                            "ai-provider-key",
-                        ):
-                            # The site contract reads the ai-key status flat
-                            # (kind/set/last4/sha256Prefix/appliedAt); the envelope
-                            # above stays untouched for uniform result polling.
-                            result.update(payload)
-                    atomic_write(
-                        results / name,
-                        json.dumps(result, ensure_ascii=False, sort_keys=True).encode(),
-                        0o644,
-                    )
-                    _remove(self.inbox_dir / name)
-                    done += 1
-                    kind = document.get("kind") if document else None
-                    print(
-                        f"inbox {request_id} kind={kind!r} actor={actor} "
-                        + ("ok" if error is None else f"error: {error}"),
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                self._prune_results(results)
-        except (BlockingIOError, FileNotFoundError):
-            return 0
-        return done
+        if kind == "map":
+            arguments = payload.get("args")
+            if not isinstance(arguments, dict) or {"kind", "actor"} & set(arguments):
+                raise ValueError("invalid cp map operation")
+            document = {**arguments, "kind": payload.get("mapOp"), "actor": identity}
+        else:
+            # sessions/mode: the same documents the former inbox carried.
+            document = {
+                key: value
+                for key, value in payload.items()
+                if key not in ("kind", "target", "actor")
+            }
+            document.update({"kind": kind, "actor": identity})
+        applied = self._apply(operation_id, document)
+        if isinstance(applied, dict):
+            return {"kind": kind, "payload": applied}
+        if type(applied) is int:
+            return {"kind": kind, "revision": applied}
+        return {"kind": kind}
 
     def export_maps(self) -> None:
-        """admin/candidates.json for the site: candidate list with status, backups per map."""
+        """Candidate list with status (admin/candidates.json for the game, CP for the site) and the map catalog."""
         if self.maps is None or not self.admin_dir:
             return
         for map_id in self.maps.retire_merged_overlays():
@@ -3196,9 +3226,11 @@ class Controller:
                         self.maps._write_meta(meta)
                 finally:
                     temporary.unlink(missing_ok=True)
+        candidates = self.maps.export()
         self._replace_if_changed(
-            self.admin_dir / "candidates.json", self.maps.export(), keep=()
+            self.admin_dir / "candidates.json", candidates, keep=()
         )
+        self._stage_report("candidates", candidates)
         sessions = self.maps.sessions()
         catalog = self.maps.catalog()
         selected = self.session()
@@ -3208,8 +3240,8 @@ class Controller:
                     entry["draft"] = self.maps.copy_properties(
                         entry["mapId"], selected["id"]
                     )
-        self._replace_if_changed(
-            self.admin_dir / "maps.json",
+        self._stage_report(
+            "maps",
             {
                 "schema": 1,
                 "maps": catalog,
@@ -3217,61 +3249,7 @@ class Controller:
                 "sessionsTotal": sessions["total"],
                 "sessionsNext": sessions["next"],
             },
-            keep=(),
         )
-
-    @staticmethod
-    def _prune_results(results: Path) -> None:
-        kept = []
-        for path in results.glob("*.json"):
-            try:
-                kept.append((path.stat().st_mtime_ns, path.name, path))
-            except FileNotFoundError:
-                pass
-        for _, _, old in sorted(kept, reverse=True)[RESULTS_KEPT:]:
-            old.unlink(missing_ok=True)
-
-    def _load_request(self, name: str) -> tuple[dict | None, str | None]:
-        try:
-            fd = os.open(
-                self.inbox_dir / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-            )
-        except OSError:
-            return None, "not a regular file"
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            os.close(fd)
-            return None, "not a regular file"
-        if info.st_size > INBOX_MERGE_MAX_BYTES:
-            os.close(fd)
-            return None, "request too large"
-        with os.fdopen(fd, "rb") as handle:
-            data = handle.read(INBOX_MAX_BYTES + 1)
-            if len(data) > INBOX_MAX_BYTES:
-                data += handle.read(INBOX_MERGE_MAX_BYTES + 1 - len(data))
-        if len(data) > INBOX_MERGE_MAX_BYTES:
-            return None, "request too large"
-        try:
-            from map_package import _json
-
-            document = _json(data)
-        except Exception:  # includes RecursionError from deeply nested input
-            return None, "request too large" if len(
-                data
-            ) > INBOX_MAX_BYTES else "invalid json"
-        if len(data) > INBOX_MAX_BYTES and (
-            not isinstance(document, dict)
-            or not isinstance(document.get("kind"), str)
-            or document.get("kind") != "publish"
-        ):
-            return None, "request too large"
-        if (
-            not isinstance(document, dict)
-            or type(document.get("schema")) is not int
-            or document["schema"] != 1
-        ):
-            return None, "unsupported schema"
-        return document, None
 
     def export_limbo(self, version: str) -> dict:
         if self.maps is None:
@@ -3560,7 +3538,7 @@ class Controller:
         status_name: str = "ai-key.json",
         kind: str = "ai-key",
     ) -> dict:
-        """Write-only workshop AI key from the site; null removes it.
+        """Write-only workshop AI key from a CP ai-key operation; null removes it.
 
         Runs under the controller lock. The key value never reaches logs, results,
         state or exceptions: only its last4/sha256 prefix leave this function.
@@ -3582,27 +3560,30 @@ class Controller:
                 raise ValueError("workshop data directory is not configured")
             stored = _write_ai_key_as_owner(base, filename, kind, key)
             applied_at = self._now_ms()
+            statuses = self.ai_key_statuses()
+            statuses[status_name] = {"schema": 1, **stored, "appliedAt": applied_at}
             atomic_write(
-                self.admin_dir / status_name,
-                json.dumps(
-                    {"schema": 1, **stored, "appliedAt": applied_at},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ).encode(),
-                0o644,
+                self._ai_keys_file,
+                json.dumps(statuses, ensure_ascii=False, sort_keys=True).encode(),
             )
+            self._stage_report("ai-keys", statuses)
             return {"kind": kind, **stored, "appliedAt": applied_at}
 
+    def ai_key_statuses(self) -> dict:
+        """Key status per site status name (set/last4/sha256Prefix/appliedAt), never the key."""
+        try:
+            value = json.loads(self._ai_keys_file.read_bytes()[:65536])
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
     def _apply(self, request_id: str, document: dict) -> int | dict | None:
+        """Map operations, sessions and mode switches (CP map/sessions/mode).
+
+        document is the operation in the former inbox shape: kind, the
+        CP-attested actor and the per-kind fields.
+        """
         kind = document.get("kind")
-        if kind == "wake":
-            actor = document.get("actor")
-            if not isinstance(actor, dict):
-                raise ValueError("invalid actor")
-            return self.wake(
-                request_id,
-                {"draslId": actor.get("draslId"), "name": actor.get("name")},
-            )
         if kind in LIVE_ONLY_KINDS and self.status().get("phase") == "sleeping":
             raise ValueError(SLEEP_MESSAGE)
         if kind in {"map-create", "map-properties"}:
@@ -3615,31 +3596,11 @@ class Controller:
                 return self.maps.sessions(
                     document.get("offset", 0), document.get("limit", 100)
                 )
-        if kind == "members":
-            entries = document.get("members")
-            if not isinstance(entries, list):
-                raise ValueError("members must be a list")
-            if not any(
-                member(entry, scopes=self._map_ids() | {"hub"})["role"] == "admin"
-                for entry in entries
-            ):
-                raise ValueError("members must keep at least one admin")
-            self.set_members(entries)
-            return None
-        if kind == "message":
-            self.set_message(document.get("message"))
-            return None
-        if kind == "cancel":
-            # An admin cancels a stuck Workshop transition without root.
-            # The inbox request id keys the compensation: a redelivered file
-            # after a committed cancel is a no-op, never a second fence.
-            return self.cancel(operation_id=request_id)["revision"]
         if kind in {
             "candidate",
             "publish",
             "reject",
             "rollback",
-            "checkout",
             "checkout-fresh",
             "export",
             "limbo-export",
@@ -3742,12 +3703,6 @@ class Controller:
                         )
                     elif kind == "reject":
                         result = self.maps.reject(document.get("candidateId"), actor)
-                    elif kind == "checkout":
-                        result = self.maps.checkout(
-                            document.get("mapId"),
-                            document.get("versionDigest"),
-                            document.get("workingCopyId"),
-                        )
                     elif kind == "export":
                         self.maps.archive_path(document.get("candidateId"))
                     elif kind == "compare":
@@ -3794,35 +3749,6 @@ class Controller:
                         )
             self.export_maps()
             return result
-        if kind == "ai-key":
-            return self._apply_ai_key(request_id, document)
-        if kind == "ai-gateway-key":
-            return self._apply_ai_key(
-                request_id,
-                document,
-                filename="gateway.key",
-                status_name="ai-gateway-key.json",
-                kind="ai-gateway-key",
-            )
-        if kind == "ai-provider-key":
-            provider = document.get("provider")
-            if (
-                type(provider) is not str
-                or AI_PROVIDER_ID.fullmatch(provider) is None
-                or (
-                    provider not in AI_PROVIDER_KEY_PRESETS
-                    and provider in AI_PROVIDER_RESERVED_IDS
-                )
-            ):
-                raise ValueError("invalid ai-provider-key request")
-            filename, status_name, _ = ai_provider_key_names(provider)
-            return self._apply_ai_key(
-                request_id,
-                document,
-                filename=filename,
-                status_name=status_name,
-                kind="ai-provider-key",
-            )
         if kind != "mode":
             raise ValueError("unknown kind")
         profile, expected, recover = (

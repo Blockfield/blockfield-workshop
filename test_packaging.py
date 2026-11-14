@@ -226,8 +226,6 @@ class PackagingFunctionalTests(unittest.TestCase):
             str(self.root / "public" / "public.json"),
             "--admin-dir",
             str(self.root / "admin"),
-            "--inbox-dir",
-            str(self.root / "inbox"),
             *command,
         ]
 
@@ -258,7 +256,6 @@ class PackagingFunctionalTests(unittest.TestCase):
             gate_file=str(self.root / "gate" / "gate.json"),
             public_file=str(self.root / "public" / "public.json"),
             admin_dir=str(self.root / "admin"),
-            inbox_dir=str(self.root / "inbox"),
         )
         entrypoint.run_loop.tick = 1234.0
         server = None

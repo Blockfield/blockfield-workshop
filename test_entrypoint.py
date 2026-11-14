@@ -26,7 +26,8 @@ def loop_env(**overrides):
 class RunLoopShutdownTests(unittest.TestCase):
     def fake_controller(self, phase="workshop"):
         controller = mock.Mock()
-        controller.process_inbox.return_value = None
+        controller.cp_client = None
+        controller.cp_renewer = None
         controller.step.return_value = {"phase": phase}
         return controller
 
@@ -95,7 +96,8 @@ class RunLoopShutdownTests(unittest.TestCase):
 class MainShutdownTests(unittest.TestCase):
     def test_sigterm_mid_run_shuts_down_and_returns_zero(self):
         controller = mock.Mock()
-        controller.process_inbox.return_value = None
+        controller.cp_client = None
+        controller.cp_renewer = None
         controller.step.return_value = {"phase": "workshop"}
         server = mock.Mock()
         handlers = {}

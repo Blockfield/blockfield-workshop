@@ -6,17 +6,16 @@
 #
 # Storage contract (contract §5): managed named volumes only. This file
 # declares no host path, socket, device, host namespace or extra capability.
-# The data interface behind workshop-data/templates/published (MapStore
-# directories, inbox, projections) is a separately approved dependency: until
-# it is supplied and verified, finish packaging/shadow evidence and keep
-# production on the host controller.
+# The controller consumes Workshop operations over Control Plane SSE, reads
+# and pushes state documents via CP state API, and controls the Workshop game
+# lifecycle through the Workshop game's CP consumer (ws-game) + the Dokploy
+# redeploy webhook.
 #
 # Image: built from this repository's Dockerfile, published as an immutable
 # digest; the application points at the fixed :approved tag which is moved
 # only after a verified release (same tag discipline as the Workshop app).
 # The controller needs no Dokploy API token: lifecycle goes through the
-# approved-tag registry move, the app deploy webhook and in-container
-# RCON/HTTP. RCON reaches the Workshop app over the private Dokploy network.
+# approved-tag registry move, the app deploy webhook and the Control Plane.
 services:
   controller:
     image: ghcr.io/blockfield/blockfield-workshop-controller:approved
@@ -43,7 +42,6 @@ services:
       BF_GATE_FILE: /state/gate/gate.json
       BF_PUBLIC_FILE: /state/public/public.json
       BF_ADMIN_DIR: /state/admin
-      BF_INBOX_DIR: /state/inbox
       BF_WORKSHOP_DATA: /data
       BF_LOCK_DIR: /locks
       BF_MAP_ARCHIVE_DIR: /data/history
@@ -54,24 +52,18 @@ services:
       BF_STEP_INTERVAL_S: 15
       BF_STEP_FOLLOW_S: 12
       BF_STEP_POLL_S: 2
+      BF_WORKSHOP_READY_TTL_S: 60
       BF_HEALTH_PORT: 8080
-      BF_WORKSHOP_RCON_HOST: blockfield-workshop
-      BF_WORKSHOP_RCON_PORT: 25575
-      # Secrets below come from Dokploy-managed secret files mounted into the
-      # container; their values never appear here, in logs or in state.
-      BF_WORKSHOP_RCON_PASSWORD_FILE: /run/secrets/workshop-rcon-password
     volumes:
       # Private controller state (read-write, controller only).
       - controller-state:/state
       # Workshop data and lifecycle receipts (single writer: this controller).
       - workshop-data:/data
-      # Backend lock directory (single writer proof, held beside Java life).
+      # Backend lock directory (single writer proof).
       - controller-locks:/locks
       # Established read-only inputs, verified before any handover.
       - workshop-templates:/templates:ro
       - workshop-published:/published:ro
-    secrets:
-      - workshop-rcon-password
 
 volumes:
   controller-state: {}
@@ -79,9 +71,3 @@ volumes:
   controller-locks: {}
   workshop-templates: {}
   workshop-published: {}
-
-secrets:
-  # Compose-client-side file resolution is docs-only here: verify at W07
-  # creation time that Dokploy actually supports secret-file mounts.
-  workshop-rcon-password:
-    file: /etc/blockfield/workshop-rcon-password

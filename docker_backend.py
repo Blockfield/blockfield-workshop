@@ -20,16 +20,23 @@ import subprocess
 import time
 from uuid import UUID, uuid4
 
-from controller import AI_PROVIDER_RESERVED_IDS, Goal, Process, atomic_write
+from controller import AI_PROVIDER_RESERVED_IDS, Goal, Process
+from cp_client import (
+    DEFAULT_READY_TTL_MS,
+    GateReporter,
+    StateReporter,
+    WorkshopGameClient,
+    cp_saves_held,
+    parse_game_activity,
+    parse_game_desired,
+    parse_game_ready,
+)
 import map_package
 
 # itzg runs `java ... -jar ./fabric-server-mc.1.21.1-loader.X-launcher.Y.jar`.
 JAVA_PATTERN = r"fabric-server-mc\..*-launcher\..*\.jar"
-RCON_COMMANDS = {
-    ("save-all", "flush"),
-    ("save-off",),
-    ("save-on",),
-}
+# Retained strictly for reading the main Game container until W4 migrates it;
+# Workshop readiness/selection use CP state (game-ready / game-desired).
 READY_FILE = ".blockfield-ready.json"
 UNKNOWN_SESSION = "00000000-0000-0000-0000-000000000000"
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
@@ -222,6 +229,10 @@ class DockerBackend:
         admin_readonly_dir: Path | str | None = None,
         ai_settings_dir: Path | str | None = None,
         ai_settings_readonly_dir: Path | str | None = None,
+        ready_ttl_ms: int | None = DEFAULT_READY_TTL_MS,
+        now_ms=None,
+        state_reporter: StateReporter | None = None,
+        game_client: WorkshopGameClient | None = None,
     ):
         if set(apps) != {"game", "workshop"} or not all(
             SERVICE.fullmatch(a.service) for a in apps.values()
@@ -262,6 +273,25 @@ class DockerBackend:
         )
         # candidates.MapStore (workshopctl wires it): extracts a candidate for the test profile.
         self.maps = None
+        self.ready_ttl_ms = ready_ttl_ms
+        self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self.state_reporter = state_reporter
+        self.game_client = game_client
+
+    def _require_state_reporter(self) -> StateReporter:
+        if self.state_reporter is None:
+            raise RuntimeError("CP state reporter is not configured")
+        return self.state_reporter
+
+    def _require_game_client(self) -> WorkshopGameClient:
+        if self.game_client is None:
+            raise RuntimeError("CP Workshop game client is not configured")
+        return self.game_client
+
+    def activity(self) -> dict | None:
+        if self.state_reporter is None:
+            return None
+        return parse_game_activity(self.state_reporter.doc("game-activity"))
 
     @staticmethod
     def app_of(profile: str) -> str:
@@ -270,6 +300,19 @@ class DockerBackend:
 
     @classmethod
     def from_env(cls, env=os.environ) -> "DockerBackend":
+        gate = GateReporter.from_env(env)
+        state_reporter = (
+            StateReporter(gate.base_url, gate.transport) if gate is not None else None
+        )
+        game_client = (
+            WorkshopGameClient.from_env(
+                env, base_url=gate.base_url, transport=gate.transport
+            )
+            if gate is not None
+            else None
+        )
+        ttl_raw = (env.get("BF_WORKSHOP_READY_TTL_S") or "").strip()
+        ready_ttl_ms = int(float(ttl_raw) * 1000) if ttl_raw else DEFAULT_READY_TTL_MS
         return cls(
             {
                 "game": App(
@@ -297,6 +340,9 @@ class DockerBackend:
             ),
             ai_settings_dir=env.get("BF_AI_SETTINGS_DIR") or None,
             ai_settings_readonly_dir=env.get("BF_AI_SETTINGS_READONLY_DIR") or None,
+            ready_ttl_ms=ready_ttl_ms,
+            state_reporter=state_reporter,
+            game_client=game_client,
         )
 
     # ------------------------------------------------------------------ commands
@@ -372,16 +418,6 @@ class DockerBackend:
                 image,
             ]:
                 return bool(IMAGE_ID.fullmatch(image))
-            case ["docker", "exec", container, "rcon-cli", *command]:
-                return bool(CONTAINER.fullmatch(container)) and (
-                    tuple(command) in RCON_COMMANDS
-                    or len(command) == 4
-                    and command[:3] == ["bf", "workshop", "export-limbo"]
-                    and re.fullmatch(
-                        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-                        command[3],
-                    )
-                )
             case ["pgrep", "-f", pattern]:
                 return pattern == JAVA_PATTERN
         return False
@@ -479,17 +515,10 @@ class DockerBackend:
             raise ValueError(
                 "one selected workshop container required for native export"
             )
-        self.run(
-            [
-                "docker",
-                "exec",
-                containers[0],
-                "rcon-cli",
-                "bf",
-                "workshop",
-                "export-limbo",
-                job,
-            ]
+        self._require_game_client().command(
+            "export-limbo",
+            job=job,
+            expires_in_s=max(60, min(300, int(self.stop_timeout))),
         )
 
     def containers(self, profile: str) -> list[str]:
@@ -564,8 +593,19 @@ class DockerBackend:
         return result
 
     def selection(self, profile: str = "workshop") -> dict | None:
-        """Profile the host selected; None only before the first controller start. Corrupt raises."""
+        """Profile the host/CP selected; None before first start. Corrupt raises."""
         app = self.app_of(profile)
+        if app == "workshop":
+            doc = self._require_state_reporter().doc("game-desired")
+            data = parse_game_desired(doc, allowed_profiles={"workshop", "test"})
+            if data is None:
+                return None
+            if data.get("modeId") is not None and (
+                data["profile"] != "test"
+                or data["modeId"] not in map_package.SUPPORTED_MODES
+            ):
+                raise ValueError("invalid selected test mode")
+            return data
         path = self.lock_dir / app / "profile.json"
         legacy = not path.exists()
         if legacy:
@@ -602,6 +642,16 @@ class DockerBackend:
         return data
 
     def readiness(self, profile: str) -> dict | None:
+        app = self.app_of(profile)
+        if app == "workshop":
+            doc = self._require_state_reporter().doc("game-ready")
+            ready, alive = parse_game_ready(
+                doc,
+                allowed_profiles={"workshop", "test"},
+                now_ms=self._now_ms(),
+                ready_ttl_ms=self.ready_ttl_ms,
+            )
+            return ready if alive else None
         try:
             data = json.loads(
                 (self.apps[profile].data / READY_FILE).read_bytes()[:16384]
@@ -639,33 +689,9 @@ class DockerBackend:
         return data
 
     def readiness_generation(self, profile: str) -> str | None:
-        """Generation in the app's readiness file; None when absent or invalid.
-
-        The controller compares the mod activity file against this so a stale or
-        foreign report (e.g. from before a restart) never counts as idleness.
-        """
-        path = self.apps[self.app_of(profile)].data / READY_FILE
-        if path.is_symlink():
-            return None
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-        except OSError:
-            return None
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16384:
-                return None
-            contents = os.read(fd, 16385)
-            if len(contents) > 16384:
-                return None
-            document = json.loads(contents)
-        except (OSError, UnicodeError, ValueError):
-            return None
-        finally:
-            os.close(fd)
-        if not isinstance(document, dict):
-            return None
-        generation = document.get("generation")
+        """Current Workshop generation from CP game-ready; None when absent/stale."""
+        ready = self.readiness(profile)
+        generation = ready.get("generation") if ready else None
         return generation if isinstance(generation, str) and generation else None
 
     @staticmethod
@@ -1321,78 +1347,21 @@ class DockerBackend:
             raise RuntimeError(f"several {profile} containers")
         return ids[0] if ids else None
 
-    def _rcon(self, profile: str, *command: str) -> str | None:
-        """None when the profile runs no java (nothing to drain or save)."""
-        profile = self.app_of(profile)
-        if profile == "game":
-            raise ValueError("Workshop controller cannot issue Game commands")
-        if self.inventory(tasks=False)[profile]["java"] == 0:
-            return None
-        container = self._container(profile)
-        if container is None:
-            raise RuntimeError(f"{profile} java without a container")
-        return self.run(["docker", "exec", container, "rcon-cli", *command])
-
     @contextmanager
     def workshop_saves_held(self):
-        """Hot snapshot: chunks are flushed and autosave is off while the copy runs, so builders stay
-        connected. The mod replaces markup files atomically; a stopped editor has nothing to hold.
-        Entry re-enables autosave first: a previous failed save-on (or a kill mid-snapshot)
-        otherwise leaves it off silently and the next save-off accepts "already turned off"."""
+        """Hot snapshot: chunks are flushed and autosave is off via CP agent ops."""
         if self.inventory(tasks=False)["workshop"]["java"] == 0:
             yield
             return
-        try:
-            result = self._rcon("workshop", "save-on")
-            if result is None or not any(
-                message in result
-                for message in (
-                    "Automatic saving is now enabled",
-                    "Saving is already turned on",
-                )
-            ):
-                raise RuntimeError("save-on did not confirm autosave enabled")
-            result = self._rcon("workshop", "save-off")
-            if result is None or not any(
-                message in result
-                for message in (
-                    "Automatic saving is now disabled",
-                    "Saving is already turned off",
-                )
-            ):
-                raise RuntimeError("save-off did not confirm autosave disabled")
-            result = self._rcon("workshop", "save-all", "flush")
-            if result is None or "Saved the game" not in result:
-                raise RuntimeError("save-all did not confirm success for live snapshot")
+        with cp_saves_held(self._require_game_client()):
             yield
-        finally:
-            # A timed-out save-off may still have reached Java; retry an
-            # unconfirmed save-on once, since it likely only missed the reply.
-            try:
-                result = self._rcon("workshop", "save-on")
-            except Exception:
-                result = None
-            if result is None or not any(
-                message in result
-                for message in (
-                    "Automatic saving is now enabled",
-                    "Saving is already turned on",
-                )
-            ):
-                result = self._rcon("workshop", "save-on")
-            if result is None or not any(
-                message in result
-                for message in (
-                    "Automatic saving is now enabled",
-                    "Saving is already turned on",
-                )
-            ):
-                raise RuntimeError("save-on did not confirm autosave restored")
 
     def _flush(self, profile: str) -> None:
-        result = self._rcon(profile, "save-all", "flush")
-        if result is not None and "Saved the game" not in result:
-            raise RuntimeError(f"save-all did not confirm success: {result}")
+        if self.app_of(profile) == "game":
+            raise ValueError("Workshop controller cannot issue Game commands")
+        if self.inventory(tasks=False)["workshop"]["java"] == 0:
+            return
+        self._require_game_client().command("save-flush")
 
     def save_and_freeze(self, process: Process) -> None:
         if process.goal.profile == "game":
@@ -1514,12 +1483,7 @@ class DockerBackend:
             document["modeId"] = goal.modeId
         selected_dir = self.lock_dir / self.app_of(goal.profile)
         selected_dir.mkdir(exist_ok=True)
-        atomic_write(
-            selected_dir / "profile.json",
-            json.dumps(document, sort_keys=True).encode(),
-            0o644,
-        )
-        (data / READY_FILE).unlink(missing_ok=True)
+        self._require_state_reporter().put("game-desired", document)
         image = self.game_image()
         if self.container_spec("workshop").get("Image") != image:
             self.run(

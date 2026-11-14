@@ -48,6 +48,9 @@ def playable(map_id="new_map", modes=None):
 class ZeroMapTests(unittest.TestCase):
     def setUp(self):
         fixtures.WorkshopSessionTests.setUp(self)
+        import cp_fixtures
+
+        self.controller.state_reporter = cp_fixtures.Reporter()
         self.controller.set_members([ACTOR | {"role": "admin"}])
         self.backend.events.clear()
         self.game = self.backend.processes[0]
@@ -554,7 +557,8 @@ class ZeroMapTests(unittest.TestCase):
         if os.name != "nt":
             self.assertTrue(config_path.stat().st_mode & stat.S_IWGRP)
         self.assertEqual(self.store.versions.head("arena"), head)
-        catalog = json.loads((self.root / "admin/maps.json").read_bytes())
+        self.controller.flush_reports()
+        catalog = self.controller.state_reporter.docs["maps"]
         entry = next(item for item in catalog["maps"] if item["mapId"] == "arena")
         self.assertEqual(entry["mapJson"]["name"], "arena")
         self.assertEqual(entry["draft"], {"workingCopyId": session, "name": "Renamed"})

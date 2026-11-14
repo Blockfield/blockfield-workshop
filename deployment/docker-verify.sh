@@ -25,14 +25,14 @@ for name in w04state w04data w04locks; do docker volume rm -f "$name" >/dev/null
 docker volume create w04state >/dev/null
 docker volume create w04data >/dev/null
 docker volume create w04locks >/dev/null
-printf 'dummy-rcon-password' >"$SECRETS/workshop-rcon-password"
+printf 'https://dokploy.invalid/api/app/deploy/dummy' >"$SECRETS/workshop-deploy-webhook-url"
 # Secret pointers: the entrypoint reads credentials only from these files.
-set -- -e BF_WORKSHOP_RCON_PASSWORD_FILE=/run/secrets/workshop-rcon-password
+set -- -e WORKSHOP_DEPLOY_WEBHOOK_URL_FILE=/run/secrets/workshop-deploy-webhook-url
 
 echo "== run entrypoint with Game off =="
 docker run -d --name w04ctl \
     -v w04state:/state -v w04data:/data -v w04locks:/locks \
-    -v "$SECRETS/workshop-rcon-password:/run/secrets/workshop-rcon-password:ro" \
+    -v "$SECRETS/workshop-deploy-webhook-url:/run/secrets/workshop-deploy-webhook-url:ro" \
     "$@" -e BF_STEP_INTERVAL_S=2 -e BF_STEP_FOLLOW_S=0 \
     -e BF_MAP_ARCHIVE_DIR=/data/history -e BF_MAP_ACTIVE_DIR=/data/active \
     -e BF_TEMPLATES_DIR=/data/templates -e BF_PUBLISHED_MAPS_DIR=/data/published \
@@ -56,7 +56,7 @@ docker run --rm -v w04data:/ro:ro --entrypoint sh "$IMAGE" -c 'if touch /ro/must
 echo "== read-only rootfs still healthy =="
 docker run -d --name w04ro --read-only --tmpfs /tmp \
     -v w04state:/state -v w04data:/data -v w04locks:/locks \
-    -v "$SECRETS/workshop-rcon-password:/run/secrets/workshop-rcon-password:ro" \
+    -v "$SECRETS/workshop-deploy-webhook-url:/run/secrets/workshop-deploy-webhook-url:ro" \
     "$@" -e BF_STEP_INTERVAL_S=2 -e BF_STEP_FOLLOW_S=0 -e BF_HEALTH_PORT=8081 \
     -e BF_MAP_ARCHIVE_DIR=/data/history -e BF_MAP_ACTIVE_DIR=/data/active \
     -e BF_TEMPLATES_DIR=/data/templates -e BF_PUBLISHED_MAPS_DIR=/data/published \
@@ -81,7 +81,7 @@ docker exec -d w04ctl python3 -I -c 'import fcntl,time; fd=open("/state/controll
 sleep 2
 code=0
 docker run --rm -v w04state:/state -v w04data:/data -v w04locks:/locks \
-    -v "$SECRETS/workshop-rcon-password:/run/secrets/workshop-rcon-password:ro" \
+    -v "$SECRETS/workshop-deploy-webhook-url:/run/secrets/workshop-deploy-webhook-url:ro" \
     "$@" -e BF_STEP_FOLLOW_S=0 \
     -e BF_MAP_ARCHIVE_DIR=/data/history -e BF_MAP_ACTIVE_DIR=/data/active \
     -e BF_TEMPLATES_DIR=/data/templates -e BF_PUBLISHED_MAPS_DIR=/data/published \

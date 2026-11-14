@@ -155,6 +155,8 @@ class DesiredHelperTests(unittest.TestCase):
 
 class ControllerDesiredTests(unittest.TestCase):
     def setUp(self):
+        import cp_fixtures
+
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.dir = Path(temp.name)
@@ -169,6 +171,7 @@ class ControllerDesiredTests(unittest.TestCase):
             workshop_data_dir=self.dir / "data",
             releases=catalog(),
         )
+        self.controller.state_reporter = cp_fixtures.Reporter()
         (self.dir / "data").mkdir(exist_ok=True)
         self.session = str(uuid4())
         self.desired_file = self.dir / "desired.json"
@@ -290,9 +293,6 @@ class ControllerDesiredTests(unittest.TestCase):
 
     def sleep(self):
         """Idle steps until the gameless editor sleeps; returns the revision."""
-        from controller import ACTIVITY_FILE
-
-        data = self.dir / "data"
         generation = self.backend.generation
         activity = {
             "schema": 1,
@@ -301,11 +301,11 @@ class ControllerDesiredTests(unittest.TestCase):
             "busy": False,
             "updatedAt": int(self.clock() * 1000),
         }
-        (data / ACTIVITY_FILE).write_text(json.dumps(activity))
+        self.controller.state_reporter.put("game-activity", activity)
         self.controller.step()
         self.clock.advance(61)
-        (data / ACTIVITY_FILE).write_text(
-            json.dumps({**activity, "updatedAt": int(self.clock() * 1000)})
+        self.controller.state_reporter.put(
+            "game-activity", {**activity, "updatedAt": int(self.clock() * 1000)}
         )
         state = self.controller.step()
         self.assertEqual(state["phase"], "sleeping")
